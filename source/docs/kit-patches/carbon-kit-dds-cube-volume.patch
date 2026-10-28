@@ -1,0 +1,249 @@
+--- a/kit/dx/d3d9.cpp
++++ b/kit/dx/d3d9.cpp
+@@ -2591,27 +2591,14 @@
+         com_QueryInterface(c);
+     }
+ }
+-void Dev_CreateVolumeTexture(X86 *c) {
+-    ComObj *dev = this_device9(c);
+-    const uint32_t w = arg(c, 1), h = arg(c, 2), depth = arg(c, 3), usage = arg(c, 5),
+-                   fmt = arg(c, 6), pool = arg(c, 7), out = arg(c, 8);
+-    uint32_t levels = arg(c, 4);
+-    if (!out || !gm_valid(out, 4)) {
+-        com_ret(c, D3DERR_INVALIDCALL);
+-        return;
+-    }
+-    wr32(out, 0);
+-    if (!dev || !d9volume::extent(w, h, depth, levels) || !d9volume::pixel_bytes(fmt) || pool > 3 ||
+-        (usage & ~0x210u) || ((usage & 0x200) && pool != 0) || arg(c, 9)) {
+-        com_ret(c, D3DERR_INVALIDCALL);
+-        return;
+-    }
++// A volume texture and its levels, without the COM call around it: shared by
++// CreateVolumeTexture and D3DXCreateVolumeTextureFromFileInMemory.
++static ComObj *volume_create(ComObj *dev, uint32_t w, uint32_t h, uint32_t depth, uint32_t levels,
++                             uint32_t usage, uint32_t fmt, uint32_t pool) {
+     levels = levels ? levels : d9volume::levels(w, h, depth);
+     ComObj *tex = com_new(K_D3D9VOLUMETEXTURE);
+-    if (!tex) {
+-        com_ret(c, E_OUTOFMEMORY);
+-        return;
+-    }
++    if (!tex)
++        return nullptr;
+     volumes()[tex->id] = {depth, pool};
+     tex->dev_d3d = dev->id;
+     tex->width = w;
+@@ -2638,7 +2625,33 @@
+         resource_usage()[v->id] = usage;
+         resource_alloc(v, v->pitch * v->height * volumes().at(v->id).depth);
+     }
+-    const uint32_t view = complete ? com_view(tex, IF_D3DVOLUMETEXTURE9) : 0;
++    if (!complete) {
++        com_release(tex);
++        return nullptr;
++    }
++    return tex;
++}
++void Dev_CreateVolumeTexture(X86 *c) {
++    ComObj *dev = this_device9(c);
++    const uint32_t w = arg(c, 1), h = arg(c, 2), depth = arg(c, 3), usage = arg(c, 5),
++                   fmt = arg(c, 6), pool = arg(c, 7), out = arg(c, 8);
++    uint32_t levels = arg(c, 4);
++    if (!out || !gm_valid(out, 4)) {
++        com_ret(c, D3DERR_INVALIDCALL);
++        return;
++    }
++    wr32(out, 0);
++    if (!dev || !d9volume::extent(w, h, depth, levels) || !d9volume::pixel_bytes(fmt) || pool > 3 ||
++        (usage & ~0x210u) || ((usage & 0x200) && pool != 0) || arg(c, 9)) {
++        com_ret(c, D3DERR_INVALIDCALL);
++        return;
++    }
++    ComObj *tex = volume_create(dev, w, h, depth, levels, usage, fmt, pool);
++    if (!tex) {
++        com_ret(c, E_OUTOFMEMORY);
++        return;
++    }
++    const uint32_t view = com_view(tex, IF_D3DVOLUMETEXTURE9);
+     if (!view) {
+         com_release(tex);
+         com_ret(c, E_OUTOFMEMORY);
+@@ -2755,6 +2768,136 @@
+     heap_free(scratch);
+     return true;
+ }
++// ---- DDS files handed to D3DXCreate{Cube,Volume}TextureFromFileInMemory ----
++// NFSC keeps both in GLOBALB.BUN chunks (0x30300201 cube, 0x30300200 volume):
++// five 256^2 DXT1 environment cubes and a 32^3 A8R8G8B8 volume with 6 mips.
++struct DdsInfo {
++    uint32_t w = 0, h = 0, d = 1, levels = 1, fmt = 0, caps2 = 0;
++    const uint8_t *data = nullptr;
++    size_t size = 0;
++};
++static bool dds_parse(const uint8_t *p, size_t n, DdsInfo &o) {
++    auto u32 = [&](size_t at) { uint32_t v; memcpy(&v, p + at, 4); return v; };
++    if (n < 128 || memcmp(p, "DDS ", 4) || u32(4) != 124)
++        return false;
++    const uint32_t flags = u32(8), pf_flags = u32(80), fourcc = u32(84), bits = u32(88),
++                   rmask = u32(92), amask = u32(104);
++    o.h = u32(12);
++    o.w = u32(16);
++    o.d = (flags & 0x800000) && u32(24) ? u32(24) : 1; // DDSD_DEPTH
++    o.levels = (flags & 0x20000) && u32(28) ? u32(28) : 1; // DDSD_MIPMAPCOUNT
++    o.caps2 = u32(112);
++    if (pf_flags & 0x4) { // DDPF_FOURCC
++        if (!dxt_block_bytes(fourcc))
++            return false;
++        o.fmt = fourcc;
++    } else if ((pf_flags & 0x40) && bits == 32 && rmask == 0x00ff0000u) { // DDPF_RGB
++        o.fmt = (pf_flags & 0x1) && amask == 0xff000000u ? 21u : 22u;      // A8R8G8B8 : X8R8G8B8
++    } else if (bits == 8 && (pf_flags & 0x2)) {                               // DDPF_ALPHA
++        o.fmt = 28;                                                           // A8
++    } else if (bits == 8 && (pf_flags & 0x20000)) {                           // DDPF_LUMINANCE
++        o.fmt = 50;                                                           // L8
++    } else {
++        return false;
++    }
++    if (!o.w || !o.h || o.levels > 16)
++        return false;
++    o.data = p + 128;
++    o.size = n - 128;
++    return true;
++}
++// Bytes in one level's 2D slice, and in one row as the file packs it.
++static size_t dds_row_bytes(uint32_t fmt, uint32_t w) {
++    if (uint32_t b = dxt_block_bytes(fmt))
++        return size_t(std::max((w + 3) / 4, 1u)) * b;
++    return size_t(w) * format_bytes(fmt);
++}
++static uint32_t dds_rows(uint32_t fmt, uint32_t h) {
++    return dxt_block_bytes(fmt) ? std::max((h + 3) / 4, 1u) : h;
++}
++
++// Returns the new cube texture's IDirect3DCubeTexture9 view, or 0.
++uint32_t d3d9_cube_from_dds(uint32_t device_view, const uint8_t *p, size_t n) {
++    ComObj *dev = device_view ? com_this(device_view) : nullptr;
++    DdsInfo dds;
++    if (!dev || !dds_parse(p, n, dds) || !(dds.caps2 & 0x200) || dds.w != dds.h) {
++        LOGW("d3dx9: cube DDS not loaded (%zu bytes, unsupported or not a full cube)", n);
++        return 0;
++    }
++    ComObj *tex = com_new(K_D3D9TEXTURE);
++    if (!tex)
++        return 0;
++    tex->dev_d3d = dev->id;
++    tex->width = tex->height = dds.w;
++    tex->bpp = format_bytes(dds.fmt) * 8;
++    tex->rmask = dds.fmt;
++    tex->caps = 1;
++    tex->pal_flags = dds.levels;
++    resource_usage()[tex->id] = 0;
++    size_t at = 0;
++    for (uint32_t face = 0; face < 6; ++face) // file order: +X -X +Y -Y +Z -Z, each with its mips
++        for (uint32_t l = 0; l < dds.levels; ++l) {
++            const uint32_t edge = std::max(dds.w >> l, 1u);
++            const size_t row = dds_row_bytes(dds.fmt, edge);
++            const uint32_t rows = dds_rows(dds.fmt, edge);
++            if (at + row * rows > dds.size) {
++                LOGW("d3dx9: cube DDS truncated at face %u level %u", face, l);
++                com_release(tex);
++                return 0;
++            }
++            ComObj *s = cube_face(tex, face, l);
++            const uint32_t staged = s ? stage_lock(s) : 0;
++            if (!staged) {
++                com_release(tex);
++                return 0;
++            }
++            for (uint32_t r = 0; r < rows; ++r)
++                memcpy(gm_ptr(staged + r * s->pitch), dds.data + at + r * row,
++                       std::min<size_t>(row, s->pitch));
++            stage_unlock(s);
++            at += row * rows;
++        }
++    const uint32_t view = com_view(tex, IF_D3DCUBETEXTURE9);
++    if (!view)
++        com_release(tex);
++    return view;
++}
++
++// Returns the new volume texture's IDirect3DVolumeTexture9 view, or 0.
++uint32_t d3d9_volume_from_dds(uint32_t device_view, const uint8_t *p, size_t n) {
++    ComObj *dev = device_view ? com_this(device_view) : nullptr;
++    DdsInfo dds;
++    if (!dev || !dds_parse(p, n, dds) || !(dds.caps2 & 0x200000) || !d9volume::pixel_bytes(dds.fmt) ||
++        !d9volume::extent(dds.w, dds.h, dds.d, dds.levels)) {
++        LOGW("d3dx9: volume DDS not loaded (%zu bytes, unsupported format or size)", n);
++        return 0;
++    }
++    ComObj *tex = volume_create(dev, dds.w, dds.h, dds.d, dds.levels, 0, dds.fmt, 1);
++    if (!tex)
++        return 0;
++    size_t at = 0;
++    for (uint32_t l = 0; l < tex->surfaces.size(); ++l) {
++        ComObj *v = volume_level(tex, l);
++        const uint32_t d = volumes().at(v->id).depth;
++        const size_t row = size_t(v->width) * (v->bpp / 8);
++        const size_t bytes = row * v->height * d;
++        if (at + bytes > dds.size || v->blob.size() < bytes) {
++            LOGW("d3dx9: volume DDS truncated at level %u", l);
++            com_release(tex);
++            return 0;
++        }
++        for (uint32_t z = 0; z < d; ++z)
++            for (uint32_t y = 0; y < v->height; ++y)
++                memcpy(v->blob.data() + (size_t(z) * v->height + y) * v->pitch,
++                       dds.data + at + (size_t(z) * v->height + y) * row, row);
++        gpu_after_unlock(v, 0, uint32_t(v->blob.size()));
++        at += bytes;
++    }
++    const uint32_t view = com_view(tex, IF_D3DVOLUMETEXTURE9);
++    if (!view)
++        com_release(tex);
++    return view;
++}
+ static void VolTex_LockBox(X86 *c) {
+     volume_lock(c, volume_level(com_this_arg(c), arg(c, 1)), arg(c, 2), arg(c, 3), arg(c, 4));
+ }
+--- a/kit/dx/d3dx9.cpp
++++ b/kit/dx/d3dx9.cpp
+@@ -2296,12 +2296,36 @@
+             wr32(out, 0);
+     }
+     set_eax(c, 0x8876086au);
++}
++uint32_t d3d9_cube_from_dds(uint32_t device_view, const uint8_t *p, size_t n);   // d3d9.cpp
++uint32_t d3d9_volume_from_dds(uint32_t device_view, const uint8_t *p, size_t n); // d3d9.cpp
++// (pDevice, pSrcData, SrcDataSize, ppTexture): DDS files only, which is what
++// NFSC's GLOBALB.BUN chunks carry.
++static void dds_texture_in_memory(X86 *c, const char *name,
++                                  uint32_t (*load)(uint32_t, const uint8_t *, size_t)) {
++    const uint32_t dev = arg(c, 0), src = arg(c, 1), size = arg(c, 2), out = arg(c, 3);
++    if (out && gm_valid(out, 4))
++        wr32(out, 0);
++    if (!dev || !src || !size || !out || !gm_valid(src, size) || !gm_valid(out, 4)) {
++        set_eax(c, D3DERR_INVALIDCALLX);
++        return;
++    }
++    const uint32_t view = load(dev, gm_ptr(src), size);
++    if (!view) {
++        set_eax(c, D3DERR_INVALIDCALLX);
++        return;
++    }
++    static uint32_t reported = 0;
++    if (++reported <= 8)
++        LOGW("d3dx9: %s: %u bytes -> %08x", name, size, view);
++    wr32(out, view);
++    set_eax(c, D3D_OKX);
+ }
+ static void X_D3DXCreateCubeTextureFromFileInMemory(X86 *c) {
+-    d3dx_unavailable(c, "D3DXCreateCubeTextureFromFileInMemory", 3);
++    dds_texture_in_memory(c, "D3DXCreateCubeTextureFromFileInMemory", d3d9_cube_from_dds);
+ }
+ static void X_D3DXCreateVolumeTextureFromFileInMemory(X86 *c) {
+-    d3dx_unavailable(c, "D3DXCreateVolumeTextureFromFileInMemory", 3);
++    dds_texture_in_memory(c, "D3DXCreateVolumeTextureFromFileInMemory", d3d9_volume_from_dds);
+ }
+ bool d3d9_fill_volume(X86 *c, uint32_t view, uint32_t fn, uint32_t data); // d3d9.cpp
+ static void X_D3DXFillVolumeTexture(X86 *c) {

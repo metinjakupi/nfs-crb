@@ -1,0 +1,15 @@
+diff --git a/tools/recomp/translate.py b/tools/recomp/translate.py
+index 12c1ba8..9ed42dd 100644
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -708,6 +708,10 @@ for _dst, _src in (("E", "Z"), ("NE", "NZ"), ("NAE", "C"), ("NB", "NC"),
+ 
+ JCC = {"J" + k: v for k, v in COND.items()}
+ JCC["JECXZ"] = ("c->r[1] == 0", ())
++# JCXZ is JECXZ under a 0x67 address-size prefix: it tests CX, not ECX. In
++# 32-bit code the prefix does not truncate the target. NFS Carbon's
++# hand-written library routines at 008bdcee and 008c4890 use it.
++JCC["JCXZ"] = ("(c->r[1] & 0xffffu) == 0", ())
+ # LOOP decrements ECX and branches while it is not zero; the decrement is
+ # the condition, so it happens whichever way the branch goes.
+ JCC["LOOP"] = ("(c->r[1] = c->r[1] - 1u) != 0u", ())

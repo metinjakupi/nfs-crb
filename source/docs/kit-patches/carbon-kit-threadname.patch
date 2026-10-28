@@ -1,0 +1,22 @@
+--- a/runtime/kernel32.cpp
++++ b/runtime/kernel32.cpp
+@@ -3860,6 +3860,19 @@
+ namespace {
+ 
+ void k_RaiseException(X86 *c) {
++    // 0x406D1388 is Visual C++'s SetThreadName convention: a debugger catches
++    // it and reads THREADNAME_INFO {type 0x1000, name, thread id, flags};
++    // without one the guest's own __except(EXCEPTION_CONTINUE_EXECUTION)
++    // resumes right after the raise. Either way the raise just returns, so do
++    // that here instead of dispatching (the SEH runtime cannot resume a
++    // faulting context). NFS Carbon names each worker thread this way.
++    if (arg(c, 0) == 0x406D1388u) {
++        uint32_t info = arg(c, 3);
++        if (arg(c, 2) >= 2 && info && gm_valid(info, 8) && rd32(info) == 0x1000u)
++            LOGV("SetThreadName(\"%s\") for thread %08x", gm_str(rd32(info + 4), 64).c_str(),
++                 arg(c, 2) >= 3 && gm_valid(info, 12) ? rd32(info + 8) : 0xffffffffu);
++        return;
++    }
+     // A raise the guest goes on to handle is invisible in a run log otherwise,
+     // and the frames it climbed out of are exactly what a language exception
+     // hides: the log shows the dialog that reported it and nothing that led

@@ -1,0 +1,303 @@
+# game.toml - everything the kit needs to know about Need for Speed: Carbon
+# (PC, v1.4, unwrapped no-DVD NFSC.exe) that is not derivable from the binary.
+# Values marked "sentinel" are not identified yet: they point into the
+# zero-filled padding after .rsrc (0x00c2b400-0x00c2bfff), which the game
+# never references, so the kit's hooks compile and never fire. Replace each
+# one with a real address as bring-up finds it.
+
+[game]
+id = "nfsc"
+name = "Need for Speed: Carbon"
+app_name = "CarbonRecomp"
+bundle_id = "io.github.nfsc-native-mac"
+executable = "NFSC.exe"
+sha256 = "baaaaec33873d4ba7e4dbae6a5212049ffdcf9679a35d865d7625b4189952fd3"
+image_base = 0x00400000
+entry_point = 0x0087e926
+guest_root = 'C:\Program Files\EA GAMES\Need for Speed Carbon'
+developer_exe = "original/NFSC.exe"
+# Carbon requires Windows XP or later.
+windows_version = "5.1.2600"
+# Nearly 2 GB arena (the game's own address space on Windows; the MW port uses 1 GB): the two runtime DLLs
+# sit just above the fixed stack/TEB/shim region (0x10000000), the extra heap above them. 1 GB was not enough
+# with the HD UI: loading the HD GlobalB.lzc (21 MB packed, 138 MB unpacked) crashed at 006add0f when the
+# unpack buffer's allocation failed. Only memory the game touches is used.
+guest_size = 0x7ffff000
+heap_extra_base = 0x10100000
+heap_extra_size = 0x6feff000
+
+[translate]
+listings = "analysis/decompiled/NFSC.exe"
+globals = "globals.toml"
+animation_counter = 0x00c2bf00  # sentinel
+volatile_reads = []
+# 0089f604/0089f07c/0089f494 (constructors called through 00403a60) and
+# 008999ee: reached only through pointers, missed by Ghidra (run 2026-10-10).
+# 0088510e/00884a1d: MMX routines on the VideoDecodeThread that Ghidra folded
+# into 008849c8 (green/glitchy EA splash); 0054bac0 after int3 padding.
+# 0059d6d0: vtable slot 0x1c, called from 00589093 at the press-start screen.
+# 0089777e: called from 00895d3d right after the press-start key press.
+# 008ab884: audio thread (from 008b65fe), at the yes/no prompt after press-start.
+# 00555450/005507a0 (recovered, then withdrawn as "data"), 005a69b0: main menu /
+# career / Audio options, run 2026-10-10 02:41.
+# 00868cc0: vtable +0x1c called from 00589093 (like 0059d6d0) after the first
+# Cross chase cutscene; returning 0 hung the career (run 2026-10-10 18:37).
+entry_points = [0x004c5450, 0x0089122d, 0x0089f604, 0x0089f07c, 0x0089f494, 0x008999ee,
+                0x0054bac0, 0x0088510e, 0x00884a1d, 0x0059d6d0, 0x0089777e, 0x008ab884,
+                0x00555450, 0x005507a0, 0x005a69b0, 0x00868cc0,
+                0x00583d70,  # FEng object callback (vtable 009d0680) core.nfsc hooks
+                0x00748a70]  # LightingFixMirror: undiscovered leaf after RET/INT3 padding;
+                            # reads exposure, sets parameter0x8b via 00713b30, RET at00748aa2.
+
+# Widescreen field of view (core.nfsc fills these per view on entry to the
+# projection setup 0071b780; see mods/core/nfsc/nfsc.c). ThirteenAG's
+# NFSCarbon.WidescreenFix patched these five reads in the code bytes; here
+# they read slots in the zero padding after .rsrc instead.
+operand_redirects = [
+    { at = 0x0071b858, from = 0x00ab0acc, to = 0x00c2b400 },  # FILD: aspect term numerator
+    { at = 0x0071b864, from = 0x00ab0ac8, to = 0x00c2b404 },  # FIDIV: aspect term denominator
+    { at = 0x0071b8da, from = 0x009c2478, to = 0x00c2b408 },  # FDIVR 1.0: horizontal scale
+    { at = 0x0071b8ec, from = 0x009c2888, to = 0x00c2b40c },  # FMUL 0.5 (second use only)
+    { at = 0x0071b923, from = 0x009c2478, to = 0x00c2b410 },  # FDIVR 1.0: vertical scale
+    # Widescreen HUD: FEngHud::SetWideScreenMode (005d5280) moves the minimap
+    # by 120.0; core.nfsc puts 240 * aspect - 320 in the slot.
+    { at = 0x005d52f9, from = 0x009cbb94, to = 0x00c2b414 },  # FSUB 120.0
+    { at = 0x005d5356, from = 0x009cbb94, to = 0x00c2b414 },  # FADD 120.0
+    # Menu mouse cursor (00731580): window x * 640.0 / width; core.nfsc puts
+    # the widescreen menu's width (480 * aspect) in the slot, or the cursor
+    # stops at x = 640 with menu still to its right.
+    { at = 0x00731665, from = 0x009e9b68, to = 0x00c2b41c },  # FMUL 640.0
+    # Resolution list (the fix's Resolution.ixx): the option's "supported" and
+    # refresh-rate tables (6 entries at 00ab0658 / 00ab08d4) are read from
+    # 40-entry tables core.nfsc fills. The unlisted readers 00712b85/00712c65
+    # (dead code) and 0072bee0 (a refresh-rate hint) keep the originals.
+    { at = 0x004a5212, from = 0x00ab0658, to = 0x00c2b500 },
+    { at = 0x00711427, from = 0x00ab0658, to = 0x00c2b500 },
+    { at = 0x00711440, from = 0x00ab0658, to = 0x00c2b500 },
+    { at = 0x0072b41c, from = 0x00ab08d4, to = 0x00c2b5a0 },
+    { at = 0x0072b48b, from = 0x00ab08d4, to = 0x00c2b5a0 },
+    { at = 0x0072b5cc, from = 0x00ab08d4, to = 0x00c2b5a0 },
+    { at = 0x007309a0, from = 0x00ab08d4, to = 0x00c2b5a0 },
+    { at = 0x0073121c, from = 0x00ab08d4, to = 0x00c2b5a0 },
+    # The fix's CarShadowFix (Misc.ixx): the car shadow's FADD reads the shared 120.0
+    # constant; it reads 60.0 from a slot instead.
+    { at = 0x007bea3a, from = 0x009cbb94, to = 0x00c2b424 },
+    # LightingFixMirror.ixx: dedicated brightness values instead of the shared
+    # exposure constant. Addresses verified against this executable's SHA256.
+    { at = 0x007497b9, from = 0x00a650e0, to = 0x00c2b448 },
+    { at = 0x00748a70, from = 0x00a650e0, to = 0x00c2b44c },
+    # The fix's water reflections (Rendering.ixx): the reflection target's sizes
+    # read 768 and 320 from slots instead of the screen-derived values.
+    { at = 0x0071a9af, from = 0x00ab0acc, to = 0x00c2b430 },
+    { at = 0x0071aa20, from = 0x00a63af8, to = 0x00c2b434 },
+    { at = 0x0071aa70, from = 0x00a63af8, to = 0x00c2b434 },
+]
+# What NFSCarbon.WidescreenFix (Frontend.ixx, FixHUD) patched in the code
+# bytes. The HUD centre (320.0) six HUD set-ups store is read from a slot
+# core.nfsc fills; the game's own widescreen HUD layout is forced on.
+instruction_patches = [
+    # Track streaming pool (sized in 006b6e00, made by 007a42e0) 48 MB bigger: the HD UI's barrier arrows
+    # (two 2048x2048 ARGB textures in the shared section Y0 of STREAML5RA.BUN) add about 45 MB to it.
+    { at = 0x006b6ef2, text = "MOV EBX,0x475c000" },
+    { at = 0x006b6ef9, text = "MOV EBX,0x471c000" },
+    { at = 0x00598db9, text = "MOV dword ptr [ESP + 0x84],dword ptr [0x00c2b418]" },
+    { at = 0x00598fb0, text = "MOV dword ptr [ESP + 0xc4],dword ptr [0x00c2b418]" },
+    { at = 0x0059940f, text = "MOV dword ptr [ESP + 0x84],dword ptr [0x00c2b418]" },
+    { at = 0x005996a7, text = "MOV dword ptr [ESP + 0xd4],dword ptr [0x00c2b418]" },
+    { at = 0x005a18ba, text = "MOV dword ptr [ESP + 0x64],dword ptr [0x00c2b418]" },
+    { at = 0x005d2b42, text = "MOV dword ptr [ESP + 0x64],dword ptr [0x00c2b418]" },
+    # Widescreen HUD always on (the fix's 0x94 SETE and 0x75 JNZ bytes).
+    { at = 0x005dc507, text = "SETZ CL" },
+    { at = 0x005d52b2, text = "SETZ AL" },
+    { at = 0x005b6bae, text = "JNZ 0x005b6bb7" },
+    { at = 0x005b6b5b, text = "JNZ 0x005b6b64" },
+    # Resolution list: the two stores that reset the option to a 6-entry
+    # range go (the fix's NOPs), and the registry write saves the packed size
+    # core.nfsc keeps in a slot instead of the bare index.
+    { at = 0x007115f0, text = "NOP" },
+    { at = 0x007116df, text = "NOP" },
+    { at = 0x00711d3f, text = "PUSH 0xc2b640" },
+    # Console button prompts (XtendedInput's CFENG_RENDEROBJ_NOP): the object
+    # renderer 005b0920 no longer skips every console-flagged (0x40) object;
+    # core.nfsc's hook on it skips whichever prompt set is not in use, and
+    # without core.nfsc the game's load-time hiding (00583d70) still hides them.
+    { at = 0x005b092d, text = "NOP" },
+    # Picture-in-picture (00750d40 -> quad builder 00750b30, the fix's "PiP/rearview mirror"):
+    # its width 0.275 becomes 0.28, and its x is read from a slot core.nfsc fills for the
+    # screen's aspect (the fix's fPiPUCAPPosition). core.nfsc then narrows both quads.
+    { at = 0x00750de6, text = "PUSH 0x3e8f5c28" },
+    { at = 0x00750df4, text = "PUSH dword ptr [0x00c2b420]" },
+    # LightingFixMirror.ixx: Xbox 360 lighting and the corrected mirror path.
+    # Translation rules replace instructions, not executable bytes. The old
+    # locations provide enough ordered instructions for the complete branch.
+    { at = 0x00748c2a, text = "CMP dword ptr [EDI + 0x8],0x1" },
+    { at = 0x00748c30, text = "JNZ 0x00748c3a" },
+    { at = 0x00748c3a, text = "PUSH dword ptr [0x00ab0914]" },
+    { at = 0x00748c43, text = "CMP dword ptr [EDI + 0x8],0x1" },
+    { at = 0x00748c49, text = "JZ 0x00748c5d" },
+    { at = 0x00748c4b, text = "CMP dword ptr [ESI + 0x1330],0x0" },
+    { at = 0x00748c4d, text = "JZ 0x00748c5d" },
+    { at = 0x00748c53, text = "PUSH 0x0" },
+    { at = 0x00748c54, text = "PUSH 0x80" },
+    { at = 0x0072e382, text = "MOV dword ptr [0x00ab0b98],0x0" },
+    # Frontend.ixx: crop/stretch width; unchanged vertical bounds +/-0.5.
+    { at = 0x00598ec3, text = "PUSH dword ptr [0x00c2b440]" },
+    { at = 0x00598ecd, text = "PUSH dword ptr [0x00c2b444]" },
+    # The rest of NFSCarbon.WidescreenFix's Frontend.ixx / Misc.ixx (2026-10-11):
+    # widescreen movie text placement (JZ -> JMP)
+    { at = 0x005ab6d7, text = "JMP 0x005ab715" },
+    # native widescreen movies: the two checks that fall back to the 4:3 bumper go
+    { at = 0x005bb818, text = "NOP" },
+    { at = 0x005bd4a1, text = "NOP" },
+    # EA HD: the start-up logo is EAHD_Bumper (0x9d51d8, in every v1.4 MOVIES folder)
+    # instead of EA_Bumper / EA_Bumper_WS, and the HD_GROUP name is cleared
+    { at = 0x005bb83b, text = "PUSH 0x9d51d8" },
+    { at = 0x005bd4a3, text = "PUSH 0x9d51d8" },
+    { at = 0x005bd4b0, text = "PUSH 0x9d51d8" },
+    { at = 0x00857701, text = "PUSH 0x0" },
+    # autosave icon: case 2 of the switch at 005cd133 (table 005cd4b0) runs case 1's
+    # code, as the fix's table write does (the translator compiles tables statically)
+    { at = 0x005cd170, text = "JMP 0x005cd14d" },
+    # world map cursor: the two branches that stop it at the 4:3 edge go
+    { at = 0x00570dcd, text = "NOP" },
+    { at = 0x00570ddc, text = "NOP" },
+    # the fix's CrashFix (Misc.ixx, on by default there)
+    { at = 0x0059606d, text = "NOP" },
+    { at = 0x005960a9, text = "NOP" },
+    # water reflections: the target height is 240 (the fix's n240 + NOP of the SHL)
+    { at = 0x0071a9f7, text = "MOV EDX,0xf0" },
+    { at = 0x0071a9fc, text = "NOP" },
+    # Rain droplets on the camera (the fix's RainDropletsHook / YScaleHook, 00722cb0):
+    # x = size * kx + x0 and y = size * ky + y0, kx/ky from slots core.nfsc fills
+    # (0.5 / aspect and 0.5). ECX/EDX only carried [esp+0xc] into two stores, so
+    # those stores copy it directly and the two freed instructions do the maths.
+    { at = 0x00722e7c, text = "FMUL dword ptr [0x00c2b428]" },
+    { at = 0x00722e80, text = "FADD dword ptr [ESP + 0x10]" },
+    { at = 0x00722e88, text = "MOV ECX,dword ptr [0x00ab0ba4]" },
+    { at = 0x00722e8e, text = "MOV dword ptr [ESP + 0x38],dword ptr [ESP + 0xc]" },
+    { at = 0x00722e92, text = "FLD dword ptr [0x00c2b42c]" },
+    { at = 0x00722e96, text = "FMUL dword ptr [ESP + 0x8]" },
+    { at = 0x00722ec2, text = "MOV dword ptr [ESP + 0x50],dword ptr [ESP + 0xc]" },
+]
+# The slots' values without core.nfsc: the original constants (the aspect
+# integers are copied from the game's own at run time by core.nfsc; 3/4 here
+# is only a safe 4:3 fallback).
+data_seeds = [
+    { addr = 0x00c2b400, value = 3 },
+    { addr = 0x00c2b404, value = 4 },
+    { addr = 0x00c2b408, float = 1.0 },
+    { addr = 0x00c2b40c, float = 0.5 },
+    { addr = 0x00c2b410, float = 1.0 },
+    { addr = 0x00c2b414, float = 120.0 },  # the minimap's widescreen offset
+    { addr = 0x00c2b418, float = 320.0 },  # the HUD centre
+    { addr = 0x00c2b41c, float = 640.0 },  # the menu cursor's width
+    { addr = 0x00c2b420, float = 0.026 },  # the picture-in-picture's x (0x3cd4fdf4)
+    { addr = 0x00c2b424, float = 60.0 },   # the car shadow's constant (CarShadowFix)
+    { addr = 0x00c2b428, float = 1.0 },    # rain droplets: x scale (core.nfsc: 0.5 / aspect)
+    { addr = 0x00c2b42c, float = 1.0 },    # rain droplets: y scale (core.nfsc: 0.5)
+    { addr = 0x00c2b430, value = 768 },    # water reflections: 768
+    { addr = 0x00c2b434, value = 320 },
+    { addr = 0x00c2b440, float = 0.5 },   # movie right bound (stretch: 2/3)
+    { addr = 0x00c2b444, float = -0.5 },  # movie left bound
+    { addr = 0x00c2b448, float = 2.0 },   # LightingFixMirror main brightness
+    { addr = 0x00c2b44c, float = 1.9 },   # LightingFixMirror mirror brightness
+    { addr = 0x00a6c204, float = 1.35 },  # LightingFixMirror shader parameter
+    # water reflections: 320
+    # The original six resolutions supported (refresh rates 0 = default),
+    # for a run without core.nfsc.
+    { addr = 0x00c2b500, value = 1 },
+    { addr = 0x00c2b504, value = 1 },
+    { addr = 0x00c2b508, value = 1 },
+    { addr = 0x00c2b50c, value = 1 },
+    { addr = 0x00c2b510, value = 1 },
+    { addr = 0x00c2b514, value = 1 },
+]
+
+# NFSC.exe imports the Visual C++ 2003 runtime from msvcr71.dll and
+# msvcp71.dll instead of linking it in, as MW's speed.exe does. Both are
+# translated like the game, from copies tools/rebase_pe.py relocates to the
+# bases below (the originals want 0x7c340000/0x7c3a0000, outside the arena).
+# Keys sort into load order: msvcp71 imports msvcr71, so msvcr71 comes first.
+# tools/rebase_pe.py fills in sha256 and size.
+[modules.aux.a_msvcr71]
+name = "msvcr71.dll"
+path = "rebased/msvcr71.dll"
+sha256 = "dcda06db178172aa9d1ff8557bb52b01586e6a77a5ca5fe2dc4c1f52509e6f07"
+base = 0x10000000
+size = 0x56000
+listings = "analysis/decompiled/msvcr71.dll"
+# memcpy's jump table: 8 code pointers, not code.
+data_ranges = [[0x10002a70, 0x10002a90]]
+entry_points = [0x100094f6]
+function_alignment = 4
+
+[modules.aux.b_msvcp71]
+name = "msvcp71.dll"
+path = "rebased/msvcp71.dll"
+sha256 = "f37df0fad42867774162874aa0650f49ae9b9afdb48e47d28b76613c6fe0ad89"
+base = 0x10060000
+size = 0x7b000
+listings = "analysis/decompiled/msvcp71.dll"
+entry_points = [0x1008d949]
+function_alignment = 4
+
+[hooks]
+# All sentinels until bring-up identifies them (see the MW port's game.toml
+# for what each one means).
+frame_clock_begin = 0x00c2bf10
+frame_clock_wait = 0x00c2bf14
+frame_clock_wait_clamp = 0x00c2bf18
+frame_clock_clamp_deadline = 0x00c2bf20
+frame_clock_wait_deadline = 0x00c2bf24
+cursor_surface_ptrs = [0x00c2bf30, 0x00c2bf34]
+mouse_vtable = 0x00c2bf40
+mouse_device_ptr = 0x00c2bf44
+mouse_device_right = 0x00c2bf48
+camera = 0x00c2bf50
+sprites = []
+# Guest functions a thread runs without the scheduler's baton, beside the thread that holds
+# it (kit runtime/win32.h sched_free_run_enter). 008a721d mixes one 256-sample block of
+# the EA sound engine's voices on the audio thread (called from its loop 008a7de6): pure
+# DSP over the mixer's own voice state, which commands from the game thread reach only
+# through 008993fa under the audio critical section. A third of a core in a crowded race.
+free_run = [0x008a721d]
+
+[mods]
+builtin = "none"
+
+[controls]
+pad = "native"
+
+[controls.native]
+xinput = false
+dinput = true
+axes = ["x", "y", "z", "rz", "rx", "ry"]
+buttons = ["square", "cross", "circle", "triangle", "l1", "r1", "l2", "r2", "select", "start", "l3", "r3", "ps"]
+
+[launcher]
+title = "Need for Speed: Carbon"
+install_names = ["Need for Speed - Carbon", "Need for Speed Carbon", "NFS Carbon", "Carbon"]
+min_free_mb = 300
+render_scale = { setting = "core.nfsc/render_scale", default = 2 }
+
+[setup]
+required_dirs = ["CARS", "FRONTEND", "GLOBAL", "SOUND", "TRACKS"]
+
+[bundle]
+# The stock runtime DLLs stay out; the rebased copies are bundled instead.
+# Text files are kept but filelist.txt (the installer's list): the game reads ONLINE/playnowconfig.txt
+# for its own Online mode (Custom Match; plans/lan-protocol.md) and CREDITS/*.txt for the credits.
+exclude = ["Uninstall", "Support", "scripts", "SAVE", "*.dll", "*.asi", "filelist.txt"]
+
+[settings]
+# The settings page (F10): Window = Windowed / Borderless / Full screen, plus
+# the mods' own settings. The other rows are Populous's and stay off, as in
+# the MW port.
+rows = ["window", "frame_limit", "performance_overlay", "filtering"]
+# The tabbed page (Graphics / Mods / Controls), as the MW port: it shows the
+# mods' choices by name. The kit's "controls" rows are the iPad/iPhone touch
+# controls and stay off on the Mac; the controller settings are core.nfsc's.
+page = "tabs"
+# A 3D game: fill the screen at any resolution (the kit's default "integer"
+# scales by whole multiples only, so most sizes left black borders).
+scaling = "smooth"

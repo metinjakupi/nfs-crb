@@ -1,0 +1,54 @@
+--- a/kit/dx/d3dx9.cpp
++++ b/kit/dx/d3dx9.cpp
+@@ -1892,7 +1892,10 @@
+     uint32_t out = arg(c, 2);
+     ComObj *tex = com_get(p->texture);
+     if (out)
+-        com_out_ptr(out, tex ? com_view(tex, tex->caps ? IF_D3DCUBETEXTURE9 : IF_D3DTEXTURE9) : 0);
++        com_out_ptr(out, tex ? com_view(tex, tex->kind == K_D3D9VOLUMETEXTURE ? IF_D3DVOLUMETEXTURE9
++                                             : tex->caps                         ? IF_D3DCUBETEXTURE9
++                                                                                 : IF_D3DTEXTURE9)
++                             : 0);
+     if (tex)
+         com_addref(tex);
+     com_ret(c, D3D_OKX);
+@@ -1996,6 +1999,17 @@
+     com_addref(dev);
+     com_out_ptr(out, com_view(dev, IF_D3DDEVICE9));
+     com_ret(c, D3D_OKX);
++}
++
++// Point a parameter at a texture, moving the reference it holds.
++static void set_param_texture(FxParam &p, uint32_t id) {
++    if (p.texture == id)
++        return;
++    if (ComObj *tex = com_get(id))
++        com_addref(tex);
++    if (ComObj *old = com_get(p.texture))
++        com_release(old);
++    p.texture = id;
+ }
+ 
+ static void fx_destroy(ComObj *o) {
+@@ -2048,7 +2062,11 @@
+             continue;
+         if (n)
+             memcpy(other->value.data(), value.value.data(), n);
+-        other->texture = value.texture;
++        // Each effect's copy holds its own reference: fx_destroy releases
++        // every parameter's texture, so an unreferenced copy over-released
++        // the shared texture once per peer effect destroyed. NFSC's race
++        // load freed its colour-grading volume this way (black 3D).
++        set_param_texture(*other, value.texture);
+         param_touched(*other);
+     }
+ }
+@@ -2066,7 +2084,7 @@
+             const FxParam *other = param_named(kv.second, p.t.name);
+             if (other && other->shared && other->value.size() == p.value.size()) {
+                 p.value = other->value;
+-                p.texture = other->texture;
++                set_param_texture(p, other->texture);
+                 param_touched(p);
+                 break;
+             }

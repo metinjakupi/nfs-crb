@@ -1,0 +1,43 @@
+--- a/kit/dx/d3dx9.cpp
++++ b/kit/dx/d3dx9.cpp
+@@ -966,6 +966,22 @@
+ static uint32_t bind_constants_impl(FxEffect &fx, const std::vector<uint8_t> &code, float (*reg)[4],
+                                     uint32_t limit, D9Pipeline &pl, uint32_t *missing, uint64_t key,
+                                     int32_t *booleans, uint64_t since);
++
++// A device sampler slot holds a reference on a volume texture (Dev_SetTexture
++// takes one and releases it when the slot changes). An effect binding a slot
++// must follow the same rule, or the next Dev_SetTexture on that stage releases
++// a reference nobody took: that freed NFSC's colour-grading volume at race load.
++static void bind_sampler_slot(uint32_t &slot, uint32_t id) {
++    if (slot == id)
++        return;
++    ComObj *nu = com_get(id), *old = com_get(slot);
++    if (nu && nu->kind == K_D3D9VOLUMETEXTURE)
++        com_addref(nu);
++    slot = id;
++    if (old && old->kind == K_D3D9VOLUMETEXTURE)
++        com_release(old);
++}
++
+ static uint32_t bind_constants(FxEffect &fx, const std::vector<uint8_t> &code, float (*reg)[4],
+                                uint32_t limit, D9Pipeline &pl, uint32_t *missing, uint64_t key = 0,
+                                int32_t *booleans = nullptr, D9Pipeline::ConstBinder *binder = nullptr) {
+@@ -1038,7 +1054,7 @@
+         FxParam *p = resolved[ci] < 0 ? nullptr : &fx.params[(size_t)resolved[ci]];
+         if (c.set == 3) { // a sampler: register index is the stage
+             if (p && c.index < 16) {
+-                pl.sampler_tex[c.index] = sampler_texture(fx, *p);
++                bind_sampler_slot(pl.sampler_tex[c.index], sampler_texture(fx, *p));
+                 for (const FxState &s : p->sampler)
+                     apply_state(fx, pl, s, c.index);
+                 ++bound;
+@@ -1401,7 +1417,7 @@
+             auto it = fx.objects.find(s.object());
+             if (it != fx.objects.end() && !it->second.param.empty())
+                 if (FxParam *tex = param_named(fx, it->second.param))
+-                    pl.sampler_tex[s.index] = tex->texture;
++                    bind_sampler_slot(pl.sampler_tex[s.index], tex->texture);
+         }
+     uint32_t missing = 0;
+     uint32_t bound =

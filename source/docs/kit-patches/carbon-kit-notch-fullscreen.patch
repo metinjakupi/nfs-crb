@@ -1,0 +1,93 @@
+--- a/kit/host/gpu/metal/metal_surface.mm
++++ b/kit/host/gpu/metal/metal_surface.mm
+@@ -468,3 +468,16 @@
+ }
+ 
+ } // namespace gpu
++
++#if !TARGET_OS_IPHONE
++// The strip a full-screen window leaves clear at the top of this Mac's main
++// screen (the camera housing on notched MacBooks), in points; 0 elsewhere.
++// Main thread only, as AppKit wants; the SDL host asks from note_screen_size.
++extern "C" double host_mac_safe_top_points(void) {
++    if (@available(macOS 12.0, *)) {
++        NSScreen *screen = NSScreen.mainScreen;
++        return screen ? screen.safeAreaInsets.top : 0.0;
++    }
++    return 0.0;
++}
++#endif
+--- a/kit/host/sdl/main.cpp
++++ b/kit/host/sdl/main.cpp
+@@ -175,6 +175,11 @@
+ // selected game mode must not hide the display's own resolution from menus.
+ // SDL video queries stay on the main thread; guest threads read only this cache.
+ std::atomic<int> g_screen_w{0}, g_screen_h{0};
++// The display less the strip a full-screen window leaves clear at the top (a
++// MacBook's notch): what a full-screen game actually gets. Equal to the
++// display where there is no such strip.
++std::atomic<int> g_fullscreen_w{0}, g_fullscreen_h{0};
++extern "C" __attribute__((weak)) double host_mac_safe_top_points(void);
+ void note_screen_size() {
+     int w = 0, h = 0;
+     SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+@@ -196,11 +201,30 @@
+     }
+     if (w <= 0 || h <= 0)
+         return;
+-    if (w != g_screen_w.load() || h != g_screen_h.load())
+-        fprintf(stderr, "[host] display pixel size: %dx%d\n", w, h);
++    int fh = h;
++    if (host_mac_safe_top_points) {
++        SDL_DisplayID d = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
++        const SDL_DisplayMode *m = SDL_GetDesktopDisplayMode(d);
++        const double density = m && m->pixel_density > 0 ? m->pixel_density : 1.0;
++        const int strip = int(std::lround(host_mac_safe_top_points() * density));
++        if (strip > 0 && strip < h)
++            fh = h - strip;
++    }
++    if (w != g_screen_w.load() || h != g_screen_h.load() || fh != g_fullscreen_h.load())
++        fprintf(stderr, "[host] display pixel size: %dx%d (full screen %dx%d)\n", w, h, w, fh);
+     g_screen_w.store(w);
+     g_screen_h.store(h);
++    g_fullscreen_w.store(w);
++    g_fullscreen_h.store(fh);
+ }
++extern "C" int host_display_fullscreen_size(int *w, int *h) {
++    const int fw = g_fullscreen_w.load(), fh = g_fullscreen_h.load();
++    if (!w || !h || fw <= 0 || fh <= 0)
++        return 0;
++    *w = fw;
++    *h = fh;
++    return 1;
++}
+ 
+ // The window's size in points and in drawable pixels.
+ void window_sizes(int *bw, int *bh, int *dw, int *dh) {
+--- a/kit/runtime/mods_seam.cpp
++++ b/kit/runtime/mods_seam.cpp
+@@ -16,6 +16,10 @@
+ __attribute__((weak)) int host_display_screen_size(int *, int *) {
+     return 0;
+ }
++// What a full-screen window gets (the display less a notch strip); none by default.
++extern "C" __attribute__((weak)) int host_display_fullscreen_size(int *, int *) {
++    return 0;
++}
+ // And a build without DirectDraw offers no modes.
+ __attribute__((weak)) int ddraw_add_mode(int, int, int) {
+     return 0;
+@@ -122,8 +126,12 @@
+         // The desktop host publishes the display through host_display_screen_size
+         // and never calls host_display_set_screen (only the web host does), so a
+         // mod's screen_size() had nothing to read on macOS.
++        // Prefer what a full-screen window really gets: on a notched MacBook
++        // that is 68 pixels shorter than the display, and a game sized to the
++        // display was shrunk to fit, leaving borders at the sides.
+         int sw = 0, sh = 0;
+-        if (!host_display_screen_size(&sw, &sh) || sw <= 0 || sh <= 0)
++        if ((!host_display_fullscreen_size(&sw, &sh) || sw <= 0 || sh <= 0) &&
++            (!host_display_screen_size(&sw, &sh) || sw <= 0 || sh <= 0))
+             return 0;
+         *w = sw;
+         *h = sh;

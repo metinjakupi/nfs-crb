@@ -1,0 +1,70 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -2274,10 +2274,19 @@
+             targets = []
+             for k in range(lo, hi + 1):
+                 t = self.image.rd32(dword_base + 4 * k)
+-                if holes and not (t is not None and (self.is_block_entry(fn, t)
+-                                                     or self.plausible_code(t))):
++                if holes and (self.slot_in_code(fn, dword_base + 4 * k)
++                              or t in self.table_bases
++                              or not (t is not None and (self.is_block_entry(fn, t)
++                                                         or self.plausible_code(t)))):
+                     # A masked index the guards never produce: the slot
+                     # holds whatever the compiler put there, usually code.
++                    # Plausibility alone is not enough when that code is
++                    # another table jump: msvcr71's memmove (1000298e) bounds
++                    # `JMP [ECX*4 + 0x100029ec]` with AND 3 after diverting 0,
++                    # and slot 0 is the displacement of the JMP before it,
++                    # 0x10002a70 - the address of a different table, whose
++                    # bytes decode as plausible garbage. A slot overlapping a
++                    # listed instruction, or naming a table, is not an entry.
+                     self.stats["_jmp_table_holes"] += 1
+                     continue
+                 self.want_target(fn, ins, t, k)
+@@ -2479,6 +2488,14 @@
+             return m.imm + 1
+         return None
+ 
++    def slot_in_code(self, fn, at):
++        """Do the four bytes at `at` overlap an instruction listed in `fn`?"""
++        for k, ins in enumerate(fn.insns):
++            end = fn.fallthrough[k] if fn.fallthrough[k] is not None else ins.addr + 1
++            if ins.addr < at + 4 and at < end:
++                return True
++        return False
++
+     def is_block_entry(self, fn, target):
+         """A jump-table target is usable if it is an instruction in this
+         function, a known entry point, or an instruction inside another
+--- a/tools/recomp/tests/test_jumptables.py
++++ b/tools/recomp/tests/test_jumptables.py
+@@ -232,3 +232,28 @@
+     entries[1] = GARBAGE
+     targets, _ = decode(lines, table(entries))
+     assert targets == [FN + 0x20 + 0x10 * k for k in range(8)]
++
++
++def test_mask_hole_overlapping_the_jump_is_not_an_entry():
++    # msvcr71's memmove: `JMP [ECX*4 + 0x100029ec]` right after another table
++    # jump, AND 3 with 0 diverted. Slot 0 is the previous JMP's displacement -
++    # the address of a different table - which is plausible as code but sits
++    # inside an instruction, so it is a hole, not a target.
++    class Sized(FakeImage):
++        def insn_end(self, addr, mnem):
++            return addr + {"JMP": 7, "AND": 3, "ADD": 2}.get(mnem, 1)
++
++    jmp = FN + 0x05
++    base = jmp + 3                     # slot 0 = bytes 3..6 of the JMP itself
++    lines = [(0x00, "AND ECX,0x3"), (0x03, "ADD EDI,ECX"),
++             (0x05, "JMP dword ptr [ECX*0x4 + 0x%x]" % base),
++             (0x40, "RET"), (0x50, "RET"), (0x60, "RET"), (0x70, "RET")]
++    dwords = {base: FN + 0x40, base + 4: FN + 0x50, base + 8: FN + 0x60, base + 12: FN + 0x70}
++    listing = "\n".join("%08x  %s" % (FN + off, text) for off, text in lines) + "\n"
++    insns = T.parse_listing_text(listing)
++    fn = T.Function(FN, "case", 0x100, insns)
++    image = Sized([i.addr for i in insns], dwords)
++    fn.measure(image)
++    tr = T.Translator(image, {FN}, Opts())
++    tr.prepare(fn, strict=True)
++    assert sorted(tr.jumptables[(FN, jmp)]) == [FN + 0x50, FN + 0x60, FN + 0x70]

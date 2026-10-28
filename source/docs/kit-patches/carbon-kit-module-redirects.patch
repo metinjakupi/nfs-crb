@@ -1,0 +1,14 @@
+--- a/kit/tools/recomp/translate.py
++++ b/kit/tools/recomp/translate.py
+@@ -102,6 +102,11 @@
+     FUNCTION_ALIGNMENT = mod["function_alignment"]
+     SYMBOL_PREFIX = "recomp_%s_" % key
+     AUX_MODULE = mod
++    # The executable's [translate] redirects, patches and seeds name its own
++    # addresses; a module translated after configure() must not inherit them
++    # (every exe redirect "matched nothing" in msvcr71).
++    global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
++    OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS = {}, {}, []
+ 
+ 
+ def read_discovered(path):

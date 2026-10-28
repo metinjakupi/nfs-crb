@@ -1,0 +1,16 @@
+--- a/kit/tools/recomp/translate.py
++++ b/kit/tools/recomp/translate.py
+@@ -1394,8 +1394,12 @@
+     def _size_word(self, nbytes, mnem):
+         if mnem.startswith("F") and mnem not in self.X87_INT:
+             return {4: "float", 8: "double", 10: "extended double"}.get(nbytes)
++        # 16 is an SSE memory operand; spelt as Ghidra's listings spell it so
++        # is_vector_insn still sees it and it becomes a recomp_unmodelled
++        # trap. Without it, recovering an unlisted function with an SSE path
++        # (NFSC's audio decoder 008ab884) abandoned the whole body.
+         return {1: "byte", 2: "word", 4: "dword", 8: "qword",
+-                10: "extended double"}.get(nbytes)
++                10: "extended double", 16: "xmmword"}.get(nbytes)
+ 
+     def _op_text(self, ci, op, mnem):
+         import capstone.x86_const as X

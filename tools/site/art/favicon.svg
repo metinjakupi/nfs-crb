@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- The site's icon: a slanted "C" in the start page's blue, with speed lines behind it. -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bff6ff"/><stop offset=".55" stop-color="#3fb6e6"/><stop offset="1" stop-color="#1360a8"/>
+    </linearGradient>
+    <linearGradient id="s" x1="0" x2="1">
+      <stop offset="0" stop-color="#5fe4f2" stop-opacity="0"/><stop offset="1" stop-color="#5fe4f2"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="12" fill="#070c16"/>
+  <g transform="translate(7 0) skewX(-12)">
+    <rect x="1" y="24" width="14" height="4" fill="url(#s)"/>
+    <rect x="-2" y="36" width="15" height="4" fill="url(#s)"/>
+    <path d="M47.6 21.4 A15 15 0 1 0 47.6 42.6" fill="none" stroke="url(#g)" stroke-width="9"/>
+  </g>
+</svg>

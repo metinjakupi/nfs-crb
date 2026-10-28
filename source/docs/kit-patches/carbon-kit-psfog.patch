@@ -1,0 +1,11 @@
+--- a/kit/dx/d3d9_shadergen.cpp
++++ b/kit/dx/d3d9_shadergen.cpp
+@@ -219,6 +219,8 @@
+                     snprintf(buf, sizeof buf, "t[%u]", d.usage_index & 7);
+                     return buf;
+                 }
++                if (d.usage == 11) // FOG: the scalar the vertex shader wrote to ofog.x
++                    return F4 + (glsl() ? "(i_fog)" : "(vin.fog)");
+                 fail("pixel shader input usage " + std::to_string(d.usage));
+                 return F4 + "(0.0)";
+             }

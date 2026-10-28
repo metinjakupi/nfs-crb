@@ -1,0 +1,69 @@
+/* site.css - the look of the site's text pages (/online/, /faq/): the start page's colours and
+   type (source/web/start.js), for pages search engines read without running the game. */
+:root {
+  --ink: #e9f6ff; --dim: #8fa6bd; --cyan: #5fe4f2; --line: rgba(95, 228, 242, .22);
+  --panel: rgba(6, 12, 22, .78);
+  --cond: "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", "Arial Narrow", sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { background: #070c16; }
+body {
+  margin: 0; min-height: 100vh; color: var(--ink);
+  font: 16px/1.6 "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  background: radial-gradient(120% 70% at 50% 0%, #142a4a 0%, #070c16 55%, #020409 100%) fixed;
+}
+a { color: var(--cyan); text-underline-offset: 3px; }
+.wrap { max-width: 860px; margin: 0 auto; padding: 22px 16px 48px; }
+
+.top { display: flex; align-items: center; justify-content: space-between; gap: 10px 18px; flex-wrap: wrap; margin-bottom: 34px; }
+.brand { font: italic 900 22px/1 var(--cond); letter-spacing: .06em; text-transform: uppercase; color: var(--ink); text-decoration: none; }
+.brand b { color: var(--cyan); font-weight: inherit; }
+.top nav { display: flex; gap: 18px; flex-wrap: wrap; }
+.top nav a { color: var(--dim); text-decoration: none; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; }
+.top nav a:hover, .top nav a[aria-current] { color: var(--ink); }
+
+h1 {
+  margin: 0 0 18px; font: italic 900 clamp(34px, 7vw, 56px)/1 var(--cond); letter-spacing: .03em; text-transform: uppercase;
+  background: linear-gradient(#bff6ff, #3fb6e6 55%, #1360a8); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+h2 {
+  margin: 40px 0 12px; font: italic 800 19px/1.2 var(--cond); letter-spacing: .16em; text-transform: uppercase; color: var(--cyan);
+  display: flex; align-items: center; gap: 12px;
+}
+h2::after { content: ""; flex: 1; height: 2px; transform: skewX(-30deg); background: linear-gradient(90deg, var(--cyan), transparent); opacity: .5; }
+h3 { margin: 26px 0 6px; font-size: 17px; line-height: 1.35; }
+p, li, dd { color: #c9d9e8; }
+.lead { font-size: 18px; color: var(--ink); max-width: 46em; }
+ol, ul { padding-left: 1.3em; }
+li { margin: 6px 0; }
+dl { margin: 0; }
+dt { font-weight: 700; margin-top: 12px; }
+dd { margin: 2px 0 0; }
+kbd { font: 600 13px/1 system-ui, sans-serif; padding: 3px 7px; border: 1px solid var(--line); background: rgba(95, 228, 242, .06); color: var(--ink); }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); padding: 4px 22px 20px; margin-top: 18px;
+  clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+}
+.cta { margin: 26px 0 8px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.btn {
+  display: inline-block; text-decoration: none; transform: skewX(-12deg);
+  font: italic 800 22px/1 var(--cond); letter-spacing: .14em; text-transform: uppercase;
+  padding: 15px 30px; color: #021018; background: linear-gradient(100deg, #9ff3fb, var(--cyan) 40%, #2aa4dc);
+  box-shadow: 0 0 28px rgba(95, 228, 242, .35); transition: box-shadow .15s ease;
+}
+.btn > span { display: inline-block; transform: skewX(12deg); }
+.btn:hover { box-shadow: 0 0 40px rgba(95, 228, 242, .6); }
+.btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+.cta small { color: var(--dim); font-size: 14px; }
+
+footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--dim); font-size: 13px; }
+footer p { color: var(--dim); margin: 6px 0; }
+footer a { color: var(--dim); }
+
+@media (max-width: 520px) {
+  .top nav { gap: 14px; }
+  .lead { font-size: 17px; }
+  .btn { font-size: 19px; padding: 13px 24px; }
+}

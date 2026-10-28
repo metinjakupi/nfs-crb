@@ -1,0 +1,29 @@
+# Never commit the game's files or anything made from them (source/.gitignore has more).
+/game/
+/source/original
+
+# Toolchain, build output, logs and local run data (players' saves, friends lists)
+/emsdk/
+/logs/
+/relay-data/
+/server/target/
+/.playwright-cli/
+
+# The upstream nfs-carbon-mac history that source/ was cloned from
+/.source-upstream.git/
+
+.DS_Store
+*.log
+.venv/
+__pycache__/
+
+# Private operational notes and local deployment tools
+/plans/
+/AGENTS.md
+/HANDOFF.md
+/FEATURE-PLAN.md
+/source/CLAUDE.md
+/source/kit/AGENTS.md
+/tools/carbon-site-deploy.sh
+/tools/carbon-relay-deploy.sh
+/tools/carbon-reports.sh

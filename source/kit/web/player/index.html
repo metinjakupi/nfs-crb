@@ -1,0 +1,426 @@
+<!doctype html>
+<!-- The player page for one game's web build. tools/web_launcher.py places it,
+     with @APP@.js/.wasm/.data, in <launcher>/<game id>/; the game's files were
+     imported by the launcher into the browser's private storage at
+     <game id>/game, and the profile lives at <game id>/profile. The page must
+     be served cross-origin isolated (COOP same-origin, COEP require-corp). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@TITLE@</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  #canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+  #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+            text-align: center; padding: 0 16px; white-space: pre-line; pointer-events: none; }
+  #status a { pointer-events: auto; color: #8cf; }
+  #status[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1"></canvas>
+<div id="status">Loading…</div>
+<script>
+"use strict";
+const statusEl = document.getElementById("status");
+const canvas = document.getElementById("canvas");
+let gameRunning = false;
+let statusFailed = false;
+let startupPhase = "start page";
+window.recompStartupPhase = startupPhase;
+function startup(phase) {
+  startupPhase = phase;
+  window.recompStartupPhase = phase;
+}
+function status(text, back) {
+  // Startup progress must not cover play or erase a fatal error.
+  if (!back && (gameRunning || statusFailed)) return;
+  if (back) statusFailed = true;
+  statusEl.textContent = text;
+  if (back) {
+    const a = document.createElement("a");
+    a.href = document.documentElement.dataset.gameId ? "/" : "../";
+    a.textContent = "\nBack to game";
+    statusEl.append(document.createElement("br"), a);
+    offerReport();
+  }
+  statusEl.hidden = !text;
+}
+// A game's report.js (if it has one) adds "Download log" and "Send report" to a stopped screen.
+function offerReport() {
+  const offer = () => { try { window.recompReport?.offer(statusEl); } catch {} };
+  if (window.recompReport) return offer();
+  const s = document.createElement("script");
+  s.src = "report.js";
+  s.onload = offer;
+  s.onerror = () => s.remove();
+  document.body.append(s);
+}
+const log = [];
+window.recompLog = log; // for tests
+
+let reportingFailure = false;
+function reportFailure(kind, error) {
+  const message = String(error?.message || error || "Unknown startup error");
+  window.recompFailure ||= { kind, message: message.slice(0, 1000), stack: String(error?.stack || "").slice(0, 5000) };
+  status(`The game stopped: ${message}`, true);
+  if (reportingFailure) return;
+  reportingFailure = true;
+  const record = {
+    kind, message: message.slice(0, 1000),
+    stack: String(error?.stack || [...log].reverse().find(t => String(t).includes("\n    at ")) || "").slice(0, 5000),
+    game: location.pathname, time: new Date().toISOString(), phase: startupPhase,
+    log: log.slice(-20).map(t => String(t).slice(0, 300)),
+  };
+  fetch("/_runtime-diagnostics", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(record), keepalive: true,
+  }).catch(() => {});
+}
+function humanBytes(bytes) {
+  let value = Math.max(0, Number(bytes) || 0), unit = 0;
+  const units = ["B", "KiB", "MiB", "GiB"];
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+function noSpaceError(result = {}) {
+  const amounts = Number.isFinite(result.needed) && Number.isFinite(result.free)
+    ? ` The game needs ${humanBytes(result.needed)}, but only ${humanBytes(result.free)} is free.` : "";
+  const error = new Error(`The browser does not have enough storage for the game.${amounts} Free disk space or use Delete downloaded files on the game page, then press Play again. Your saves are kept.`);
+  error.name = "QuotaExceededError";
+  return error;
+}
+async function reportStartupFailure(error) {
+  const full = error?.name === "QuotaExceededError" || /quota|not enough storage|ran out of storage/i.test(String(error?.message || error));
+  if (!full) return reportFailure("startup", error);
+  if (!/does not have enough storage/i.test(String(error?.message || ""))) {
+    let free;
+    try {
+      const estimate = await navigator.storage.estimate();
+      if (Number.isFinite(estimate.quota) && Number.isFinite(estimate.usage)) free = Math.max(0, estimate.quota - estimate.usage);
+    } catch {}
+    error = noSpaceError({ free });
+  }
+  reportFailure("startup-storage", error);
+}
+window.addEventListener("error", e => reportFailure("error", e.error || e.message));
+window.addEventListener("unhandledrejection", e => reportFailure("rejection", e.reason));
+
+// Temporary loading diagnostics: bounded to the first ten minutes of a run.
+let loadingReports = 0;
+const loadingTimer = setInterval(() => {
+  if (reportingFailure || ++loadingReports > 20) { clearInterval(loadingTimer); return; }
+  const record = {
+    kind: "loading-snapshot", game: location.pathname, time: new Date().toISOString(), phase: startupPhase,
+    assets: window.carbonTestAssets || {},
+    graphics: window.carbonGraphicsInfo || {},
+    canvas: { width: canvas.width, height: canvas.height, dpr: devicePixelRatio },
+    rendering: log.filter(t => /d3d9 webgpu:|d3d9 host:|audio sink:|sched: baton held/.test(String(t)))
+      .slice(-10).map(t => String(t).slice(0, 500)),
+    log: log.slice(-35).map(t => String(t).slice(0, 200)),
+    warnings: log.filter(t => /missing|not found|failed|unimplemented|unknown|error/i.test(String(t)))
+      .slice(-8).map(t => String(t).slice(0, 200)),
+  };
+  let body = JSON.stringify(record);
+  while (new TextEncoder().encode(body).length > 14000 && record.log.length) {
+    record.log.shift(); body = JSON.stringify(record);
+  }
+  fetch("/_runtime-diagnostics", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body,
+  }).catch(() => {});
+}, 30000);
+
+// ?profile=<name>: this window keeps its saves and settings in profile-<name>,
+// a copy of the main profile made the first time, so two windows of the same
+// game (online play on one computer) never write the same save.
+async function copyFolder(from, to) {
+  for await (const [name, entry] of from.entries()) {
+    if (entry.kind === "directory") {
+      await copyFolder(entry, await to.getDirectoryHandle(name, { create: true }));
+    } else {
+      try {
+        const data = await (await entry.getFile()).arrayBuffer();
+        const out = await (await to.getFileHandle(name, { create: true })).createWritable();
+        await out.write(data);
+        await out.close();
+      } catch (error) {
+        console.warn(`[browser] could not copy ${name} into this window's profile: ${error.message}`);
+      }
+    }
+  }
+}
+
+async function profileFolder(id, wanted) {
+  const name = wanted || new URLSearchParams(location.search).get("profile");
+  if (!name) return "profile";
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) throw new Error("A profile name may use letters, digits, - and _.");
+  const folder = `profile-${name}`;
+  const game = await (await navigator.storage.getDirectory()).getDirectoryHandle(id);
+  const target = await game.getDirectoryHandle(folder, { create: true });
+  try {
+    await target.getFileHandle(".copied");
+  } catch {
+    let main = null;
+    try { main = await game.getDirectoryHandle("profile"); } catch {}
+    if (main) await copyFolder(main, target);
+    await (await (await target.getFileHandle(".copied", { create: true })).createWritable()).close();
+  }
+  return folder;
+}
+
+async function gameId() {
+  if (document.documentElement.dataset.gameId) return document.documentElement.dataset.gameId;
+  const parts = location.pathname.split("/").filter(Boolean);
+  if (parts.length && parts[parts.length - 1].includes(".")) parts.pop();
+  return decodeURIComponent(parts[parts.length - 1] || "");
+}
+
+function phoneInPortrait() {
+  return matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) <= 600 && innerHeight > innerWidth;
+}
+
+async function waitForPhoneLandscape() {
+  if (!phoneInPortrait()) return;
+  startup("waiting for landscape orientation");
+  status("Rotate your phone to landscape to start.");
+  await new Promise((resolve) => {
+    const check = () => {
+      if (phoneInPortrait()) return;
+      removeEventListener("resize", check);
+      removeEventListener("orientationchange", check);
+      resolve();
+    };
+    addEventListener("resize", check);
+    addEventListener("orientationchange", check);
+  });
+  // Let the browser resize its high-DPI canvas before SDL reads it once for
+  // Carbon's resolution list.
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+// Match the desktop launcher's render scale: Screen is automatic, 1.5x and
+// Game resolution are fixed multipliers. Read the selected profile before
+// creating the renderer; the native setting is saved for the next start.
+async function savedRenderScale(game, profile) {
+  const config = game.renderScaleSetting;
+  if (!config) return undefined;
+  let choice = config.default;
+  try {
+    let dir = await navigator.storage.getDirectory();
+    for (const part of [game.id, profile]) dir = await dir.getDirectoryHandle(part);
+    const file = await (await dir.getFileHandle("mod-settings.json")).getFile();
+    const value = JSON.parse(await file.text())[config.setting];
+    if (Number.isInteger(value) && value >= 0 && value <= 2) choice = value;
+  } catch (error) {
+    if (error.name !== "NotFoundError") console.warn("[browser] could not read render resolution; using its default");
+  }
+  return choice === 1 ? "1.5" : choice === 2 ? "1" : undefined;
+}
+
+// options (from the game's start page): profile, a save slot name like
+// ?profile=; online, {relay, name} like ?mp= and &name=; lan, {url, name}
+// like ?lan=ws://host:port: the game's own online code over the server's
+// virtual LAN (lan.js; RECOMP_LAN turns the kit's Winsock on).
+async function start(options = {}) {
+  startup("browser checks");
+  if (!crossOriginIsolated) throw new Error("The game could not start. Reload this page and try again.");
+  if (!navigator.gpu) throw new Error("This browser cannot run the game. Open it in desktop Chrome.");
+  await waitForPhoneLandscape();
+  startup("reading game information");
+  const id = await gameId();
+  const games = await fetch("../games.json").then((r) => r.json());
+  const game = games.find((g) => g.id === id);
+  if (!game) throw new Error(`No game "${id}" in the launcher's games.json.`);
+  document.title = game.title;
+
+  // Full imports still boot locally; hosted games prepare only verified startup modules.
+  startup("checking game files");
+  let stream = null;
+  let dir = await navigator.storage.getDirectory();
+  let complete = false;
+  try {
+    for (const p of [id, "game"]) dir = await dir.getDirectoryHandle(p);
+    const stamp = await (await (await dir.getFileHandle(".stamp")).getFile()).text();
+    complete = stamp.trim() === game.sha256;
+  } catch {}
+  if (!complete && game.streamAssets && game.downloadManifest) {
+    startup("preparing game files");
+    status("Loading game…");
+    const worker = new Worker("../worker.js", { type: "module" });
+    try {
+      stream = await new Promise((resolve, reject) => {
+        worker.onerror = () => reject(new Error("Could not prepare game files. Try Play again."));
+        worker.onmessage = ({ data }) => {
+          if (data.progress) {
+            const p = data.progress;
+            status(`Loading game… ${p.bytesTotal ? Math.floor(p.bytesDone / p.bytesTotal * 100) : 0}%`);
+          } else if (data.error) reject(new Error(data.error));
+          else if (data.result?.result === "done") resolve(data.result);
+          else if (data.result?.result === "noSpace") reject(noSpaceError(data.result));
+          else reject(new Error(`Startup download failed: ${data.result?.result}`));
+        };
+        worker.postMessage({ id: 1, cmd: "streamSetup", game });
+      });
+    } finally { worker.terminate(); }
+  } else if (!complete) throw new Error(`Import ${game.title} from the launcher before playing.`);
+  window.carbonTestAssets = { NIS: !!stream };
+  if (!stream) {
+    try { await dir.getDirectoryHandle("NIS"); window.carbonTestAssets.NIS = true; }
+    catch { console.warn("[browser] NIS scene data is missing; resume Import Windows installation."); }
+  }
+  const streamChannel = new BroadcastChannel("recomp-stream");
+  if (stream) {
+    window.recompStream = {
+      prepareModels: keys => streamChannel.postMessage({ type: "prefetch-models", keys }),
+      prepareFiles: paths => streamChannel.postMessage({ type: "prefetch", paths }),
+    };
+    if (game.streamPreparationScript) {
+      const prepare = document.createElement("script");
+      prepare.src = game.streamPreparationScript;
+      document.body.append(prepare);
+    }
+  }
+  let activeLoads = 0;
+  let streamFailed = false;
+  streamChannel.onmessage = ({ data }) => {
+    if (data.type === "stats") window.recompStreamStats = data;
+    if (data.type === "unavailable") {
+      if (streamFailed) return;
+      streamFailed = true;
+      console.error("[stream] required game file unavailable", data.path || "(unknown file)", data.message || "");
+      reportFailure("stream", new Error(
+        "A game file could not be loaded. Check your connection and reload. Your saves are kept."));
+    }
+    if (data.type === "loading") {
+      activeLoads = Math.max(0, activeLoads + (data.busy ? 1 : -1));
+      if (!streamFailed) status(activeLoads ? "Loading…" : "");
+    }
+  };
+
+  startup("starting graphics adapter");
+  let adapter;
+  for (const options of [{ powerPreference: "high-performance" }, undefined]) {
+    try { adapter = await navigator.gpu.requestAdapter(options); }
+    catch (error) { console.warn("[browser] WebGPU adapter request failed", error?.message || String(error)); }
+    if (adapter) break;
+    if (options) console.warn("[browser] high-performance WebGPU adapter unavailable; trying the browser default");
+  }
+  if (!adapter) throw new Error("This browser could not start WebGPU. Turn on hardware acceleration and restart the browser. If that does not work, update the graphics driver or use the current Chrome or Edge version.");
+  const info = adapter.info || {};
+  window.carbonGraphicsInfo = {
+    vendor: info.vendor || "", architecture: info.architecture || "",
+    device: info.device || "", description: info.description || "",
+    fallback: adapter.isFallbackAdapter ?? info.isFallbackAdapter ?? null,
+  };
+  const wanted = ["texture-compression-bc", "depth32float-stencil8", "float32-filterable",
+                  "unorm16-texture-formats", "rg11b10ufloat-renderable"];
+  const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
+  const requiredLimits = {};
+  for (const k of ["maxTextureDimension2D", "maxBufferSize", "maxStorageBufferBindingSize",
+                   "maxUniformBufferBindingSize", "maxBindGroups", "maxSampledTexturesPerShaderStage",
+                   "maxSamplersPerShaderStage", "maxStorageBuffersPerShaderStage",
+                   "maxUniformBuffersPerShaderStage", "maxDynamicUniformBuffersPerPipelineLayout",
+                   "maxVertexBuffers", "maxVertexAttributes", "maxColorAttachments",
+                   "maxInterStageShaderVariables"])
+    if (k in adapter.limits) requiredLimits[k] = adapter.limits[k];
+  startup("starting graphics device");
+  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  device.lost.then((info) => reportFailure("graphics-device-lost",
+    new Error(`The graphics device stopped: ${info.message}. Reload the page; your saves are kept.`)));
+  device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
+
+  startup("opening player profile");
+  const exe = `/opfs/${id}/game/${game.executable}`;
+  const profile = await profileFolder(id, options.profile);
+  const renderScale = await savedRenderScale(game, profile);
+  // ?mp=<relay address>: online play. The game's client (net.js) links the
+  // game to the relay, and the game keeps running while another window has
+  // the keyboard.
+  if (options.online) window.recompOnline = options.online;
+  const online = !!options.online || new URLSearchParams(location.search).has("mp");
+  if (online) {
+    const net = document.createElement("script");
+    net.src = "net.js";
+    net.onerror = () => console.warn("[browser] this game has no online client (net.js)");
+    document.body.append(net);
+  }
+  const lanUrl = options.lan?.url || new URLSearchParams(location.search).get("lan");
+  if (lanUrl) {
+    window.recompLan = { url: lanUrl, name: options.lan?.name || options.online?.name || "" };
+    const lan = document.createElement("script");
+    lan.src = "lan.js";
+    lan.onerror = () => console.warn("[browser] the virtual LAN client (lan.js) is missing");
+    document.body.append(lan);
+  }
+  const Module = {
+    canvas,
+    preinitializedWebGPUDevice: device,
+    noInitialRun: true,
+    print: (t) => { log.push(t); console.log(t); },
+    printErr: (t) => { log.push(t); console.warn(t); },
+    setStatus: (t) => status(t ? t : ""),
+    onAbort: (what) => reportFailure("abort", what),
+    preRun: [() => {
+      const m = Module;
+      if (stream) {
+        m.ENV.RECOMP_WEB_ASSET_BASE = stream.base;
+        m.ENV.RECOMP_WEB_ASSET_INDEX = stream.index;
+        if (stream.manifest) m.ENV.RECOMP_WEB_ASSET_MANIFEST = stream.manifest;
+        m.ENV.RECOMP_FILE_READ_YIELD = "1";
+      }
+      m.ENV.RECOMP_PROFILE_DIR = `/opfs/${id}/${profile}`;
+      if (renderScale !== undefined) m.ENV.RECOMP_D3D9_SCALE = renderScale;
+      if (online || lanUrl) m.ENV.RECOMP_KEEP_ACTIVE = "1";
+      if (lanUrl) m.ENV.RECOMP_LAN = "1";
+      const extra = new URLSearchParams(location.search);
+      for (const [k, v] of extra) if (k.startsWith("RECOMP_")) m.ENV[k] = v;
+    }],
+    onRuntimeInitialized() {
+      if (statusFailed) return;
+      startup("starting game code");
+      status("");
+      gameRunning = true;
+      canvas.focus();
+      try { Module.callMain([`--exe=${exe}`]); }
+      catch (error) { reportFailure("main", error); }
+    },
+  };
+  window.Module = Module;
+  startup("loading game runtime");
+  const script = document.createElement("script");
+  script.src = "@APP@.js";
+  script.onerror = () => reportFailure("runtime-script", new Error("The game's web build is missing."));
+  document.body.append(script);
+}
+
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("click", () => canvas.focus());
+
+// A game may have a start page (its web/start.js): it shows first and calls
+// recompBoot when the player presses Play. An address with developer settings
+// (?mp=, ?lan=, ?profile=, RECOMP_*) starts the game at once, as does a game without one.
+let booted = false;
+window.recompBoot = (options) => {
+  if (booted) return;
+  booted = true;
+  status("Loading…");
+  start(options).catch(reportStartupFailure);
+};
+(async () => {
+  const params = [...new URLSearchParams(location.search).keys()];
+  if (params.some((k) => k === "mp" || k === "lan" || k === "profile" || k.startsWith("RECOMP_"))) return recompBoot();
+  const id = await gameId();
+  const games = await fetch("../games.json").then((r) => r.json()).catch(() => []);
+  const game = games.find((g) => g.id === id);
+  window.recompGame = { id, executable: game?.executable || "", title: game?.title || "", sha256: game?.sha256 || "", downloadManifest: game?.downloadManifest || "", streamAssets: !!game?.streamAssets };
+  if (game) document.title = game.title;
+  status("");
+  const page = document.createElement("script");
+  page.src = "start.js";
+  page.onerror = () => recompBoot();
+  document.body.append(page);
+})().catch((e) => status(e.message, true));
+</script>
+</body>
+</html>

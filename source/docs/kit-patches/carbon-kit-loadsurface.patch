@@ -1,0 +1,264 @@
+--- a/kit/dx/d3d9.cpp
++++ b/kit/dx/d3d9.cpp
+@@ -2897,7 +2897,238 @@
+     if (!view)
+         com_release(tex);
+     return view;
++}
++// ---- D3DXLoadSurfaceFromSurface: whole-surface copy with format conversion ----
++// NFSC copies textures into one another at run time (007d7580 when formats
++// differ, 00759040 per mip level, 00732ca0 once at boot). Pixels are read from
++// the surface's canonical CPU copy, so a GPU-rendered source (a render target)
++// is only as current as its last write-back.
++static void px_to_rgba(uint32_t fmt, const uint8_t *p, uint8_t *o) {
++    uint32_t v = 0;
++    switch (fmt) {
++    case 21: o[2] = p[0]; o[1] = p[1]; o[0] = p[2]; o[3] = p[3]; return;      // A8R8G8B8 (BGRA bytes)
++    case 22: o[2] = p[0]; o[1] = p[1]; o[0] = p[2]; o[3] = 255; return;       // X8R8G8B8
++    case 23: v = p[0] | p[1] << 8;                                             // R5G6B5
++        o[0] = uint8_t((v >> 11 & 31) * 255 / 31); o[1] = uint8_t((v >> 5 & 63) * 255 / 63);
++        o[2] = uint8_t((v & 31) * 255 / 31); o[3] = 255; return;
++    case 24: case 25: v = p[0] | p[1] << 8;                                    // X1R5G5B5 / A1R5G5B5
++        o[0] = uint8_t((v >> 10 & 31) * 255 / 31); o[1] = uint8_t((v >> 5 & 31) * 255 / 31);
++        o[2] = uint8_t((v & 31) * 255 / 31); o[3] = fmt == 25 ? (v & 0x8000 ? 255 : 0) : 255; return;
++    case 26: v = p[0] | p[1] << 8;                                             // A4R4G4B4
++        o[0] = uint8_t((v >> 8 & 15) * 17); o[1] = uint8_t((v >> 4 & 15) * 17);
++        o[2] = uint8_t((v & 15) * 17); o[3] = uint8_t((v >> 12 & 15) * 17); return;
++    case 28: o[0] = o[1] = o[2] = 0; o[3] = p[0]; return;                      // A8
++    case 50: o[0] = o[1] = o[2] = p[0]; o[3] = 255; return;                    // L8
++    default: o[0] = o[1] = o[2] = 0; o[3] = 255; return;
++    }
+ }
++static void rgba_to_px(uint32_t fmt, const uint8_t *o, uint8_t *p) {
++    uint32_t v;
++    switch (fmt) {
++    case 21: p[0] = o[2]; p[1] = o[1]; p[2] = o[0]; p[3] = o[3]; return;
++    case 22: p[0] = o[2]; p[1] = o[1]; p[2] = o[0]; p[3] = 255; return;
++    case 23: v = (o[0] >> 3) << 11 | (o[1] >> 2) << 5 | o[2] >> 3; p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); return;
++    case 24: case 25: v = (o[0] >> 3) << 10 | (o[1] >> 3) << 5 | o[2] >> 3 | (fmt == 25 && o[3] < 128 ? 0 : 0x8000);
++        p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); return;
++    case 26: v = (o[3] >> 4) << 12 | (o[0] >> 4) << 8 | (o[1] >> 4) << 4 | o[2] >> 4;
++        p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); return;
++    case 28: p[0] = o[3]; return;
++    case 50: p[0] = uint8_t((o[0] * 77 + o[1] * 150 + o[2] * 29) >> 8); return;
++    default: return;
++    }
++}
++static bool rgba_format_known(uint32_t fmt) {
++    switch (fmt) {
++    case 21: case 22: case 23: case 24: case 25: case 26: case 28: case 50:
++        return true;
++    default:
++        return dxt_block_bytes(fmt) != 0;
++    }
++}
++static void dxt_color_565(const uint8_t *o, uint16_t &c) {
++    c = uint16_t((o[0] >> 3) << 11 | (o[1] >> 2) << 5 | o[2] >> 3);
++}
++static void unpack_565(uint16_t c, uint8_t *o) {
++    o[0] = uint8_t((c >> 11 & 31) * 255 / 31); o[1] = uint8_t((c >> 5 & 63) * 255 / 63);
++    o[2] = uint8_t((c & 31) * 255 / 31); o[3] = 255;
++}
++static void surface_to_rgba(ComObj *s, std::vector<uint8_t> &out) {
++    const uint32_t w = s->width, h = s->height, fmt = s->rmask;
++    out.assign(size_t(w) * h * 4, 0);
++    const uint8_t *src = s->blob.data();
++    if (uint32_t block = dxt_block_bytes(fmt)) {
++        const uint32_t bw = std::max((w + 3) / 4, 1u), bh = std::max((h + 3) / 4, 1u);
++        for (uint32_t by = 0; by < bh; ++by)
++            for (uint32_t bx = 0; bx < bw; ++bx) {
++                const uint8_t *b = src + size_t(by) * s->pitch + size_t(bx) * block;
++                if (size_t(b - src) + block > s->blob.size())
++                    return;
++                const uint8_t *cb = block == 8 ? b : b + 8;
++                const uint16_t c0 = uint16_t(cb[0] | cb[1] << 8), c1 = uint16_t(cb[2] | cb[3] << 8);
++                uint8_t pal[4][4];
++                unpack_565(c0, pal[0]);
++                unpack_565(c1, pal[1]);
++                const bool four = block == 16 || c0 > c1;
++                for (int k = 0; k < 3; ++k) {
++                    pal[2][k] = uint8_t(four ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2);
++                    pal[3][k] = uint8_t(four ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0);
++                }
++                pal[2][3] = 255;
++                pal[3][3] = four ? 255 : 0;
++                const uint32_t bits = uint32_t(cb[4] | cb[5] << 8 | cb[6] << 16 | uint32_t(cb[7]) << 24);
++                uint8_t alpha[8] = {};
++                uint64_t abits = 0;
++                if (fmt == 0x35545844u) { // DXT5
++                    alpha[0] = b[0];
++                    alpha[1] = b[1];
++                    for (int k = 1; k < 7; ++k)
++                        alpha[k + 1] = alpha[0] > alpha[1]
++                                           ? uint8_t(((7 - k) * alpha[0] + k * alpha[1]) / 7)
++                                           : k < 5 ? uint8_t(((5 - k) * alpha[0] + k * alpha[1]) / 5)
++                                                   : uint8_t(k == 5 ? 0 : 255);
++                    for (int k = 0; k < 6; ++k)
++                        abits |= uint64_t(b[2 + k]) << (8 * k);
++                }
++                for (uint32_t k = 0; k < 16; ++k) {
++                    const uint32_t x = bx * 4 + k % 4, y = by * 4 + k / 4;
++                    if (x >= w || y >= h)
++                        continue;
++                    uint8_t *o = &out[(size_t(y) * w + x) * 4];
++                    memcpy(o, pal[bits >> (2 * k) & 3], 4);
++                    if (fmt == 0x33545844u) // DXT3
++                        o[3] = uint8_t((b[k / 2] >> ((k & 1) * 4) & 15) * 17);
++                    else if (fmt == 0x35545844u)
++                        o[3] = alpha[abits >> (3 * k) & 7];
++                }
++            }
++        return;
++    }
++    const uint32_t bpp = format_bytes(fmt);
++    for (uint32_t y = 0; y < h; ++y)
++        for (uint32_t x = 0; x < w; ++x) {
++            const size_t at = size_t(y) * s->pitch + size_t(x) * bpp;
++            if (at + bpp <= s->blob.size())
++                px_to_rgba(fmt, src + at, &out[(size_t(y) * w + x) * 4]);
++        }
++}
++// Encode RGBA (w x h) into a staged copy of `d` (pitch d->pitch).
++static void rgba_to_surface(const std::vector<uint8_t> &in, ComObj *d, uint8_t *dst) {
++    const uint32_t w = d->width, h = d->height, fmt = d->rmask;
++    if (uint32_t block = dxt_block_bytes(fmt)) {
++        // Endpoints at the block's colour bounding box: plain, but never wrong
++        // in kind, and these copies are textures the game already ships.
++        const uint32_t bw = std::max((w + 3) / 4, 1u), bh = std::max((h + 3) / 4, 1u);
++        for (uint32_t by = 0; by < bh; ++by)
++            for (uint32_t bx = 0; bx < bw; ++bx) {
++                uint8_t px[16][4], lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
++                for (uint32_t k = 0; k < 16; ++k) {
++                    const uint32_t x = std::min(bx * 4 + k % 4, w - 1), y = std::min(by * 4 + k / 4, h - 1);
++                    memcpy(px[k], &in[(size_t(y) * w + x) * 4], 4);
++                    for (int c = 0; c < 4; ++c) {
++                        lo[c] = std::min(lo[c], px[k][c]);
++                        hi[c] = std::max(hi[c], px[k][c]);
++                    }
++                }
++                uint8_t *b = dst + size_t(by) * d->pitch + size_t(bx) * block;
++                uint8_t *cb = block == 8 ? b : b + 8;
++                uint16_t c0, c1;
++                dxt_color_565(hi, c0);
++                dxt_color_565(lo, c1);
++                if (c0 < c1)
++                    std::swap(c0, c1);
++                uint8_t pal[4][4];
++                unpack_565(c0, pal[0]);
++                unpack_565(c1, pal[1]);
++                for (int c = 0; c < 3; ++c) {
++                    pal[2][c] = uint8_t((2 * pal[0][c] + pal[1][c]) / 3);
++                    pal[3][c] = uint8_t((pal[0][c] + 2 * pal[1][c]) / 3);
++                }
++                uint32_t bits = 0;
++                for (uint32_t k = 0; k < 16; ++k) {
++                    int best = 0, bestd = 1 << 30;
++                    for (int i = 0; i < 4; ++i) {
++                        int dd = 0;
++                        for (int c = 0; c < 3; ++c)
++                            dd += (px[k][c] - pal[i][c]) * (px[k][c] - pal[i][c]);
++                        if (dd < bestd) { bestd = dd; best = i; }
++                    }
++                    if (c0 == c1)
++                        best = 0;
++                    bits |= uint32_t(best) << (2 * k);
++                }
++                cb[0] = uint8_t(c0); cb[1] = uint8_t(c0 >> 8); cb[2] = uint8_t(c1); cb[3] = uint8_t(c1 >> 8);
++                memcpy(cb + 4, &bits, 4);
++                if (fmt == 0x33545844u) { // DXT3: explicit 4-bit alpha
++                    for (uint32_t k = 0; k < 16; k += 2)
++                        b[k / 2] = uint8_t((px[k][3] >> 4) | (px[k + 1][3] >> 4) << 4);
++                } else if (block == 16) { // DXT5 (DXT2/4 treated alike): 8-step ramp
++                    const uint8_t a0 = hi[3], a1 = lo[3];
++                    b[0] = a0;
++                    b[1] = a1;
++                    uint64_t abits = 0;
++                    for (uint32_t k = 0; k < 16; ++k) {
++                        int idx = 0;
++                        if (a0 != a1) {
++                            const int t = ((a0 - px[k][3]) * 7 + (a0 - a1) / 2) / (a0 - a1); // 0..7 along a0->a1
++                            idx = t <= 0 ? 0 : t >= 7 ? 1 : t + 1;
++                        }
++                        abits |= uint64_t(idx) << (3 * k);
++                    }
++                    for (int k = 0; k < 6; ++k)
++                        b[2 + k] = uint8_t(abits >> (8 * k));
++                }
++            }
++        return;
++    }
++    const uint32_t bpp = format_bytes(fmt);
++    for (uint32_t y = 0; y < h; ++y)
++        for (uint32_t x = 0; x < w; ++x)
++            rgba_to_px(fmt, &in[(size_t(y) * w + x) * 4], dst + size_t(y) * d->pitch + size_t(x) * bpp);
++}
++// Returns 0 (D3D_OK) or an HRESULT.
++uint32_t d3d9_load_surface(uint32_t dst_view, uint32_t src_view, uint32_t color_key) {
++    ComObj *d = dst_view ? com_this(dst_view) : nullptr, *s = src_view ? com_this(src_view) : nullptr;
++    if (!d || !s || d->kind != K_D3D9SURFACE || s->kind != K_D3D9SURFACE)
++        return D3DERR_INVALIDCALL;
++    if (!rgba_format_known(d->rmask) || !rgba_format_known(s->rmask) || s->blob.empty()) {
++        log_once("d3dx9.loadsurface.fmt", "d3dx9: D3DXLoadSurfaceFromSurface: format %08x -> %08x not supported",
++                 s->rmask, d->rmask);
++        return 0x8876086au; // D3DERR_NOTAVAILABLE
++    }
++    const uint32_t staged = stage_lock(d);
++    if (!staged)
++        return E_OUTOFMEMORY;
++    uint8_t *dst = gm_ptr(staged);
++    if (s->rmask == d->rmask && s->width == d->width && s->height == d->height && !color_key) {
++        const uint32_t rows = dds_rows(d->rmask, d->height);
++        const size_t row = std::min<size_t>(dds_row_bytes(d->rmask, d->width), std::min(s->pitch, d->pitch));
++        for (uint32_t r = 0; r < rows; ++r)
++            if (size_t(r) * s->pitch + row <= s->blob.size())
++                memcpy(dst + size_t(r) * d->pitch, s->blob.data() + size_t(r) * s->pitch, row);
++    } else {
++        std::vector<uint8_t> rgba, scaled;
++        surface_to_rgba(s, rgba);
++        if (color_key)
++            for (size_t i = 0; i < rgba.size(); i += 4) {
++                const uint32_t argb = uint32_t(rgba[i + 3]) << 24 | rgba[i] << 16 | rgba[i + 1] << 8 | rgba[i + 2];
++                if (argb == color_key)
++                    rgba[i] = rgba[i + 1] = rgba[i + 2] = rgba[i + 3] = 0;
++            }
++        if (s->width != d->width || s->height != d->height) { // nearest neighbour
++            scaled.resize(size_t(d->width) * d->height * 4);
++            for (uint32_t y = 0; y < d->height; ++y)
++                for (uint32_t x = 0; x < d->width; ++x) {
++                    const uint32_t sx = uint32_t(uint64_t(x) * s->width / d->width),
++                                   sy = uint32_t(uint64_t(y) * s->height / d->height);
++                    memcpy(&scaled[(size_t(y) * d->width + x) * 4], &rgba[(size_t(sy) * s->width + sx) * 4], 4);
++                }
++            rgba.swap(scaled);
++        }
++        rgba_to_surface(rgba, d, dst);
++    }
++    stage_unlock(d);
++    return 0;
++}
+ static void VolTex_LockBox(X86 *c) {
+     volume_lock(c, volume_level(com_this_arg(c), arg(c, 1)), arg(c, 2), arg(c, 3), arg(c, 4));
+ }
+--- a/kit/dx/d3dx9.cpp
++++ b/kit/dx/d3dx9.cpp
+@@ -2339,8 +2339,19 @@
+              arg(c, 0), arg(c, 1));
+     set_eax(c, D3D_OKX);
+ }
++uint32_t d3d9_load_surface(uint32_t dst_view, uint32_t src_view, uint32_t color_key); // d3d9.cpp
++// (pDestSurface, pDestPalette, pDestRect, pSrcSurface, pSrcPalette, pSrcRect,
++//  Filter, ColorKey). Whole surfaces only; any filter is point sampling.
+ static void X_D3DXLoadSurfaceFromSurface(X86 *c) {
+-    d3dx_unavailable(c, "D3DXLoadSurfaceFromSurface", -1);
++    if (arg(c, 2) || arg(c, 5)) {
++        log_once("d3dx9.loadsurface.rect", "d3dx9: D3DXLoadSurfaceFromSurface with a rectangle is not supported");
++        set_eax(c, 0x8876086au);
++        return;
++    }
++    const uint32_t hr = d3d9_load_surface(arg(c, 0), arg(c, 3), arg(c, 7));
++    log_once("d3dx9.loadsurface", "d3dx9: D3DXLoadSurfaceFromSurface(%08x <- %08x) -> %08x", arg(c, 0),
++             arg(c, 3), hr);
++    set_eax(c, hr);
+ }
+ static void X_D3DXSaveSurfaceToFileA(X86 *c) {
+     d3dx_unavailable(c, "D3DXSaveSurfaceToFileA", -1);

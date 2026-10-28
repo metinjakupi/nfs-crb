@@ -1,0 +1,22 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -1230,10 +1230,18 @@
+             m = re.match(r"dword ptr \[(0x[0-9a-fA-F]+)\]$", op.strip())
+             return int(m.group(1), 16) if m else None
+ 
++        def initterm_thunk(t):
++            # `JMP dword ptr [__imp__initterm]` (FF 25 slot): the import stub
++            # the linker emits when the caller was not compiled dllimport.
++            # NFSC.exe's startup calls both tables through one, at 0087f1a0.
++            return (self.rd8(t) == 0xFF and self.rd8(t + 1) == 0x25
++                    and self.rd32(t + 2) in initterm_slots)
++
+         def calls_initterm(ins, cached):
+             op = ins.ops[0]
+             if op.startswith("0x"):
+-                return int(op, 16) in walkers
++                t = int(op, 16)
++                return t in walkers or initterm_thunk(t)
+             if op.strip() in cached:
+                 return True
+             return slot_of(op) in initterm_slots

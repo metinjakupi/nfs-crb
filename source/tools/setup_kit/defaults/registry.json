@@ -1,0 +1,84 @@
+{
+  "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Need for Speed Carbon": {
+    "FirstTime": {
+      "type": 4,
+      "data": 0
+    },
+    "g_AudioMode": {
+      "type": 4,
+      "data": 1
+    },
+    "g_Brightness": {
+      "type": 4,
+      "data": 52
+    },
+    "g_CarEnvironmentMapEnable": {
+      "type": 4,
+      "data": 3
+    },
+    "g_CarLodLevel": {
+      "type": 4,
+      "data": 1
+    },
+    "g_FSAALevel": {
+      "type": 4,
+      "data": 0
+    },
+    "g_MotionBlurEnable": {
+      "type": 4,
+      "data": 1
+    },
+    "g_ParticleSystemEnable": {
+      "type": 4,
+      "data": 1
+    },
+    "g_PerformanceLevel": {
+      "type": 4,
+      "data": 2
+    },
+    "g_RacingResolution": {
+      "type": 4,
+      "data": 1
+    },
+    "g_RainEnable": {
+      "type": 4,
+      "data": 1
+    },
+    "g_RoadReflectionEnable": {
+      "type": 4,
+      "data": 1
+    },
+    "g_ShaderDetailLevel": {
+      "type": 4,
+      "data": 2
+    },
+    "g_ShadowDetail": {
+      "type": 4,
+      "data": 0
+    },
+    "g_TextureFiltering": {
+      "type": 4,
+      "data": 1
+    },
+    "g_VisualTreatment": {
+      "type": 4,
+      "data": 1
+    },
+    "g_VSyncOn": {
+      "type": 4,
+      "data": 0
+    },
+    "g_WorldLodLevel": {
+      "type": 4,
+      "data": 2
+    },
+    "SIZE": {
+      "type": 4,
+      "data": 100
+    },
+    "VERSION": {
+      "type": 4,
+      "data": 1
+    }
+  }
+}

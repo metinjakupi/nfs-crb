@@ -1,0 +1,54 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -1658,6 +1658,13 @@
+ 
+ NORETURN_IMPORTS = frozenset(("RaiseException", "ExitProcess", "TerminateProcess",
+                               "ExitThread", "FatalAppExitA", "FatalExit"))
++# Imports a CALL through the IAT never comes back from. Wider than
++# NORETURN_IMPORTS: it adds the C runtime's exits, which a game linking the
++# CRT as a DLL (NFS Carbon imports msvcr71.dll) calls through the IAT, and
++# which Ghidra's library signatures already end listings at.
++NORETURN_IAT_CALLS = NORETURN_IMPORTS | frozenset((
++    "_exit", "exit", "abort", "_amsg_exit", "_CxxThrowException", "?terminate@@YAXXZ",
++    "longjmp", "_endthread", "_endthreadex"))
+ 
+ 
+ def noreturn_callees_from(parsed, iat_names, image=None):
+@@ -1796,11 +1803,23 @@
+                 break
+ 
+     def never_returns(self, ins):
+-        """Is `ins` a direct CALL to a callee the listings show never returning?"""
++        """Is `ins` a direct CALL to a callee the listings show never returning,
++        or a CALL through an import slot for one that never returns?"""
+         if ins.mnem != "CALL":
+             return False
+         t = self.branch_target(ins)
+-        return t is not None and t in self.noreturn_callees
++        if t is not None:
++            return t in self.noreturn_callees
++        return self.iat_call_name(ins) in NORETURN_IAT_CALLS
++
++    def iat_call_name(self, ins):
++        """The import a `CALL dword ptr [slot]` goes through, else None."""
++        if not ins.ops:
++            return None
++        m = re.match(r"dword ptr \[(0x[0-9a-fA-F]+)\]$", ins.ops[0].strip())
++        if not m:
++            return None
++        return getattr(self.image, "iat_names", {}).get(int(m.group(1), 16))
+ 
+     @staticmethod
+     def closed_noreturn_loop(fn):
+@@ -3218,6 +3237,11 @@
+             if RESUMABLE_STACKS:
+                 L.append("if (c->eip != %s) return;" % hexlit(nxt))
+             self.stats["_call_indirect"] += 1
++            if self.never_returns(ins):
++                # An exit import (see NORETURN_IAT_CALLS): what follows is
++                # padding. Coming back anyway is reported, as for direct calls.
++                self.stats["_noreturn_trap"] += 1
++                L.append("recomp_unknown_call(c, %s); return;" % hexlit(nxt))
+             return L
+ 
+         if m == "RET":

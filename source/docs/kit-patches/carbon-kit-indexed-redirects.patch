@@ -1,0 +1,15 @@
+--- a/kit/tools/recomp/translate.py
++++ b/kit/tools/recomp/translate.py
+@@ -373,8 +373,10 @@
+             if ins.addr not in redirects or not ins.ops:
+                 continue
+             old, new = redirects[ins.addr]
+-            pattern = re.compile(r"\[0x0*%x\]" % old, re.IGNORECASE)
+-            ops = [pattern.sub("[0x%08x]" % new, o) for o in ins.ops]
++            # A bare [0xADDR], or ADDR as the displacement ending an indexed
++            # operand ([EAX*0x4 + 0xADDR]), as table reads are listed.
++            pattern = re.compile(r"(\[|\+ )0x0*%x\]" % old, re.IGNORECASE)
++            ops = [pattern.sub(lambda m: "%s0x%08x]" % (m.group(1), new), o) for o in ins.ops]
+             if ops != list(ins.ops):
+                 ins.ops = ops
+                 missing.pop(ins.addr, None)

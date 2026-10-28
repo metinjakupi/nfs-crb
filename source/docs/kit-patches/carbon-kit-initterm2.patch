@@ -1,0 +1,46 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -1226,19 +1226,39 @@
+         if not walkers and not initterm_slots:
+             return [], set()
+ 
+-        def calls_initterm(ins):
++        def slot_of(op):
++            m = re.match(r"dword ptr \[(0x[0-9a-fA-F]+)\]$", op.strip())
++            return int(m.group(1), 16) if m else None
++
++        def calls_initterm(ins, cached):
+             op = ins.ops[0]
+             if op.startswith("0x"):
+                 return int(op, 16) in walkers
+-            m = re.match(r"dword ptr \[(0x[0-9a-fA-F]+)\]$", op.strip())
+-            return bool(m) and int(m.group(1), 16) in initterm_slots
++            if op.strip() in cached:
++                return True
++            return slot_of(op) in initterm_slots
+ 
+         ranges, entries = [], set()
+         for fn in functions:
++            # MSVC loads an import it calls twice into a register once:
++            # `MOV EDI,dword ptr [__imp__initterm] ... CALL EDI` (NFSC.exe's
++            # startup runs both initializer tables that way). Track which
++            # registers hold the import, forgetting one when it is written.
++            cached = set()
+             for i, ins in enumerate(fn.insns):
++                if ins.ops and ins.mnem in ("MOV", "LEA", "POP", "XOR", "SUB", "ADD", "AND",
++                                            "OR", "INC", "DEC", "XCHG", "MOVZX", "MOVSX"):
++                    dst = ins.ops[0].strip()
++                    cached.discard(dst)
++                    if (ins.mnem == "MOV" and len(ins.ops) == 2
++                            and slot_of(ins.ops[1]) in initterm_slots):
++                        cached.add(dst)
+                 if ins.mnem != "CALL" or not ins.ops:
+                     continue
+-                if not calls_initterm(ins):
++                if not calls_initterm(ins, cached):
++                    cached.discard("EAX")       # the callee's return value
++                    cached.discard("ECX")
++                    cached.discard("EDX")
+                     continue
+                 if i < 2 or fn.insns[i - 1].mnem != "PUSH" or fn.insns[i - 2].mnem != "PUSH":
+                     continue

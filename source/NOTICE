@@ -1,0 +1,101 @@
+Need for Speed: Carbon is the original game represented by this project.
+Original game names, executable code, artwork, audio, tracks, cinematics and
+other data retain their original ownership and notices. Original in-game
+credits are preserved. This project is not affiliated with or endorsed by
+Electronic Arts. "Need for Speed" and "Carbon" are trademarks of Electronic
+Arts Inc.
+
+Original game files are not distributed in this repository. The app is built
+locally from the player's own copy of the game; the game's executable, data,
+artwork, audio, tracks and cinematics are still required from that copy and
+are never included. The app icon is made at build time from the game's own
+logo in the player's files (GLOBAL/UniqueBootTextures.bin); the fallback
+icon in tools/setup_kit/defaults is original artwork.
+
+The native host, compatibility runtime and translator are recomp-kit by
+veritr1x, included in kit/ with this port's changes, under its own LICENSE and
+NOTICE. The port's setup and much of its approach follow the Need for Speed:
+Most Wanted Mac port (github.com/elforeign/nfs-most-wanted-mac). Its Setup app
+(tools/installer/SetupApp.swift), setup.sh and setup kit were adapted for
+this port.
+
+Third-party work this port reimplements:
+
+- NFSCarbon.WidescreenFix, part of WidescreenFixesPack by ThirteenAG
+  (github.com/ThirteenAG/WidescreenFixesPack). Its resolution and field-of-view
+  changes, HUD constraints, UI/movie geometry scaling, lighting, shadows and
+  Xenon blending are reimplemented in mods/core/nfsc and game.toml. Its license:
+
+  MIT License
+
+  Copyright (c) 2018 ThirteenAG
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+- nfsu2-web by th0mk, with portions by Talha Müderrisoğlu
+  (github.com/th0mk/nfsu2-web). The virtual LAN in kit/ follows its design and
+  ports its rules: the Winsock semantics of runtime/winsock.c and
+  runtime/web/net_lan.c (socket table, bind and port rules, broadcast
+  loopback, "port unreachable", TCP over the switch's frames and its flow
+  control, ICMP echo with the IPv4 header in front, Netbios' adapter status)
+  into kit/runtime/winsock.cpp, and the mailbox of runtime/web/net_proto.h into
+  kit/runtime/lan_mailbox.h and kit/web/player/lan.js. Its license:
+
+  MIT License
+
+  Copyright (c) 2026 th0mk
+  Portions copyright (c) 2026 Talha Müderrisoğlu (the original recompiler and macOS runtime)
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+- NFS-XtendedInput by Lovro Plese (Xan/Tenjoin) and Berkay Yigit
+  (github.com/xan1242/NFS-XtendedInput). Its Carbon controller layout and
+  console button prompts are reimplemented in mods/core/nfsc (pad.h,
+  fe_pad.h). MIT License, Copyright (c) 2022-2023 Lovro Plese (Xan/Tenjoin),
+  Copyright (c) 2023 Berkay Yigit; the license text is as above for
+  ThirteenAG's work, with these names.
+  Its controller button icons (XtendedInputButtons.tpk, art by Aero_) are not
+  included in this repository: the setup optionally downloads them from
+  XtendedInput's GitHub release onto the player's Mac.
+
+- NFS Carbon Remastered UI by BadassBaboon (nfsmods.xyz/mod/1095) is not included: the Setup
+  app downloads it on the player's Mac only when its checkbox is ticked. It is installed by
+  tools/setup_kit/hd_ui.py, which runs the mod's own Endscript; the Endscript commands and the
+  texture-pack layout follow Endscript and Darius by MaxHwoy / nlgxzef (MIT,
+  github.com/nlgxzef/Endscript, github.com/nlgxzef/Darius). What Aero_'s NFSHDContentSupport
+  (GPL-3) does for fonts and the cursor is reimplemented in mods/core/nfsc/hd_ui.h; none of its
+  code is used.
+  The HUFF (EA Huffman) decoder in tools/setup_kit/bun.py comes from the Need for Speed: Most
+  Wanted Mac port's tools/setup_kit/tpk.py.

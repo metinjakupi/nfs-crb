@@ -1,0 +1,18 @@
+{
+ "host.controls/haptics": 1,
+ "host.controls/hidden": 281474976710656,
+ "host.controls/layout": 1,
+ "host.controls/opacity": 100,
+ "host.controls/pad_with_controller": 0,
+ "host.controls/size": 1,
+ "host.controls/snap": 1,
+ "host.display/classic_mode": 0,
+ "host.display/frame_limit": 2,
+ "host.display/hd_textures": 1,
+ "host.display/performance_overlay": 0,
+ "host.display/rendering": 0,
+ "host.display/texture_filtering": 3,
+ "host.display/ui_scale": 0,
+ "host.display/wide_view": 1,
+ "host.display/window": 2
+}

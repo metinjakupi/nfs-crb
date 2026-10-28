@@ -1,0 +1,5 @@
+# Linux x86_64 from a Mac without a C toolchain for Linux: musl's libc and start files come
+# with the rustup target, and rust-lld (shipped with every Rust toolchain) links them into one
+# static binary. See README.md.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

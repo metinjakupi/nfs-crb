@@ -1,0 +1,443 @@
+diff --git a/dx/d3dx9.cpp b/dx/d3dx9.cpp
+index 7c0093d..a0615ca 100644
+--- a/dx/d3dx9.cpp
++++ b/dx/d3dx9.cpp
+@@ -2251,6 +2251,37 @@ void X_D3DXCreateEffectFromResourceA(X86 *c) {
+     set_eax(c, D3D_OKX);
+ }
+ 
++// Need for Speed Carbon's d3dx9_30 imports that have no implementation yet.
++// Each fails cleanly (null out-pointer, D3DERR_NOTAVAILABLE) and says so once
++// in the log, so bring-up shows which of them the game actually reaches.
++static void d3dx_unavailable(X86 *c, const char *name, int out_arg) {
++    log_once(name, "%s: not implemented yet, returning D3DERR_NOTAVAILABLE", name);
++    if (out_arg >= 0) {
++        uint32_t out = arg(c, out_arg);
++        if (out && gm_valid(out, 4))
++            wr32(out, 0);
++    }
++    set_eax(c, 0x8876086au);
++}
++static void X_D3DXCreateCubeTextureFromFileInMemory(X86 *c) {
++    d3dx_unavailable(c, "D3DXCreateCubeTextureFromFileInMemory", 3);
++}
++static void X_D3DXCreateVolumeTextureFromFileInMemory(X86 *c) {
++    d3dx_unavailable(c, "D3DXCreateVolumeTextureFromFileInMemory", 3);
++}
++static void X_D3DXFillVolumeTexture(X86 *c) {
++    d3dx_unavailable(c, "D3DXFillVolumeTexture", -1);
++}
++static void X_D3DXLoadSurfaceFromSurface(X86 *c) {
++    d3dx_unavailable(c, "D3DXLoadSurfaceFromSurface", -1);
++}
++static void X_D3DXSaveSurfaceToFileA(X86 *c) {
++    d3dx_unavailable(c, "D3DXSaveSurfaceToFileA", -1);
++}
++static void X_D3DXSaveSurfaceToFileInMemory(X86 *c) {
++    d3dx_unavailable(c, "D3DXSaveSurfaceToFileInMemory", 0);
++}
++
+ static const ImportShim g_d3dx9_exports[] = {
+     {"d3dx9_26.dll", "D3DXCreateEffectPool", 1, X_D3DXCreateEffectPool},
+     {"d3dx9_26.dll", "D3DXCreateEffectFromResourceA", 9, X_D3DXCreateEffectFromResourceA},
+@@ -2265,6 +2296,12 @@ static const ImportShim g_d3dx9_exports[] = {
+     {"d3dx9_26.dll", "D3DXVec3TransformNormal", 3, X_D3DXVec3TransformNormal},
+     {"d3dx9_26.dll", "D3DXVec3TransformCoordArray", 6, X_D3DXVec3TransformCoordArray},
+     {"d3dx9_26.dll", "D3DXVec3Normalize", 2, X_D3DXVec3Normalize},
++    {"d3dx9_26.dll", "D3DXCreateCubeTextureFromFileInMemory", 4, X_D3DXCreateCubeTextureFromFileInMemory},
++    {"d3dx9_26.dll", "D3DXCreateVolumeTextureFromFileInMemory", 4, X_D3DXCreateVolumeTextureFromFileInMemory},
++    {"d3dx9_26.dll", "D3DXFillVolumeTexture", 3, X_D3DXFillVolumeTexture},
++    {"d3dx9_26.dll", "D3DXLoadSurfaceFromSurface", 8, X_D3DXLoadSurfaceFromSurface},
++    {"d3dx9_26.dll", "D3DXSaveSurfaceToFileA", 5, X_D3DXSaveSurfaceToFileA},
++    {"d3dx9_26.dll", "D3DXSaveSurfaceToFileInMemory", 5, X_D3DXSaveSurfaceToFileInMemory},
+ };
+ 
+ void d3dx9_reset() {
+@@ -2283,4 +2320,12 @@ void d3dx9_register() {
+     com_bind(IF_D3DXEFFECT, K_D3DXEFFECT);
+     com_set_destructor(K_D3DXEFFECT, fx_destroy);
+     imports_register(g_d3dx9_exports, std::size(g_d3dx9_exports));
++    // The same exports under the D3DX DLL names other games link: Carbon
++    // imports d3dx9_30.dll. The functions used here behave the same in both.
++    static const char *const aliases[] = {"d3dx9_30.dll"};
++    static std::vector<ImportShim> renamed;
++    for (const char *dll : aliases)
++        for (const ImportShim &s : g_d3dx9_exports)
++            renamed.push_back({dll, s.name, s.argc_stdcall, s.fn});
++    imports_register(renamed.data(), renamed.size());
+ }
+diff --git a/runtime/kernel32_wide.cpp b/runtime/kernel32_wide.cpp
+index 85af1d5..f5c1dbc 100644
+--- a/runtime/kernel32_wide.cpp
++++ b/runtime/kernel32_wide.cpp
+@@ -407,6 +407,53 @@ void k_FileTimeToLocalFileTime(X86 *c) {
+         memmove(g_mem + dst, g_mem + src, 8); // The virtual machine uses UTC.
+     set_eax(c, ok ? 1 : 0);
+ }
++// Need for Speed Carbon and its msvcr71/msvcp71 (game.toml [modules.aux]).
++// Guest threads are scheduled cooperatively, so plain reads and writes are
++// atomic with respect to each other, as the Interlocked shims above assume.
++void k_InterlockedCompareExchange(X86 *c) {
++    uint32_t p = arg(c, 0), exchange = arg(c, 1), comparand = arg(c, 2);
++    uint32_t old = rd32(p);
++    if (old == comparand)
++        wr32(p, exchange);
++    set_eax(c, old);
++}
++void k_InterlockedExchangeAdd(X86 *c) {
++    uint32_t p = arg(c, 0), value = arg(c, 1);
++    uint32_t old = rd32(p);
++    wr32(p, old + value);
++    set_eax(c, old);
++}
++void k_SetThreadIdealProcessor(X86 *c) {
++    set_eax(c, 0); // previous ideal processor
++}
++void k_DisableThreadLibraryCalls(X86 *c) {
++    set_eax(c, 1);
++}
++void k_GetComputerNameA(X86 *c) {
++    static const char name[] = "MAC";
++    uint32_t buf = arg(c, 0), size_ptr = arg(c, 1);
++    if (!size_ptr || !gm_valid(size_ptr, 4)) {
++        set_last_error(87);
++        set_eax(c, 0);
++        return;
++    }
++    uint32_t cap = rd32(size_ptr);
++    if (!buf || cap < sizeof name || !gm_valid(buf, sizeof name)) {
++        wr32(size_ptr, sizeof name);
++        set_last_error(111); // ERROR_BUFFER_OVERFLOW
++        set_eax(c, 0);
++        return;
++    }
++    memcpy(g_mem + buf, name, sizeof name);
++    wr32(size_ptr, sizeof name - 1);
++    set_eax(c, 1);
++}
++void k_LocalFileTimeToFileTime(X86 *c) {
++    k_FileTimeToLocalFileTime(c); // The virtual machine uses UTC both ways.
++}
++void k_LockFile(X86 *c) {
++    set_eax(c, 1); // one process owns the files
++}
+ void k_FileTimeToSystemTime(X86 *c) {
+     struct tm t{};
+     uint16_t ms = 0;
+@@ -945,6 +992,37 @@ static const ImportShim g_kernel32_wide[] = {
+     {"KERNEL32.dll", "OutputDebugStringW", 1, k_OutputDebugStringW},
+     {"KERNEL32.dll", "GetDateFormatW", 6, k_GetDateFormatW},
+     {"KERNEL32.dll", "FileTimeToLocalFileTime", 2, k_FileTimeToLocalFileTime},
++    {"KERNEL32.dll", "LocalFileTimeToFileTime", 2, k_LocalFileTimeToFileTime},
++    {"KERNEL32.dll", "InterlockedCompareExchange", 3, k_InterlockedCompareExchange},
++    {"KERNEL32.dll", "InterlockedExchangeAdd", 2, k_InterlockedExchangeAdd},
++    {"KERNEL32.dll", "SetThreadIdealProcessor", 2, k_SetThreadIdealProcessor},
++    {"KERNEL32.dll", "DisableThreadLibraryCalls", 1, k_DisableThreadLibraryCalls},
++    {"KERNEL32.dll", "GetComputerNameA", 2, k_GetComputerNameA},
++    {"KERNEL32.dll", "LockFile", 5, k_LockFile},
++    {"KERNEL32.dll", "UnlockFile", 5, k_LockFile},
++    // msvcr71 imports these for console I/O, pipes and process spawning,
++    // which the game never reaches; the pop counts keep the stack right.
++    {"KERNEL32.dll", "Beep", 2, nullptr},
++    {"KERNEL32.dll", "CreatePipe", 4, nullptr},
++    {"KERNEL32.dll", "CreateProcessW", 10, nullptr},
++    {"KERNEL32.dll", "GetExitCodeProcess", 2, nullptr},
++    {"KERNEL32.dll", "GetFileInformationByHandle", 2, nullptr},
++    {"KERNEL32.dll", "HeapCompact", 2, nullptr},
++    {"KERNEL32.dll", "HeapWalk", 2, nullptr},
++    {"KERNEL32.dll", "PeekNamedPipe", 6, nullptr},
++    {"KERNEL32.dll", "GetConsoleMode", 2, nullptr},
++    {"KERNEL32.dll", "SetConsoleMode", 2, nullptr},
++    {"KERNEL32.dll", "GetNumberOfConsoleInputEvents", 2, nullptr},
++    {"KERNEL32.dll", "PeekConsoleInputA", 4, nullptr},
++    {"KERNEL32.dll", "ReadConsoleInputA", 4, nullptr},
++    {"KERNEL32.dll", "ReadConsoleInputW", 4, nullptr},
++    {"KERNEL32.dll", "ReadConsoleA", 5, nullptr},
++    {"KERNEL32.dll", "ReadConsoleW", 5, nullptr},
++    {"KERNEL32.dll", "WriteConsoleA", 5, nullptr},
++    {"KERNEL32.dll", "WriteConsoleW", 5, nullptr},
++    {"KERNEL32.dll", "SetCurrentDirectoryW", 1, nullptr},
++    {"KERNEL32.dll", "SetEnvironmentVariableW", 2, nullptr},
++    {"KERNEL32.dll", "SetLocalTime", 1, nullptr},
+     {"KERNEL32.dll", "FileTimeToSystemTime", 2, k_FileTimeToSystemTime},
+     {"KERNEL32.dll", "FileTimeToDosDateTime", 3, k_FileTimeToDosDateTime},
+ 
+diff --git a/runtime/loader.cpp b/runtime/loader.cpp
+index 75269f0..4274621 100644
+--- a/runtime/loader.cpp
++++ b/runtime/loader.cpp
+@@ -16,6 +16,7 @@ __attribute__((weak)) const uint32_t recomp_data_seed_count = 0;
+ }
+ #include "memory.h"
+ #include "imports.h"
++#include "guest.h"
+ #include "win32.h"
+ 
+ #include <stdio.h>
+@@ -259,7 +260,9 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
+             // DLLs can import code AND data from the executable. Both slots
+             // must hold the original guest address, not a host trampoline or
+             // a separately allocated copy of an exported global.
+-            if (const LoaderModule *module = loader_module_named(dll.c_str())) {
++            if (LoaderModule *module = loader_module_named(dll.c_str())) {
++                if (module->base != g_base)
++                    module->bound = true;
+                 uint32_t address = (t & 0x80000000u)
+                                        ? loader_module_export_ordinal(*module, t & 0xffff)
+                                        : loader_module_export(*module, namebuf);
+@@ -309,29 +312,40 @@ bool load_aux_module(const AuxSpec &spec) {
+     LoaderModule m;
+     m.name = spec.name;
+     m.path = dirname_of(g_exe_path) + "/" + spec.name;
+-    std::vector<uint8_t> file;
+-    if (!read_file(m.path.c_str(), file)) {
++    // Candidates in order: beside the executable, the configured installation
++    // subfolder beside it, then the developer path. The first whose content
++    // hash matches wins, so an original DLL beside the game (e.g. a stock
++    // msvcr71.dll) does not shadow the rebased copy game.toml names.
++    std::vector<std::string> candidates{dirname_of(g_exe_path) + "/" + spec.name};
++    {
+         const std::string root = std::string(RECOMP_DEVELOPER_GAME_DIR) + "/";
+         const std::string configured = spec.path;
+-        bool found = false;
+-        if (configured.compare(0, root.size(), root) == 0) {
+-            m.path = dirname_of(g_exe_path) + "/" + configured.substr(root.size());
+-            found = read_file(m.path.c_str(), file);
+-        }
+-        if (!found) {
+-            // Modules kept outside the install still have a developer fallback.
+-            m.path = configured;
+-            found = read_file(m.path.c_str(), file);
+-        }
+-        if (!found) {
+-            g_error =
+-                std::string("cannot read auxiliary module ") + spec.name + " beside " + g_exe_path;
+-            return false;
+-        }
++        if (configured.compare(0, root.size(), root) == 0)
++            candidates.push_back(dirname_of(g_exe_path) + "/" + configured.substr(root.size()));
++        candidates.push_back(configured);
+     }
+-    std::string digest = sha256_hex(file);
+-    if (digest != spec.sha256) {
+-        g_error = m.path + " has SHA-256 " + digest + ", expected " + spec.sha256;
++    std::vector<uint8_t> file;
++    std::string mismatch;
++    bool found = false;
++    for (const std::string &path : candidates) {
++        std::vector<uint8_t> bytes;
++        if (!read_file(path.c_str(), bytes))
++            continue;
++        std::string digest = sha256_hex(bytes);
++        if (digest != spec.sha256) {
++            if (mismatch.empty())
++                mismatch = path + " has SHA-256 " + digest + ", expected " + spec.sha256;
++            continue;
++        }
++        m.path = path;
++        file.swap(bytes);
++        found = true;
++        break;
++    }
++    if (!found) {
++        g_error = !mismatch.empty() ? mismatch
++                                    : std::string("cannot read auxiliary module ") + spec.name +
++                                          " beside " + g_exe_path;
+         return false;
+     }
+     if (file.size() < 0x40 || rd<uint16_t>(file, 0) != 0x5a4d) {
+@@ -749,11 +763,15 @@ bool loader_load(const char *exe_path) {
+         }
+     }
+ 
+-    if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
+-        return false;
++    // Auxiliary modules first: the executable may import from them statically
++    // (Need for Speed Carbon imports msvcr71.dll and msvcp71.dll), and
++    // patch_iat binds such imports to their exports only when they are mapped.
++    // game.toml orders them by key, so list a DLL before the DLLs importing it.
+     for (uint32_t i = 0; i < RECOMP_AUX_MODULE_COUNT; ++i)
+         if (!load_aux_module(g_aux_specs[i]))
+             return false;
++    if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
++        return false;
+ 
+     if (g_entry != LOADER_EXPECTED_ENTRY)
+         LOGW("entry point is %08x, expected %08x", g_entry, LOADER_EXPECTED_ENTRY);
+@@ -829,6 +847,27 @@ void run_entry(X86 *c) {
+     sched_set_guest_thread(true);
+     // ExitProcess/TerminateProcess/ExitThread-outside-a-thread longjmp here.
+     if (setjmp(*process_exit_jmp()) == 0) {
++        // DLL_PROCESS_ATTACH for statically imported modules, in load order,
++        // before TLS callbacks and the entry point, as the Windows loader does.
++        for (LoaderModule &m : g_aux) {
++            if (!m.bound || m.attached)
++                continue;
++            m.attached = true;
++            m.load_refs = 1;
++            if (!m.entry || recomp_module_lookup(m.entry) < 0) {
++                LOGW("%s: DLL entry %08x is not translated, not run", m.name.c_str(), m.entry);
++                continue;
++            }
++            const uint32_t args[3] = {m.base, 1u /* DLL_PROCESS_ATTACH */, 1u /* static load */};
++            uint32_t ok = guest_call(c, m.entry, args, 3);
++            LOGV("%s: DLL entry %08x attach returned %08x", m.name.c_str(), m.entry, ok);
++            if (!ok) {
++                g_error = m.name + ": DllMain failed process attach";
++                LOGW("%s", g_error.c_str());
++                sched_set_guest_thread(false);
++                return;
++            }
++        }
+         uint32_t count = 0;
+         for (uint32_t p = g_tls.callbacks; p && rva_ok(p - g_base, 4); p += 4) {
+             uint32_t cb = rd32(p);
+diff --git a/runtime/loader.h b/runtime/loader.h
+index bfe336c..1625ccf 100644
+--- a/runtime/loader.h
++++ b/runtime/loader.h
+@@ -49,6 +49,9 @@ struct LoaderModule {
+     std::string name, path;
+     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
+     bool attached = false;
++    // Named in some image's import table (not only reached by LoadLibrary):
++    // run_entry attaches it before the game's entry point, as Windows does.
++    bool bound = false;
+     uint32_t load_refs = 0;
+     std::vector<uint8_t> initial_image;
+     std::vector<SectionInfo> sections;
+diff --git a/runtime/misc.cpp b/runtime/misc.cpp
+index 1b92a9f..3ca7960 100644
+--- a/runtime/misc.cpp
++++ b/runtime/misc.cpp
+@@ -1076,6 +1076,105 @@ void w_inet_ntoa(X86 *c) {
+     set_eax(c, buf);
+ }
+ 
++// Need for Speed Carbon (ws2_32 by name, advapi32, rpcrt4, ole32). Online
++// play is gone, so these only have to answer the probes the game makes at
++// start-up: an admin check, a random seed and a GUID for the profile.
++void w_htons(X86 *c) {
++    uint32_t v = arg(c, 0) & 0xffff;
++    set_eax(c, ((v & 0xff) << 8) | (v >> 8));
++}
++void w_htonl(X86 *c) {
++    uint32_t v = arg(c, 0);
++    set_eax(c, (v >> 24) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) | (v << 24));
++}
++void w_inet_addr(X86 *c) {
++    unsigned a, b, cc, d;
++    char tail;
++    std::string text = gm_str(arg(c, 0), 64);
++    if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &tail) == 4 && a < 256 && b < 256 &&
++        cc < 256 && d < 256)
++        set_eax(c, a | (b << 8) | (cc << 16) | (d << 24)); // network byte order
++    else
++        set_eax(c, 0xffffffffu); // INADDR_NONE
++}
++void fill_random(uint32_t p, uint32_t n) {
++    static uint64_t state = 0;
++    if (!state)
++        state = os_monotonic_ns() ^ (uint64_t)(uintptr_t)&state ^ 0x9e3779b97f4a7c15ull;
++    for (uint32_t i = 0; i < n; ++i) {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        wr8(p + i, (uint8_t)state);
++    }
++}
++void a_AllocateAndInitializeSid(X86 *c) {
++    uint32_t out = arg(c, 10);
++    if (out && gm_valid(out, 4))
++        wr32(out, 0);
++    set_last_error(5); // ERROR_ACCESS_DENIED: no SIDs here
++    set_eax(c, 0);
++}
++void a_CheckTokenMembership(X86 *c) {
++    uint32_t member = arg(c, 2);
++    if (member && gm_valid(member, 4))
++        wr32(member, 0); // not an administrator
++    set_eax(c, 1);
++}
++void a_CryptAcquireContextA(X86 *c) {
++    uint32_t out = arg(c, 0);
++    if (out && gm_valid(out, 4))
++        wr32(out, 0x43525950u); // any nonzero provider handle
++    set_eax(c, out ? 1 : 0);
++}
++void a_CryptGenRandom(X86 *c) {
++    uint32_t n = arg(c, 1), p = arg(c, 2);
++    bool ok = p && gm_valid(p, n);
++    if (ok)
++        fill_random(p, n);
++    set_eax(c, ok ? 1 : 0);
++}
++void o_CoCreateGuid(X86 *c) {
++    uint32_t p = arg(c, 0);
++    if (!p || !gm_valid(p, 16)) {
++        set_eax(c, 0x80070057u); // E_INVALIDARG
++        return;
++    }
++    fill_random(p, 16);
++    wr8(p + 7, (uint8_t)((rd8(p + 7) & 0x0f) | 0x40)); // version 4
++    wr8(p + 8, (uint8_t)((rd8(p + 8) & 0x3f) | 0x80)); // RFC 4122 variant
++    set_eax(c, 0);
++}
++void r_UuidToStringA(X86 *c) {
++    uint32_t u = arg(c, 0), out = arg(c, 1);
++    if (!u || !out || !gm_valid(u, 16) || !gm_valid(out, 4)) {
++        set_eax(c, 1702); // RPC_S_INVALID_ARG
++        return;
++    }
++    char tmp[40];
++    snprintf(tmp, sizeof tmp, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", rd32(u), rd16(u + 4),
++             rd16(u + 6), rd8(u + 8), rd8(u + 9), rd8(u + 10), rd8(u + 11), rd8(u + 12), rd8(u + 13),
++             rd8(u + 14), rd8(u + 15));
++    uint32_t buf = heap_alloc(40, true);
++    if (!buf) {
++        set_eax(c, 14); // RPC_S_OUT_OF_MEMORY
++        return;
++    }
++    gm_put_str(buf, tmp, 40);
++    wr32(out, buf);
++    set_eax(c, 0);
++}
++void r_RpcStringFreeA(X86 *c) {
++    uint32_t p = arg(c, 0);
++    if (p && gm_valid(p, 4)) {
++        uint32_t s = rd32(p);
++        if (s && heap_owns(s))
++            heap_free(s);
++        wr32(p, 0);
++    }
++    set_eax(c, 0);
++}
++
+ // -------------------------------------------------------------------------
+ // WINMM: clock, multimedia timers and mmio.
+ // -------------------------------------------------------------------------
+@@ -2229,6 +2328,24 @@ const ImportShim g_misc_shims[] = {
+     {"WS2_32.dll", "getsockname", 3, nullptr},
+     {"WS2_32.dll", "gethostbyname", 1, nullptr},
+     {"WS2_32.dll", "gethostname", 2, nullptr},
++    {"WS2_32.dll", "htons", 1, w_htons},
++    {"WS2_32.dll", "htonl", 1, w_htonl},
++    {"WS2_32.dll", "ntohs", 1, w_htons},
++    {"WS2_32.dll", "ntohl", 1, w_htonl},
++    {"WS2_32.dll", "inet_addr", 1, w_inet_addr},
++    {"WS2_32.dll", "inet_ntoa", 1, w_inet_ntoa},
++    {"WS2_32.dll", "getservbyport", 2, nullptr},
++    {"WS2_32.dll", "getservbyname", 2, nullptr},
++    {"WS2_32.dll", "gethostbyaddr", 3, nullptr},
++    {"ADVAPI32.dll", "AllocateAndInitializeSid", 11, a_AllocateAndInitializeSid},
++    {"ADVAPI32.dll", "CheckTokenMembership", 3, a_CheckTokenMembership},
++    {"ADVAPI32.dll", "FreeSid", 1, nullptr},
++    {"ADVAPI32.dll", "CryptAcquireContextA", 5, a_CryptAcquireContextA},
++    {"ADVAPI32.dll", "CryptGenRandom", 3, a_CryptGenRandom},
++    {"ADVAPI32.dll", "CryptReleaseContext", 2, nullptr},
++    {"RPCRT4.dll", "UuidToStringA", 2, r_UuidToStringA},
++    {"RPCRT4.dll", "RpcStringFreeA", 1, r_RpcStringFreeA},
++    {"ole32.dll", "CoCreateGuid", 1, o_CoCreateGuid},
+     {"NETAPI32.dll", "Netbios", 1, nullptr},
+     {"DDRAW.dll", "DirectDrawCreate", 3, nullptr},
+     {"DDRAW.dll", "DirectDrawEnumerateA", 2, nullptr},

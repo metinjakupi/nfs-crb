@@ -1,0 +1,87 @@
+--- a/kit/dx/d3d9.cpp
++++ b/kit/dx/d3d9.cpp
+@@ -2698,6 +2698,63 @@
+         gpu_after_unlock(v, 0, uint32_t(v->blob.size()));
+     com_ret(c, D3D_OK9);
+ }
++// D3DXFillVolumeTexture's work, here where volume storage lives: for every
++// texel of every level, the guest's LPD3DXFILL3D (out float4, texel-centre
++// coordinate, texel size, user data) gives a colour, stored in the level's
++// format. Need for Speed Carbon builds its colour-grading lookup this way
++// (0073c1a0 -> 0073c100); left unfilled, the lookup is zero and every 3D
++// pixel that passes through the visual treatment comes out black.
++bool d3d9_fill_volume(X86 *c, uint32_t view, uint32_t fn, uint32_t data) {
++    ComObj *tex = view ? com_this(view) : nullptr;
++    if (!tex || tex->kind != K_D3D9VOLUMETEXTURE || !fn)
++        return false;
++    const uint32_t scratch = heap_alloc(48, true);
++    if (!scratch)
++        return false;
++    const uint32_t out = scratch, coord = scratch + 16, size = scratch + 32;
++    auto wrf = [](uint32_t a, float f) { uint32_t u; memcpy(&u, &f, 4); wr32(a, u); };
++    auto rdf = [](uint32_t a) { uint32_t u = rd32(a); float f; memcpy(&f, &u, 4); return f; };
++    auto u8 = [](float f) {
++        f = f < 0.f ? 0.f : f > 1.f ? 1.f : f;
++        return uint32_t(f * 255.f + 0.5f);
++    };
++    for (uint32_t l = 0; l < tex->surfaces.size(); ++l) {
++        ComObj *v = volume_level(tex, l);
++        if (!v || v->lock_count)
++            continue;
++        const uint32_t w = v->width, h = v->height, d = volumes().at(v->id).depth;
++        const uint32_t bpp = v->bpp / 8, fmt = v->rmask;
++        if (v->blob.size() < size_t(v->pitch) * h * d)
++            continue;
++        wrf(size, 1.f / w);
++        wrf(size + 4, 1.f / h);
++        wrf(size + 8, 1.f / d);
++        for (uint32_t z = 0; z < d; ++z)
++            for (uint32_t y = 0; y < h; ++y)
++                for (uint32_t x = 0; x < w; ++x) {
++                    wrf(coord, (x + 0.5f) / w);
++                    wrf(coord + 4, (y + 0.5f) / h);
++                    wrf(coord + 8, (z + 0.5f) / d);
++                    for (int i = 0; i < 4; ++i)
++                        wrf(out + 4 * i, 0.f);
++                    const uint32_t args[4] = {out, coord, size, data};
++                    guest_call(c, fn, args, 4);
++                    const uint32_t r = u8(rdf(out)), g = u8(rdf(out + 4)),
++                                   b = u8(rdf(out + 8)), a = u8(rdf(out + 12));
++                    uint8_t *px = v->blob.data() + size_t(z) * v->pitch * h + size_t(y) * v->pitch +
++                                  size_t(x) * bpp;
++                    if (bpp == 4) {
++                        const uint32_t argb = (fmt == 22 ? 0xffu : a) << 24 | r << 16 | g << 8 | b;
++                        memcpy(px, &argb, 4);
++                    } else {
++                        *px = uint8_t(fmt == 28 ? a : r); // A8 keeps alpha, L8 the first channel
++                    }
++                }
++        gpu_after_unlock(v, 0, uint32_t(v->blob.size()));
++    }
++    heap_free(scratch);
++    return true;
++}
+ static void VolTex_LockBox(X86 *c) {
+     volume_lock(c, volume_level(com_this_arg(c), arg(c, 1)), arg(c, 2), arg(c, 3), arg(c, 4));
+ }
+--- a/kit/dx/d3dx9.cpp
++++ b/kit/dx/d3dx9.cpp
+@@ -2269,8 +2269,17 @@
+ static void X_D3DXCreateVolumeTextureFromFileInMemory(X86 *c) {
+     d3dx_unavailable(c, "D3DXCreateVolumeTextureFromFileInMemory", 3);
+ }
++bool d3d9_fill_volume(X86 *c, uint32_t view, uint32_t fn, uint32_t data); // d3d9.cpp
+ static void X_D3DXFillVolumeTexture(X86 *c) {
+-    d3dx_unavailable(c, "D3DXFillVolumeTexture", -1);
++    // (LPDIRECT3DVOLUMETEXTURE9, LPD3DXFILL3D, LPVOID)
++    if (!d3d9_fill_volume(c, arg(c, 0), arg(c, 1), arg(c, 2))) {
++        LOGW("d3dx9: D3DXFillVolumeTexture(%08x, %08x): not a volume texture", arg(c, 0), arg(c, 1));
++        set_eax(c, 0x8876086cu); // D3DERR_INVALIDCALL
++        return;
++    }
++    log_once("D3DXFillVolumeTexture", "d3dx9: D3DXFillVolumeTexture filled %08x via guest %08x",
++             arg(c, 0), arg(c, 1));
++    set_eax(c, D3D_OKX);
+ }
+ static void X_D3DXLoadSurfaceFromSurface(X86 *c) {
+     d3dx_unavailable(c, "D3DXLoadSurfaceFromSurface", -1);

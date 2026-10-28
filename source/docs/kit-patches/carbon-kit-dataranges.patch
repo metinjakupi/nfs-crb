@@ -1,0 +1,62 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -43,6 +43,8 @@
+ ANIMATION_COUNTER = 0
+ VISUAL_ANIMATION_READS = frozenset()
+ EXTRA_ENTRY_POINTS = frozenset()
++# [start, end) ranges game.toml says are data, never code (data_ranges).
++DATA_RANGES = ()
+ RESUMABLE_STACKS = False
+ FUNCTION_ALIGNMENT = 16
+ 
+@@ -95,6 +97,8 @@
+     ANIMATION_COUNTER = 0
+     VISUAL_ANIMATION_READS = frozenset()
+     EXTRA_ENTRY_POINTS = frozenset(mod.get("entry_points", ()))
++    global DATA_RANGES
++    DATA_RANGES = tuple(tuple(r) for r in mod.get("data_ranges", ()))
+     FUNCTION_ALIGNMENT = mod["function_alignment"]
+     SYMBOL_PREFIX = "recomp_%s_" % key
+     AUX_MODULE = mod
+@@ -131,6 +135,8 @@
+     global RESUMABLE_STACKS
+     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
+     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
++    global DATA_RANGES
++    DATA_RANGES = tuple((int(lo), int(hi)) for lo, hi in cfg["translate"].get("data_ranges", ()))
+     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
+     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
+     OPERAND_REDIRECTS = {int(r["at"]): (int(r["from"]), int(r["to"]))
+@@ -4245,6 +4251,10 @@
+     initterm_tables = []
+     rejected = set()
+     tr = Translator(image, all_addrs, args)
++    # Ranges game.toml declares data (a jump table whose site the analysis
++    # missed, say): excluded from every pointer and immediate guess, exactly
++    # like a decoded table, so their bytes are never recovered as code.
++    tr.table_ranges.update(DATA_RANGES)
+     tr.noreturn_callees = image.noreturn_callees
+ 
+     if args.check_flags:
+--- a/tools/game_config.py
++++ b/tools/game_config.py
+@@ -267,12 +267,19 @@
+                                                for a in entries):
+             raise ValueError("%s: [modules.aux.%s] entry_points must be addresses inside the module"
+                              % (source, key))
++        ranges = entry.get("data_ranges", [])
++        if not isinstance(ranges, list) or any(
++                not isinstance(r, list) or len(r) != 2 or any(type(v) is not int for v in r)
++                or not base <= r[0] < r[1] <= base + size for r in ranges):
++            raise ValueError("%s: [modules.aux.%s] data_ranges must be [start, end] pairs inside the module"
++                             % (source, key))
+         modules.append({
+             "key": key, "name": entry["name"], "sha256": entry["sha256"], "base": base, "size": size,
+             "path": (game_dir / entry["path"]).resolve(),
+             "listings_path": (game_dir / entry.get("listings", "analysis/" + entry["name"])).resolve(),
+             "function_alignment": alignment,
+             "entry_points": entries,
++            "data_ranges": [tuple(r) for r in ranges],
+         })
+     extra_base = game.setdefault("heap_extra_base", 0)
+     extra_size = game.setdefault("heap_extra_size", 0)

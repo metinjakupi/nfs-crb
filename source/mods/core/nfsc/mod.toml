@@ -1,0 +1,44 @@
+# Carbon's widescreen view. What ThirteenAG's NFSCarbon.WidescreenFix (MIT; see
+# NOTICE) did with binary patches, done here with hooks and translate-time
+# operand redirects (game.toml), because patched code bytes mean nothing to a
+# recompiled game.
+id = "core.nfsc"
+name = "Carbon"
+version = "0.1.0"
+api = 1
+game = "baaaaec33873d4ba7e4dbae6a5212049ffdcf9679a35d865d7625b4189952fd3"
+requires = ["core.hooks >= 1.0.0"]
+affects_simulation = false
+
+[plugin]
+path = "nfsc.dylib"
+
+[settings]
+widescreen = { type = "bool", default = true, apply = "restart", label = "Widescreen", group = "graphics", help = "Fills a wide screen instead of a 4:3 picture. Leave on. Takes effect after a restart." }
+fov_scaling = { type = "int", default = 1, min = 0, max = 2, choices = "Original|Xbox 360|Mathematically correct", apply = "restart", label = "How much you see to the sides", group = "graphics", help = "Selects the original, Xbox 360, or mathematically correct widescreen field of view. Restart to apply." }
+hud_constraint = { type = "int", default = 0, min = 0, max = 3, choices = "Auto|16:9|21:9|Custom", apply = "restart", label = "HUD aspect ratio", group = "graphics", help = "Keeps HUD side groups inside this aspect ratio without changing the world view. Auto uses the game resolution. Restart to apply." }
+hud_custom_width = { type = "int", default = 16, min = 1, max = 10000, apply = "restart", label = "Custom HUD ratio width", group = "graphics", help = "Used with Custom HUD aspect ratio. For 32:9 enter 32 here and 9 for height. Restart to apply." }
+hud_custom_height = { type = "int", default = 9, min = 1, max = 10000, apply = "restart", label = "Custom HUD ratio height", group = "graphics", help = "Used with Custom HUD aspect ratio. Restart to apply." }
+ui_scale = { type = "int", default = 100, min = 25, max = 200, apply = "restart", label = "UI size %", group = "graphics", help = "Menu size. 100 is original; 92 matches the Xbox 360 setting. Restart to apply." }
+ui_autofit = { type = "bool", default = true, apply = "restart", label = "Fit UI to narrow screens", group = "graphics", help = "Reduces UI size when the game aspect ratio is narrower than 4:3. Restart to apply." }
+movie_mode = { type = "int", default = 1, min = 1, max = 2, choices = "Crop|Stretch", apply = "restart", label = "Widescreen movie geometry", group = "graphics", help = "Crop uses native widescreen movies. Stretch widens the movie quad to 16:9. This setting requires a working movie decoder. Restart to apply." }
+movie_scale = { type = "int", default = 100, min = 25, max = 200, apply = "restart", label = "Movie size %", group = "graphics", help = "Scales movie geometry. Requires a working movie decoder. Restart to apply." }
+movie_autofit = { type = "bool", default = true, apply = "restart", label = "Fit movies to narrow screens", group = "graphics", help = "Reduces movie size below 16:9 to keep the picture visible. Requires a working movie decoder. Restart to apply." }
+xenon_effects = { type = "bool", default = true, apply = "restart", label = "Correct sparks and contrails blending", group = "graphics", help = "Applies the Widescreen Fix additive destination blend after Xenon effect setup. Restart to apply." }
+car_shine = { type = "int", default = 0, min = 0, max = 2, choices = "Original|Less|Matte", apply = "live", label = "Car shine", group = "graphics", help = "How strongly cars reflect their surroundings and catch highlights. Original is the game's own wet, showroom look. Less tones it down. Matte leaves only a soft sheen. Only cars change, not the world." }
+own_headlight_road = { type = "int", default = 2, min = 0, max = 2, choices = "Off|Like other cars|Bright", apply = "live", label = "Your headlights on the road", group = "graphics", help = "The patch of light your headlights throw on the road ahead. Like other cars: the same light the game shows in front of other cars (the game itself leaves it out for your car). Bright: three times as strong, so you see it from behind your car. Flashing your headlights (hold F) makes it longer and brighter. Off: the game's own look." }
+console_layout = { type = "bool", default = true, apply = "live", label = "Console controller layout", group = "controls", help = "Gives a controller the console layout (RT gas, LT brake, A handbrake, B nitrous, X speedbreaker, Y crew, LB look back, RB camera, right stick to shift) instead of the PC game's generic one. Your own changes in Options > Controls are kept." }
+controller_buttons = { type = "int", default = 0, min = 0, max = 3, choices = "Automatic|Xbox|PlayStation (DualSense)|Nintendo Switch Pro", apply = "live", label = "Button names", group = "controls", help = "Which controller's button names Options > Controls shows. Automatic asks macOS which controller is connected." }
+console_prompts = { type = "bool", default = true, apply = "restart", label = "Controller prompts in menus", group = "controls", help = "Menus show your controller's buttons while you use it, and the keyboard's when you type or click. Needs the button icons from the Setup app. Restart to apply." }
+skip_intro = { type = "bool", default = false, apply = "restart", label = "Skip intro movies", group = "career", help = "Starts the game without the EA logo and the street-racing warning movies. Story movies still play. Takes effect after a restart." }
+hide_online = { type = "bool", default = true, apply = "restart", label = "Hide online modes", group = "career", help = "Removes Quick Match and Custom Match from the main menu: EA's servers for them are closed. With Online on the start page they stay, and race on our server. Takes effect after a restart." }
+render_scale = { type = "int", default = 2, min = 0, max = 2, choices = "Screen (heaviest)|1.5x (smoother)|Game resolution", apply = "restart", label = "Render resolution", group = "graphics", help = "How many pixels the 3D world is drawn with. Game resolution: exactly the size set in Options > Video (fastest, the default). 1.5x: 1.5 times that, for smoother edges. Screen: your Mac's full Retina resolution (heaviest). Restart to apply." }
+turn_signal_auto_off = { type = "bool", default = true, apply = "live", label = "Turn signals switch off after a turn", group = "controls", help = "Q / E (d-pad left / right) switch the left / right turn signal on and off. Hold F (or click and hold the left stick) to flash your headlights; press it twice quickly to switch your headlights off or on. With this on, a turn signal switches itself off once you have turned a corner." }
+impact_rumble = { type = "int", default = 100, min = 0, max = 200, apply = "live", label = "Rumble: crashes %", group = "controls", help = "How hard the controller shakes when you hit something. 0 turns it off." }
+surface_rumble = { type = "int", default = 100, min = 0, max = 200, apply = "live", label = "Rumble: driving %", group = "controls", help = "Shaking from the road surface under the tyres. 0 turns it off." }
+rumble_floor = { type = "int", default = 1, min = 0, max = 10, apply = "live", label = "Rumble: ignore tiny shakes %", group = "controls", help = "Very weak rumble below this is skipped, so the controller does not buzz constantly. 0 plays everything." }
+freelook = { type = "int", default = 1, min = 0, max = 2, choices = "Off|On|Left and right only", apply = "live", label = "Free look (right stick)", group = "controls", help = "Move the right stick to swing the camera around the car, all the way round to see its front; up and down tilt it. Let go and it returns behind the car. With a mouse: hold the right mouse button and drag. Left and right only: for a manual gearbox, where the right stick's up and down shift gears." }
+freelook_invert = { type = "bool", default = false, apply = "live", label = "Free look: invert up/down", group = "controls", help = "Swaps up and down for free look, on the stick and the mouse." }
+input_trace = { type = "bool", default = false, apply = "live", label = "Log rumble (testing)", group = "diagnostics", help = "Writes each rumble change to the log, for troubleshooting." }
+mp_test = { type = "bool", default = false, apply = "live", label = "Test car beside you (multiplayer test)", group = "diagnostics", help = "Puts a see-through copy of your car beside you. It records your first 15 seconds of driving, then replays them over and over, the way another player's car would move. Turn it off to remove the car." }
+mp_ghost_cars = { type = "bool", default = false, apply = "live", label = "Ghost mode (see-through cars)", group = "online", help = "Shows other players' cars see-through instead of solid." }

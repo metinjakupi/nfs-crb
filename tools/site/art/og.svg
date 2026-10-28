@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!-- The site's link-preview image (og.png): the start page's colours and type, no game art. -->
+  <defs>
+    <radialGradient id="bg" cx="45%" cy="-10%" r="120%">
+      <stop offset="0" stop-color="#1a3a63"/><stop offset=".5" stop-color="#070c16"/><stop offset="1" stop-color="#020409"/>
+    </radialGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bff6ff"/><stop offset=".55" stop-color="#3fb6e6"/><stop offset="1" stop-color="#1360a8"/>
+    </linearGradient>
+    <linearGradient id="streak" x1="0" x2="1">
+      <stop offset="0" stop-color="#5fe4f2" stop-opacity="0"/><stop offset="1" stop-color="#5fe4f2" stop-opacity=".85"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" x2="1">
+      <stop offset="0" stop-color="#5fe4f2" stop-opacity=".7"/><stop offset="1" stop-color="#5fe4f2" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="2" height="6" fill="#ffffff" fill-opacity=".025"/>
+    </pattern>
+    <filter id="blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="60"/></filter>
+    <filter id="glow" x="-10%" y="-30%" width="120%" height="160%"><feGaussianBlur stdDeviation="10" result="b"/>
+      <feColorMatrix in="b" values="0 0 0 0 0.42  0 0 0 0 0.16  0 0 0 0 0.54  0 0 0 .8 0"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <ellipse cx="1000" cy="150" rx="300" ry="200" fill="#6a2a8a" opacity=".35" filter="url(#blur)"/>
+  <rect width="1200" height="630" fill="url(#hatch)"/>
+  <g transform="skewX(-28)">
+    <rect x="980" y="236" width="420" height="5" fill="url(#streak)"/>
+    <rect x="1060" y="268" width="360" height="3" fill="url(#streak)" opacity=".7"/>
+    <rect x="900" y="300" width="520" height="8" fill="url(#streak)"/>
+    <rect x="1120" y="338" width="300" height="3" fill="url(#streak)" opacity=".6"/>
+    <rect x="1010" y="372" width="410" height="5" fill="url(#streak)" opacity=".8"/>
+  </g>
+  <text x="84" y="178" font-family="Avenir Next" font-weight="600" font-size="30" letter-spacing="12" fill="#e9f6ff">NEED FOR SPEED</text>
+  <text x="70" y="368" font-family="Avenir Next Condensed" font-style="italic" font-weight="900" font-size="210" letter-spacing="6" fill="url(#word)" filter="url(#glow)">CARBON</text>
+  <text x="84" y="452" font-family="Avenir Next Condensed" font-style="italic" font-weight="700" font-size="70" letter-spacing="18" fill="#5fe4f2">ONLINE</text>
+  <rect x="420" y="424" width="420" height="4" fill="url(#bar)" transform="skewX(-30) translate(245 0)"/>
+  <text x="84" y="530" font-family="Avenir Next" font-weight="500" font-size="31" fill="#c9d9e8">Multiplayer is back · race, chase and roam in your browser</text>
+  <text x="84" y="590" font-family="Avenir Next" font-weight="600" font-size="26" letter-spacing="3" fill="#5fe4f2">nfscrb.xyz</text>
+  <text x="1116" y="590" text-anchor="end" font-family="Avenir Next" font-size="18" fill="#8fa6bd">Fan project · not affiliated with EA</text>
+</svg>

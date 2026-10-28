@@ -1,0 +1,49 @@
+carbon-server: the online server for the browser port of Need for Speed: Carbon.
+
+The virtual network for the game's own Online mode (src/lan.rs, src/trace.rs) follows the
+design of nfsu2-web by th0mk (github.com/th0mk/nfsu2-web, the server behind nfsu2.xyz),
+read at commit 53e04ea (2026-10-24): its LAN switch (web/server-rs/crates/lan) and its
+virtual host (web/server-rs/crates/online/src/vhost.rs and trace.rs). Taken from it: the
+frame layout and the 8-byte LAN header, the TCP-over-frames operations (SYN, SYNACK, RST,
+DATA, FIN, GONE) without sequence numbers or retransmission, virtual addresses in 10.77.0.0
+with the server's own host at 10.77.0.1 and the source rewritten to the sender's address,
+broadcasts to everyone but the sender, a virtual host that accepts a SYN with SYNACK, and
+lan_frame() in src/lan.rs, which is adapted from vhost.rs. The rest of this crate is its own
+code. nfsu2-web's licence:
+
+  MIT License
+
+  Copyright (c) 2026 th0mk
+  Portions copyright (c) 2026 Talha Müderrisoğlu (the original recompiler and macOS runtime)
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+The free-roam relay and cloud saves (src/relay.rs, src/saves.rs, src/http.rs, src/ws.rs) are
+a port of this project's own tools/carbon-net-relay.mjs.
+
+The free-roam relay's interest management (src/relay.rs and tools/carbon-net-relay.mjs, "Interest"
+in the latter's header; 2026-10-25) takes its ideas from nfsu2-web's free-roam hub
+(web/server-rs/crates/roam/src/lib.rs, same commit and licence as above): each player gets the
+players nearest to it, crew-mates first (at most 16) and race partners before everyone; "nearest"
+looks ahead along the cars' speeds (1 s and 4 s on); a link already made is held for 5 s and then
+counts at a fraction of its distance, so a newcomer must be much nearer to replace it. The code is
+this project's own; none of nfsu2-web's was copied.
+
+Crates used (each under its own licence, MIT or Apache-2.0): tokio, httparse, serde_json,
+sha1 and sha2 (RustCrypto), and what they depend on (see Cargo.lock).

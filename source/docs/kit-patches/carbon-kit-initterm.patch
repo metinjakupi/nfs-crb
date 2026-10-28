@@ -1,0 +1,33 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -1217,15 +1217,28 @@
+                     step = True
+             if indirect_call and step:
+                 walkers.add(fn.addr)
+-        if not walkers:
++        # A program linking the CRT as a DLL calls its _initterm through the
++        # import table instead: NFS Carbon's NFSC.exe and msvcp71.dll both do
++        # `PUSH end; PUSH start; CALL dword ptr [__imp__initterm]` into
++        # msvcr71.dll, whose walker is in another image.
++        initterm_slots = {slot for slot, name in getattr(self, "iat_names", {}).items()
++                          if name in ("_initterm", "_initterm_e")}
++        if not walkers and not initterm_slots:
+             return [], set()
+ 
++        def calls_initterm(ins):
++            op = ins.ops[0]
++            if op.startswith("0x"):
++                return int(op, 16) in walkers
++            m = re.match(r"dword ptr \[(0x[0-9a-fA-F]+)\]$", op.strip())
++            return bool(m) and int(m.group(1), 16) in initterm_slots
++
+         ranges, entries = [], set()
+         for fn in functions:
+             for i, ins in enumerate(fn.insns):
+                 if ins.mnem != "CALL" or not ins.ops:
+                     continue
+-                if not ins.ops[0].startswith("0x") or int(ins.ops[0], 16) not in walkers:
++                if not calls_initterm(ins):
+                     continue
+                 if i < 2 or fn.insns[i - 1].mnem != "PUSH" or fn.insns[i - 2].mnem != "PUSH":
+                     continue

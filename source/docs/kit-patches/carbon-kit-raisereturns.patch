@@ -1,0 +1,15 @@
+--- a/tools/recomp/translate.py
++++ b/tools/recomp/translate.py
+@@ -1709,7 +1709,11 @@
+ # NORETURN_IMPORTS: it adds the C runtime's exits, which a game linking the
+ # CRT as a DLL (NFS Carbon imports msvcr71.dll) calls through the IAT, and
+ # which Ghidra's library signatures already end listings at.
+-NORETURN_IAT_CALLS = NORETURN_IMPORTS | frozenset((
++#
++# RaiseException is left out: it returns whenever a handler continues
++# execution, which is how Visual C++'s SetThreadName (code 0x406D1388) works;
++# NFS Carbon names its worker threads that way and carries on at 008dacdd.
++NORETURN_IAT_CALLS = (NORETURN_IMPORTS - {"RaiseException"}) | frozenset((
+     "_exit", "exit", "abort", "_amsg_exit", "_CxxThrowException", "?terminate@@YAXXZ",
+     "longjmp", "_endthread", "_endthreadex"))
+ 
