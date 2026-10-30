@@ -293,7 +293,7 @@ if(TARGET recomp_gen)
     # saves.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js menu.js chat.js radar.js race.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js)
+    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()

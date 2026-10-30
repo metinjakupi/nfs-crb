@@ -23,6 +23,12 @@
 <div id="status">Loading…</div>
 <script>
 "use strict";
+const canonicalRedirect = location.hostname.endsWith(".");
+if (canonicalRedirect) {
+  const canonical = new URL(location.href);
+  canonical.hostname = canonical.hostname.slice(0, -1);
+  location.replace(canonical.href);
+}
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("canvas");
 let gameRunning = false;
@@ -33,7 +39,7 @@ function startup(phase) {
   startupPhase = phase;
   window.recompStartupPhase = phase;
 }
-function status(text, back) {
+function status(text, back, backText = "Back to game") {
   // Startup progress must not cover play or erase a fatal error.
   if (!back && (gameRunning || statusFailed)) return;
   if (back) statusFailed = true;
@@ -41,7 +47,7 @@ function status(text, back) {
   if (back) {
     const a = document.createElement("a");
     a.href = document.documentElement.dataset.gameId ? "/" : "../";
-    a.textContent = "\nBack to game";
+    a.textContent = `\n${backText}`;
     statusEl.append(document.createElement("br"), a);
     offerReport();
   }
@@ -64,7 +70,7 @@ let reportingFailure = false;
 function reportFailure(kind, error) {
   const message = String(error?.message || error || "Unknown startup error");
   window.recompFailure ||= { kind, message: message.slice(0, 1000), stack: String(error?.stack || "").slice(0, 5000) };
-  status(`The game stopped: ${message}`, true);
+  status(`The game stopped: ${message}`, true, kind === "startup-storage" ? "Open game page" : "Back to game");
   if (reportingFailure) return;
   reportingFailure = true;
   const record = {
@@ -87,11 +93,19 @@ function humanBytes(bytes) {
 function noSpaceError(result = {}) {
   const amounts = Number.isFinite(result.needed) && Number.isFinite(result.free)
     ? ` The game needs ${humanBytes(result.needed)}, but only ${humanBytes(result.free)} is free.` : "";
-  const error = new Error(`The browser does not have enough storage for the game.${amounts} Free disk space or use Delete downloaded files on the game page, then press Play again. Your saves are kept.`);
+  const zeroFree = result.free === 0
+    ? "\n\nThe browser reports 0 B free. Use a normal window, not a Private or Tor window. If Brave still reports 0 B, use an up-to-date Chrome or Edge browser."
+    : "\n\nFree disk space on this device if the disk is nearly full.";
+  const error = new Error(`The browser does not have enough storage for the game.${amounts}\n\nWhat to do:\n1. Select Open game page below.\n2. Select Delete downloaded files.\n3. Press Play again.${zeroFree}\n\nDeleting downloaded files keeps your saves and settings.`);
   error.name = "QuotaExceededError";
   return error;
 }
 async function reportStartupFailure(error) {
+  if (staleStorageError(error)) {
+    const recovery = new Error("The browser changed its game storage while Carbon was loading. Close other Carbon tabs, then select Open game page and press Play again. Your saves are kept.");
+    recovery.name = "InvalidStateError";
+    return reportFailure("startup-storage", recovery);
+  }
   const full = error?.name === "QuotaExceededError" || /quota|not enough storage|ran out of storage/i.test(String(error?.message || error));
   if (!full) return reportFailure("startup", error);
   if (!/does not have enough storage/i.test(String(error?.message || ""))) {
@@ -103,6 +117,10 @@ async function reportStartupFailure(error) {
     error = noSpaceError({ free });
   }
   reportFailure("startup-storage", error);
+}
+function staleStorageError(error) {
+  return error?.name === "InvalidStateError" ||
+    /state cached in an interface object.*changed since it was read from disk/i.test(String(error?.message || error));
 }
 window.addEventListener("error", e => reportFailure("error", e.error || e.message));
 window.addEventListener("unhandledrejection", e => reportFailure("rejection", e.reason));
@@ -218,14 +236,92 @@ async function savedRenderScale(game, profile) {
   return choice === 1 ? "1.5" : choice === 2 ? "1" : undefined;
 }
 
+// Keep streaming compilation on phones: do not pre-buffer another full runtime.
+// Retry covers response-body failures too, not just the initial fetch.
+async function loadRuntime(imports) {
+  const url = new URL("@APP@.wasm", document.baseURI).href;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(url, { credentials: "same-origin", cache: attempt ? "reload" : "default" });
+      if (!response.ok) {
+        await response.body?.cancel();
+        const error = new Error(`Game runtime download returned HTTP ${response.status}.`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw error;
+      }
+      if (WebAssembly.instantiateStreaming && response.headers.get("Content-Type")?.split(";")[0].trim() === "application/wasm")
+        return await WebAssembly.instantiateStreaming(response, imports);
+      return await WebAssembly.instantiate(await response.arrayBuffer(), imports);
+    } catch (error) {
+      if (error instanceof WebAssembly.CompileError || error instanceof WebAssembly.LinkError)
+        throw new Error(`Could not compile or link the game runtime: ${error.message}`);
+      if (error.retryable === false) throw error;
+      if (attempt === 2)
+        throw new Error("The game runtime could not be downloaded after three attempts. Check your connection and reload the page. Your saves are kept.");
+      console.warn(`[browser] runtime download attempt ${attempt + 1} failed: ${error.message}`);
+      status(`Downloading game code… retry ${attempt + 2} of 3`);
+      await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+}
+
+// ChromeOS can invalidate an OPFS handle when another tab changes this origin's
+// storage. A fresh worker opens fresh handles. Retry once; repeated failures are
+// reported without touching the player's profile folder.
+async function prepareStream(game) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const worker = new Worker("../worker.js", { type: "module" });
+    try {
+      return await new Promise((resolve, reject) => {
+        worker.onerror = () => reject(new Error("Could not prepare game files. Try Play again."));
+        worker.onmessage = ({ data }) => {
+          if (data.progress) {
+            const p = data.progress;
+            status(`Loading game… ${p.bytesTotal ? Math.floor(p.bytesDone / p.bytesTotal * 100) : 0}%`);
+          } else if (data.error) {
+            const error = new Error(data.error);
+            if (data.name) error.name = data.name;
+            reject(error);
+          } else if (data.result?.result === "done") resolve(data.result);
+          else if (data.result?.result === "noSpace") reject(noSpaceError(data.result));
+          else reject(new Error(`Startup download failed: ${data.result?.result}`));
+        };
+        worker.postMessage({ id: 1, cmd: "streamSetup", game });
+      });
+    } catch (error) {
+      if (attempt === 0 && staleStorageError(error)) {
+        console.warn("[browser] browser storage changed during startup; reopening it once");
+        status("Browser storage changed… reopening it once");
+        continue;
+      }
+      throw error;
+    } finally {
+      worker.terminate();
+    }
+  }
+}
+
+function webGpuUnavailableError() {
+  const ua = navigator.userAgent || "";
+  if (/Android/i.test(ua))
+    return new Error("This Android device or browser does not provide WebGPU. Open the game in the current Chrome app. If current Chrome shows this message too, this device cannot run this build.");
+  if (/iPhone|iPad|iPod/i.test(ua))
+    return new Error("This iPhone or iPad does not provide the WebGPU support this build needs. This device cannot run the game yet.");
+  return new Error("This browser could not start WebGPU. Turn on hardware acceleration and restart the browser. If that does not work, update the graphics driver or use the current Chrome or Edge version.");
+}
+
 // options (from the game's start page): profile, a save slot name like
-// ?profile=; online, {relay, name} like ?mp= and &name=; lan, {url, name}
+// ?profile=; online, {relay, name, claim} like ?mp= and &name=; lan, {url, name, claim}
 // like ?lan=ws://host:port: the game's own online code over the server's
 // virtual LAN (lan.js; RECOMP_LAN turns the kit's Winsock on).
 async function start(options = {}) {
   startup("browser checks");
-  if (!crossOriginIsolated) throw new Error("The game could not start. Reload this page and try again.");
-  if (!navigator.gpu) throw new Error("This browser cannot run the game. Open it in desktop Chrome.");
+  if (!crossOriginIsolated) {
+    if (/Instagram/i.test(navigator.userAgent || ""))
+      throw new Error("The game cannot run inside Instagram's browser. Open Instagram's menu and choose Open in browser, or copy this page's link into Chrome or Safari.");
+    throw new Error("The game needs a secure browser environment that this page does not provide. Open this link directly in Chrome or Safari. If it still fails, send a report.");
+  }
+  if (!navigator.gpu) throw webGpuUnavailableError();
   await waitForPhoneLandscape();
   startup("reading game information");
   const id = await gameId();
@@ -247,22 +343,7 @@ async function start(options = {}) {
   if (!complete && game.streamAssets && game.downloadManifest) {
     startup("preparing game files");
     status("Loading game…");
-    const worker = new Worker("../worker.js", { type: "module" });
-    try {
-      stream = await new Promise((resolve, reject) => {
-        worker.onerror = () => reject(new Error("Could not prepare game files. Try Play again."));
-        worker.onmessage = ({ data }) => {
-          if (data.progress) {
-            const p = data.progress;
-            status(`Loading game… ${p.bytesTotal ? Math.floor(p.bytesDone / p.bytesTotal * 100) : 0}%`);
-          } else if (data.error) reject(new Error(data.error));
-          else if (data.result?.result === "done") resolve(data.result);
-          else if (data.result?.result === "noSpace") reject(noSpaceError(data.result));
-          else reject(new Error(`Startup download failed: ${data.result?.result}`));
-        };
-        worker.postMessage({ id: 1, cmd: "streamSetup", game });
-      });
-    } finally { worker.terminate(); }
+    stream = await prepareStream(game);
   } else if (!complete) throw new Error(`Import ${game.title} from the launcher before playing.`);
   window.carbonTestAssets = { NIS: !!stream };
   if (!stream) {
@@ -286,6 +367,10 @@ async function start(options = {}) {
   streamChannel.onmessage = ({ data }) => {
     if (data.type === "stats") window.recompStreamStats = data;
     if (data.type === "unavailable") {
+      window.carbonTestAssets.unavailable = {
+        path: String(data.path || "").slice(0, 300),
+        message: String(data.message || "").slice(0, 500),
+      };
       if (streamFailed) return;
       streamFailed = true;
       console.error("[stream] required game file unavailable", data.path || "(unknown file)", data.message || "");
@@ -306,7 +391,7 @@ async function start(options = {}) {
     if (adapter) break;
     if (options) console.warn("[browser] high-performance WebGPU adapter unavailable; trying the browser default");
   }
-  if (!adapter) throw new Error("This browser could not start WebGPU. Turn on hardware acceleration and restart the browser. If that does not work, update the graphics driver or use the current Chrome or Edge version.");
+  if (!adapter) throw webGpuUnavailableError();
   const info = adapter.info || {};
   window.carbonGraphicsInfo = {
     vendor: info.vendor || "", architecture: info.architecture || "",
@@ -344,10 +429,15 @@ async function start(options = {}) {
     net.src = "net.js";
     net.onerror = () => console.warn("[browser] this game has no online client (net.js)");
     document.body.append(net);
+    if (id === "nfsc") {
+      const encounter = document.createElement("script");
+      encounter.src = "encounter.js";
+      document.body.append(encounter);
+    }
   }
   const lanUrl = options.lan?.url || new URLSearchParams(location.search).get("lan");
   if (lanUrl) {
-    window.recompLan = { url: lanUrl, name: options.lan?.name || options.online?.name || "" };
+    window.recompLan = { url: lanUrl, name: options.lan?.name || options.online?.name || "", claim: options.lan?.claim || "" };
     const lan = document.createElement("script");
     lan.src = "lan.js";
     lan.onerror = () => console.warn("[browser] the virtual LAN client (lan.js) is missing");
@@ -357,6 +447,11 @@ async function start(options = {}) {
     canvas,
     preinitializedWebGPUDevice: device,
     noInitialRun: true,
+    instantiateWasm(imports, receiveInstance) {
+      loadRuntime(imports).then(({ instance, module }) => receiveInstance(instance, module))
+        .catch(error => reportFailure("runtime-load", error));
+      return {}; // Emscripten waits for receiveInstance for asynchronous loading.
+    },
     print: (t) => { log.push(t); console.log(t); },
     printErr: (t) => { log.push(t); console.warn(t); },
     setStatus: (t) => status(t ? t : ""),
@@ -402,12 +497,13 @@ canvas.addEventListener("click", () => canvas.focus());
 // (?mp=, ?lan=, ?profile=, RECOMP_*) starts the game at once, as does a game without one.
 let booted = false;
 window.recompBoot = (options) => {
-  if (booted) return;
+  if (canonicalRedirect || booted) return;
   booted = true;
   status("Loading…");
   start(options).catch(reportStartupFailure);
 };
 (async () => {
+  if (canonicalRedirect) return;
   const params = [...new URLSearchParams(location.search).keys()];
   if (params.some((k) => k === "mp" || k === "lan" || k === "profile" || k.startsWith("RECOMP_"))) return recompBoot();
   const id = await gameId();

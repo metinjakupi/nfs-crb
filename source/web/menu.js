@@ -1230,10 +1230,21 @@
       left: dir >= 5 && dir <= 7, ry: axis(5), l2v: (axis(3) + 1) / 2, r2v: (axis(4) + 1) / 2 });
     return s;
   }
+  // Match SDL's browser-name normalization, rather than treating any open
+  // controller as proof that the device shown here is used by the game.
+  function padDeviceName(name) {
+    return String(name || "").replace(/\s*\((STANDARD GAMEPAD|Vendor:|XInput).*$/i, "")
+      .replace(/^0*[0-9a-f]+-0*[0-9a-f]+-/i, "").trim().toLowerCase();
+  }
+  function padMatchesGame(gp) {
+    const used = globalThis.recompGameController;
+    return !!gp && !!used && padDeviceName(gp.id) === padDeviceName(used.deviceName || used.name);
+  }
   function padFind() {
     let pads = [];
     try { pads = [...(navigator.getGamepads?.() || [])]; } catch {}
-    return pads.find((g) => g && g.connected) || null;
+    const controllers = pads.filter((g) => g && g.connected && !/hyperx cloud/i.test(g.id));
+    return controllers.find(padMatchesGame) || controllers[0] || null;
   }
 
   let padKind = "sony", padHeld = null, padDir = "", padNext = 0, padBackAt = 0, padLoop = 0, checking = false;
@@ -1339,9 +1350,12 @@
     name.classList.toggle("none", !gp);
     name.textContent = gp ? `${padTitle(gp)}: found by the browser` :
       "No controller found yet. Connect it (USB cable or Bluetooth), then press any button on it - not the PS button.";
-    game.classList.toggle("good", !!used);
-    game.classList.toggle("bad", !used && !!gp);
-    game.textContent = used ? "The game uses it." : gp ? "The game has not picked it up yet. Press a few buttons; if this stays, tell us." : "";
+    const matches = padMatchesGame(gp);
+    game.classList.toggle("good", matches);
+    game.classList.toggle("bad", !matches && !!gp);
+    game.textContent = matches ? "The game uses it." : used
+      ? `The game is using another device: ${used.deviceName || used.name}.`
+      : gp ? "The game has not picked it up yet. Press a few buttons; if this stays, tell us." : "";
     const layout = gp?.mapping === "standard" ? "standard"
       : kind === "sony" ? "not standard (the game sorts out PlayStation controllers)" : "not standard (some buttons may be in odd places)";
     info.textContent = gp ? `Layout: ${layout}` +

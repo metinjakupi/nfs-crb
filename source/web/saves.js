@@ -433,6 +433,14 @@
     let cloud = store.get(cloudKey, null);
     try { cloud = cloud && /^[0-9a-f]{64}$/.test(cloud.id || "") ? { ...cloud, phrase: parsePhrase(cloud.phrase) } : null; }
     catch { cloud = null; }
+    // start.js uses only the opaque cloud-save id as a bearer proof for an explicit name
+    // claim. The keyphrase itself stays inside this module and is never sent to /names.
+    window.recompCloudIdentity = Object.freeze({
+      token: () => cloud?.id || null,
+      show: () => host.scrollIntoView({ behavior: "smooth", block: "start" }),
+    });
+    const identityChanged = () => dispatchEvent(new CustomEvent("recomp-cloud-identity", { detail: { linked: !!cloud } }));
+    identityChanged();
 
     function say(text, kind = "") {
       msg.textContent = text || "";
@@ -832,6 +840,7 @@
       cloud = { phrase, id: await cloudId(phrase), ack: false, since: new Date().toISOString() };
       store.set(cloudKey, cloud);
       store.set(syncKey, {});
+      identityChanged();
       state.notice = null;
       showCloud();
       if (!state.files.length) return "Cloud saves are on. Your save goes up once there is one.";
@@ -871,7 +880,7 @@
         return "Nothing was changed.";
       say("Loading the cloud save…", "busy");
       await restore(backup.files);
-      if (adopt) { cloud = adopt; store.set(cloudKey, cloud); store.set(syncKey, {}); }
+      if (adopt) { cloud = adopt; store.set(cloudKey, cloud); store.set(syncKey, {}); identityChanged(); }
       remember({ etag, fp: await fingerprint(backup.files), at: backup.info.made || at });
       state.notice = null;
       return `Loaded from the cloud: ${describe(backup.files).text}.`;
@@ -937,6 +946,7 @@
       store.set(cloudKey, null);
       store.set(syncKey, {});
       cloud = null;
+      identityChanged();
       state.notice = null;
       showCloud();
       say("Cloud saves are off on this computer.", "good");
@@ -978,6 +988,7 @@
         store.set(cloudKey, null);
         store.set(syncKey, {});
         cloud = null;
+        identityChanged();
         return "Removed from the cloud, and this computer forgot the keyphrase. The save in this browser is unchanged.";
       }
       remember({ removed: new Date().toISOString() });

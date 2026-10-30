@@ -143,12 +143,18 @@ async function gameLink(t, relay, name, crew = "") {
   });
   const clientScript = process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
   assert.throws(() => vm.runInContext(fs.readFileSync(clientScript, "utf8"), page), (e) => e === captured);
-  const timers = [], sockets = [], posted = [];
+  const timers = [], timeouts = [], sockets = [], posted = [];
   let now = 1000;
   const worker = vm.createContext({
     onmessage: null, postMessage(data) { posted.push(data); }, console, atob, btoa,
     performance: { now: () => now },
-    setInterval: (fn) => timers.push(fn), setTimeout() {},
+    setInterval: (fn) => timers.push(fn),
+    setTimeout(fn, delay = 0) {
+      const timer = { fn, at: now + delay, cancelled: false };
+      timeouts.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) { if (timer) timer.cancelled = true; },
     WebSocket: class extends WebSocket {
       constructor(url) { super(url); sockets.push(this); }
     },
@@ -165,7 +171,12 @@ async function gameLink(t, relay, name, crew = "") {
     id, u32, i32, f32, posted,
     post(data) { worker.onmessage({ data }); },
     close() { for (const socket of sockets) socket.close(); },
-    tick(ms = 40) { now += ms; for (const fn of timers) fn(); },
+    tick(ms = 40) {
+      now += ms;
+      for (const fn of timers) fn();
+      for (const timer of timeouts)
+        if (!timer.cancelled && timer.at <= now) { timer.cancelled = true; timer.fn(); }
+    },
     publish(ms, s = pose.s, state = 1) {
       Atomics.add(i32, 3, 1);
       u32[4] = state; u32[5] = pose.k; u32[6]++; u32[7] = ms;
@@ -1339,7 +1350,30 @@ test("game workers speak compact poses with a relay that offers them, and JSON w
   }
 });
 
-test("a hidden or paused game parks its car immediately and restores it without rewinding time", async (t) => {
+test("a game worker coalesces a recovered pose backlog to the newest pose", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  const ana = await connect(t, relay, "lobby", "Ana");
+  ana.send({ ...pose, ts: 1000 });
+  const slot = await until(() => { ben.tick(40); return ben.slot(ana.welcome.id) + 1; }, "Ana's car") - 1;
+  const base = (0x60 + slot * 0x100) / 4;
+  const before = ben.u32[base + 4];
+
+  ben.tick(2000); // no pose: the receiver has reached its prediction limit
+  for (let i = 1; i <= 30; i++)
+    ana.send({ ...pose, ts: 1000 + 33 * i, s: [...pose.s.slice(0, 4), 12 + i, ...pose.s.slice(5)] });
+  ana.send({ t: "chat", text: "pose backlog barrier" });
+  await until(() => ben.posted.some(e => e.t === "msg" && e.m?.text === "pose backlog barrier"), "backlog delivered");
+
+  assert.equal(ben.u32[base + 4], before, "queued historical poses do not enter the game one by one");
+  ben.tick(40);
+  assert.equal(ben.u32[base + 4], before + 1, "one recovered pose enters the game");
+  const at = base + 8 + ((ben.u32[base + 4] - 1) % 4) * 14;
+  assert.equal(ben.u32[at], 1990, "the recovered pose is the newest one");
+  assert.equal(ben.f32[at + 5], 42, "the recovered car resumes at the newest position");
+});
+
+test("a hidden or paused game keeps a stationary paused car until disconnect and restores it", async (t) => {
   const relay = await start(t);
   const ana = await gameLink(t, relay, "Ana"), ben = await gameLink(t, relay, "Ben");
   ana.publish(1500);
@@ -1350,7 +1384,12 @@ test("a hidden or paused game parks its car immediately and restores it without 
 
   ana.post({ t: "visibility", hidden: true });
   ana.tick(1);
-  await until(() => { ben.tick(1); return mode() === 0; }, "hidden car parked");
+  await until(() => { ben.tick(1); return mode() === 0; }, "hidden car paused");
+  const pausedState = () => [...ben.posted].reverse().find((m) => m.t === "state" && m.slotModes?.[slot] === 0);
+  await until(pausedState, "paused label state");
+  let at = (0x60 + slot * 0x100) / 4 + 8 + ((ben.u32[(0x60 + slot * 0x100) / 4 + 4] - 1) % 4) * 14;
+  assert.deepEqual(Array.from(ben.f32.subarray(at + 8, at + 14)), [0, 0, 0, 0, 0, 0],
+    "a paused car has no linear or angular motion");
 
   ana.post({ t: "visibility", hidden: false });
   ana.tick(1);
@@ -1358,7 +1397,11 @@ test("a hidden or paused game parks its car immediately and restores it without 
 
   ana.publish(1500, pose.s, 0);
   ana.tick(1);
-  await until(() => { ben.tick(1); return mode() === 0; }, "paused car parked at the same physics time");
+  await until(() => { ben.tick(1); return mode() === 0; }, "game-menu car paused at the same physics time");
+  assert.equal(ben.u32[(0x60 + slot * 0x100) / 4], ana.id, "the paused player still owns the car slot");
+
+  ana.close();
+  await until(() => { ben.tick(10); return ben.slot(ana.id) < 0; }, "disconnect removes the paused car");
 });
 
 // ---- Police chases (the relay header's "Police chases"; source/web/net.js, mods/core/nfsc/cops.h) ----

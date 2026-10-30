@@ -2,6 +2,32 @@
 
 Game features, performance improvements, and bug fixes for NFS Carbon in the browser.
 
+## 2026-10-30
+
+### Controls
+- HyperX Cloud headset media controls no longer occupy the game controller slot.
+- Controller check confirms the displayed device matches the controller used by the game.
+
+### Startup and reports
+- Retry startup once when the browser changes its downloaded-game storage handles.
+- Give save-preserving recovery instructions when startup storage remains unavailable.
+- Explain unsupported mobile graphics and in-app browser limits more clearly.
+- Redirect site addresses with an extra trailing dot to the normal address.
+- Include recent race roster changes and failed game-file details in reports, retaining race history across a same-tab reload.
+
+### Online play
+- Keep paused players' cars visible and non-colliding, with a paused status.
+- Smooth other players' recovery after interrupted position updates.
+- Protect claimed names with cloud-save identity and preserve existing careers.
+- Nearby players from different crews now receive Carbon's original Crew Challenge prompt automatically.
+- Both players accept before choosing a finish on the original map and racing with the game's countdown, standings and results.
+- Dismissed requests clear for both players and wait two minutes before repeating for that pair.
+- Fixed a progress update writing to the wrong memory address and corrupting online race rankings.
+- Crew Challenges end for both players when the first player finishes, with one agreed winner.
+- Cancelled Crew Challenges return players to free roam, including when a player disconnects during loading.
+- Fixed Crew Challenge failing to load through the normal Online Play button.
+- Fixed a Rust relay coordinate-rounding difference that could leave one player waiting after accepting a finish.
+
 ## 2026-10-28
 
 ### Fixes

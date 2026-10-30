@@ -114,6 +114,24 @@ fn upgrade(port: u16, path: &str) -> (u16, Option<Client>) {
     (status, (status == 101).then_some(Client { s, buf: rest }))
 }
 
+/// One HTTP request to the real server: its status and body.
+fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, Vec<u8>) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len()).unwrap();
+    for (name, value) in headers {
+        write!(s, "{name}: {value}\r\n").unwrap();
+    }
+    s.write_all(b"\r\n").unwrap();
+    s.write_all(body).unwrap();
+    let mut answer = Vec::new();
+    s.read_to_end(&mut answer).unwrap();
+    let split = answer.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&answer[..split]);
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, answer[split + 4..].to_vec())
+}
+
 impl Client {
     /// A browser on the network: its welcome checked, its vip returned.
     fn lan(server: &Server) -> (Client, u32) {
@@ -1010,8 +1028,12 @@ fn the_server_hosts_a_custom_match_game() {
 /// A page through the switch that says hello with its player key (lan.js), then FESL Login:
 /// the client, its vip and Login's answer.
 fn keyed_login(server: &Server, name: &str, cport: u16, pk: &str) -> (Client, u32, Reply) {
+    login_with_claim(server, name, cport, pk, "")
+}
+
+fn login_with_claim(server: &Server, name: &str, cport: u16, pk: &str, claim: &str) -> (Client, u32, Reply) {
     let (mut c, vip) = Client::lan(server);
-    c.send(1, format!(r#"{{"t":"hello","name":"{name}","pk":"{pk}"}}"#).as_bytes());
+    c.send(1, format!(r#"{{"t":"hello","name":"{name}","pk":"{pk}","claim":"{claim}"}}"#).as_bytes());
     let conn = 0x5c00_0000 | cport as u32;
     c.frame(&Frame::tcp(HOST, cport, 18210, 1, conn, b"").bytes());
     assert_eq!(c.read_frame().op, 2);
@@ -1038,9 +1060,10 @@ fn messenger_send(c: &mut Client, cport: u16, conn: u32, kind: &[u8; 4], lines: 
 }
 
 #[test]
-fn messenger_friends_chat_presence_and_name_claims() {
+fn a_claimed_name_keeps_its_cloud_save_and_existing_messenger_identity() {
     let dir = temp_dir("messenger");
-    let env = [("CARBON_MESSENGER_DIR", dir.to_str().unwrap())];
+    let saves = dir.join("saves");
+    let env = [("CARBON_MESSENGER_DIR", dir.to_str().unwrap()), ("CARBON_SAVES_DIR", saves.to_str().unwrap())];
     let server = Server::start(&env);
     let (mut metin, _, r) = keyed_login(&server, "Metin", 50600, "metin-browser-key-0001");
     let metin_lkey = r.get("lkey").to_string();
@@ -1077,13 +1100,72 @@ fn messenger_friends_chat_presence_and_name_claims() {
     server.line(|l| l.contains("RECV") && l.contains("BODY=(private)"));
     assert!(!server.lines.lock().unwrap().iter().any(|l| l.contains("docks")), "chat is never printed");
 
-    // Another browser cannot sign in as Metin: Login answers as for a wrong password.
-    let (_other, _, r) = keyed_login(&server, "metin", 50620, "someone-elses-key-0001");
-    assert_eq!((r.get("TXN"), r.get("errorCode")), ("Login", "122"));
-    // A page from before player keys may use a free name, but not a claimed one.
-    let (_old, _, r) = keyed_login(&server, "Oldpage", 50630, "");
-    assert!(!r.get("lkey").is_empty());
+    // The old server data exists before explicit claims are enabled. A restart snapshots each
+    // existing name and its browser-key fingerprint without changing Messenger or save data.
+    const CLAIM: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let save = b"sealed existing career";
+    assert_eq!(http(server.port, "PUT", &format!("/saves/{CLAIM}?key={KEY}"), &[("Content-Type", "application/octet-stream")], save).0, 201);
     assert!(!server.lines.lock().unwrap().iter().any(|l| l.contains("metin-browser-key")), "keys are never printed");
+    drop(server);
+    // Simulate the production upgrade: the old server has messenger.json but no names.json.
+    let _ = std::fs::remove_file(dir.join("names.json"));
+    let server = Server::start(&env);
+
+    // A different player cannot take Metin's existing identity by typing the name and using
+    // their own cloud save. The existing browser can still sign in before it chooses Claim.
+    let (status, body) = http(server.port, "GET", &format!("/names?key={KEY}&name=Metin"),
+        &[("X-Carbon-Player-Key", "someone-elses-key-0001")], b"");
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["state"], "reserved");
+    let (status, body) = http(server.port, "POST", &format!("/names?key={KEY}"),
+        &[("Authorization", &format!("Bearer {CLAIM}")), ("Content-Type", "application/json"),
+          ("X-Carbon-Player-Key", "someone-elses-key-0001")], br#"{"name":"Metin"}"#);
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "old-browser");
+    let (_, roam) = upgrade(server.port, &format!("/lobby?key={KEY}"));
+    let mut roam = roam.unwrap();
+    roam.send(1, br#"{"t":"hi","name":"Metin","pk":"someone-elses-key-0001"}"#);
+    assert!(matches!(roam.read(), Msg::Close(b) if b.ends_with(b"name protected")));
+    let (_, roam) = upgrade(server.port, &format!("/lobby?key={KEY}"));
+    let mut roam = roam.unwrap();
+    roam.send(1, br#"{"t":"hi","name":"Metin","pk":"metin-browser-key-0001"}"#);
+    assert!(matches!(roam.read(), Msg::Text(w) if w.contains(r#""t":"welcome""#)));
+    let (_other, _, r) = keyed_login(&server, "Metin", 50620, "someone-elses-key-0001");
+    assert_eq!(r.get("errorCode"), "122", "another browser must not inherit the old identity: {r:?}");
+    let (_old, _, r) = keyed_login(&server, "Metin", 50630, "metin-browser-key-0001");
+    assert!(!r.get("lkey").is_empty(), "the existing browser keeps its name before Claim: {r:?}");
+
+    // Claim uses the existing cloud-save id and the migration browser proof. The server already
+    // knows the opaque save id; it never receives the keyphrase. Claiming must not replace or
+    // rewrite the save, friend list or statistics.
+    let messenger_before_claim = std::fs::read(dir.join("messenger.json")).unwrap();
+    let (status, body) = http(server.port, "POST", &format!("/names?key={KEY}"),
+        &[("Authorization", &format!("Bearer {CLAIM}")), ("Content-Type", "application/json"),
+          ("X-Carbon-Player-Key", "metin-browser-key-0001")], br#"{"name":"Metin"}"#);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["state"], "yours");
+    assert_eq!(std::fs::read(dir.join("messenger.json")).unwrap(), messenger_before_claim,
+        "claiming rewrote existing Messenger data");
+    let (status, body) = http(server.port, "GET", &format!("/saves/{CLAIM}?key={KEY}"), &[], b"");
+    assert_eq!((status, body.as_slice()), (200, save.as_slice()), "claim changed the cloud save");
+
+    // Free roam enforces the same identity. A client without the proof is closed before its
+    // name reaches the room; the owner receives the normal welcome.
+    let (_, mut roam) = upgrade(server.port, &format!("/lobby?key={KEY}"));
+    let mut roam = roam.take().unwrap();
+    roam.send(1, br#"{"t":"hi","name":"Metin"}"#);
+    assert!(matches!(roam.read(), Msg::Close(b) if b.ends_with(b"name protected")));
+    let (_, mut roam) = upgrade(server.port, &format!("/lobby?key={KEY}"));
+    let mut roam = roam.take().unwrap();
+    roam.send(1, format!(r#"{{"t":"hi","name":"Metin","claim":"{CLAIM}"}}"#).as_bytes());
+    assert!(matches!(roam.read(), Msg::Text(w) if w.contains(r#""t":"welcome""#)));
+
+    // After Claim, only the same keyphrase-derived proof may use the name. The unrelated
+    // browser key is not an identity proof.
+    let (_wrong, _, r) = keyed_login(&server, "Metin", 50631, "metin-browser-key-0001");
+    assert_eq!(r.get("errorCode"), "122", "a claimed name must reject a missing proof: {r:?}");
+    let (_mine, _, r) = login_with_claim(&server, "Metin", 50632, "new-browser-key-0001", CLAIM);
+    assert!(!r.get("lkey").is_empty(), "the cloud keyphrase recovers the claimed name: {r:?}");
 
     // After a restart (the store is in CARBON_MESSENGER_DIR) Jan's roster still has Metin.
     drop(server);
@@ -1094,8 +1176,10 @@ fn messenger_friends_chat_presence_and_name_claims() {
     messenger_send(&mut jan, 50641, jc, b"RGET", &[("LIST", "B"), ("LRSC", "eagames"), ("PRES", "Y"), ("PEND", "Y"), ("ID", "2")]);
     let r = replies(&mut jan, 13505, 2);
     assert_eq!((r[0].get("SIZE"), r[1].kind.as_str(), r[1].get("ATTR"), r[1].get("USER")), ("1", "ROST", "AT", "Metin@messaging.ea.com"));
-    let (_, _, r) = keyed_login(&server, "Metin", 50650, "someone-elses-key-0001");
-    assert_eq!(r.get("errorCode"), "122", "the claim survives the restart");
+    let (_, _, r) = login_with_claim(&server, "Metin", 50650, "someone-elses-key-0001", CLAIM);
+    assert!(!r.get("lkey").is_empty(), "the claim and old Messenger identity survive a restart: {r:?}");
+    let (_, _, r) = keyed_login(&server, "Metin", 50660, "someone-elses-key-0001");
+    assert_eq!(r.get("errorCode"), "122", "the persisted claim must still reject a missing proof: {r:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1112,7 +1196,9 @@ fn rank(c: &mut Client, cport: u16, id: u32, lines: &[(&str, &str)]) -> Reply {
 #[test]
 fn player_stats_and_the_leaderboard_are_kept_and_ranked() {
     let dir = temp_dir("stats");
-    let env = [("CARBON_STATS_DIR", dir.to_str().unwrap())];
+    let saves = dir.join("saves");
+    let env = [("CARBON_STATS_DIR", dir.to_str().unwrap()), ("CARBON_MESSENGER_DIR", dir.to_str().unwrap()),
+        ("CARBON_SAVES_DIR", saves.to_str().unwrap())];
     let server = Server::start(&env);
     let (mut metin, _, r) = keyed_login(&server, "Metin", 50700, "metin-browser-key-0001");
     let metin_id = r.get("userId").to_string();
@@ -1158,10 +1244,25 @@ fn player_stats_and_the_leaderboard_are_kept_and_ranked() {
     let r = rank(&mut jan, 50710, 11, &[("TXN", "GetStats"), ("owner", jan_id.as_str()), ("ownerType", "1"), ("periodId", "0"), ("periodPast", "0"), ("keys.0", "Overall_Solo_On_Wins"), ("keys.1", "Total_Cash"), ("keys.[]", "2")]);
     assert_eq!((r.get("stats.0.value"), r.get("stats.1.value")), ("0.0", "0.0"));
 
+    // A restart snapshots the old identity before claims are enabled. Adding identity
+    // protection does not move or reset the ranking record under this name.
+    drop(server);
+    // Simulate the production upgrade: the old server has its data but no names.json.
+    let _ = std::fs::remove_file(dir.join("names.json"));
+    let server = Server::start(&env);
+    const CLAIM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    assert_eq!(http(server.port, "PUT", &format!("/saves/{CLAIM}?key={KEY}"), &[("Content-Type", "application/octet-stream")], b"sealed").0, 201);
+    let stats_before_claim = std::fs::read(dir.join("stats.json")).unwrap();
+    assert_eq!(http(server.port, "POST", &format!("/names?key={KEY}"),
+        &[("Authorization", &format!("Bearer {CLAIM}")), ("Content-Type", "application/json"),
+          ("X-Carbon-Player-Key", "metin-browser-key-0001")], br#"{"name":"Metin"}"#).0, 200);
+    assert_eq!(std::fs::read(dir.join("stats.json")).unwrap(), stats_before_claim,
+        "claiming rewrote existing leaderboard data");
+
     // After a restart (the store is in CARBON_STATS_DIR) the board is the same.
     drop(server);
     let server = Server::start(&env);
-    let (mut metin, _, _) = keyed_login(&server, "Metin", 50720, "metin-browser-key-0001");
+    let (mut metin, _, _) = login_with_claim(&server, "Metin", 50720, "new-browser-key-0001", CLAIM);
     let r = rank(&mut metin, 50720, 3, &[("TXN", "GetTopNAndStats"), ("key", "Evt_Bst_30F07253"), ("minRank", "1"), ("maxRank", "2"), ("periodId", "2"), ("periodPast", "0"), ("keys.0", "Evt_Bst_30F07253"), ("keys.[]", "1")]);
     assert_eq!((r.get("stats.[]"), r.get("stats.0.name"), r.get("stats.1.name"), r.get("stats.1.addStats.0.value")), ("2", "Jan", "Metin", "103.05"));
     let text = std::fs::read_to_string(dir.join("stats.json")).unwrap();

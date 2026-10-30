@@ -101,6 +101,15 @@ impl Saves {
         lock(&self.st).used / 1_048_576.0
     }
 
+    /// Whether an opaque cloud-save id exists. Name claims use this without reading or
+    /// changing the sealed save.
+    pub async fn exists(&self, id: &str) -> io::Result<bool> {
+        if !is_id(id) {
+            return Ok(false);
+        }
+        self.stat(id).await.map(|info| info.is_some())
+    }
+
     /// 0 when the request may go ahead, else the seconds to wait.
     fn wait(&self, who: &str) -> u64 {
         let mut st = lock(&self.st);

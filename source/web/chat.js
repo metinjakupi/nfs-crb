@@ -1,11 +1,11 @@
-// chat.js - Need for Speed: Carbon's quick chat and horn, for free roam with
+// chat.js - Need for Speed: Carbon's chat and horn, for free roam with
 // others. The start page (start.js) loads it with the in-game menu (menu.js)
 // when the player presses Play. It wakes up only when the game goes online
 // (window.recompOnline, or net.js's first "recomp-online" event: the player
 // page sets recompOnline a moment after this file may have run) and does
 // nothing offline.
 //
-// Y opens quick phrases; Shift+Y opens typed chat (120 characters). Both use
+// Y opens typed chat (120 characters). Messages use
 // the relay's existing chat rate limit and room/nearby routing. Received text
 // is displayed with textContent, never interpreted as HTML.
 //
@@ -17,11 +17,11 @@
 //
 // KEYS. NFS Carbon's default keyboard controls (the bindings template in
 // NFSC.exe at 0xa61c88, see mods/core/nfsc/pad.h) put Next song on T and bind
-// Y and H to nothing, so quick chat is on Y and the horn on H. But a player
+// Y and H to nothing, so chat is on Y and the horn on H. But a player
 // can bind any key on Options -> Controls, and a key bound there must stay the
 // game's. So the game says which letters its bindings use (MpShared.keys, see
 // mp.h; 0 from a mod too old to say, which keeps Y and H) and each feature
-// takes the first free key of its own list: quick chat Y U J K, the horn
+// takes the first free key of its own list: chat Y U J K, the horn
 // H B N V. All eight are free in the default controls, in the middle of the
 // keyboard, where the left hand reaches them from gas, brake, Speedbreaker and
 // handbrake (A Z X Space) while the right stays on the arrows; the horn's keep
@@ -38,19 +38,12 @@
 // the bubble phase); key-ups always pass, as in menu.js.
 "use strict";
 (() => {
-  const GROUPS = [
-    { name: "Hi", phrases: ["Hi!", "Bye!", "Thanks!", "Sorry!"] },
-    { name: "Reply", phrases: ["Yes", "No", "Nice!", "GG"] },
-    { name: "Drive", phrases: ["Follow me", "Wait for me", "Over here", "Cops!"] },
-    { name: "Race", phrases: ["Race me!", "Ready?", "Let's go!", "Rematch?"] },
-  ];
   const cleanText = (text) => typeof text === "string" ? text.replace(/\p{Cc}/gu, " ").trim().slice(0, 120) : "";
   const CHAT_KEYS = ["KeyY", "KeyU", "KeyJ", "KeyK"]; // first free one wins (KEYS above)
   const HORN_KEYS = ["KeyH", "KeyB", "KeyN", "KeyV"];
-  const DIGITS = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3, Numpad1: 0, Numpad2: 1, Numpad3: 2, Numpad4: 3 };
   const SHOW_MS = 8000;      // a line in the feed stays this long, then fades
-  const MAX_LINES = 6;
-  const IDLE_MS = 10000;     // the picker closes by itself if left open, so it can't keep eating keys
+  const MAX_LINES = 2; // temporary hints, separate from conversation
+  const HISTORY_LIMIT = 200, RECENT_LIMIT = 5;
   const HORN_MAX_MS = 4000;
   const HEAR_M = 150;        // other players' horns are silent beyond this
   // The relay's limits (LIMITS in tools/carbon-net-relay.mjs), kept a little
@@ -79,7 +72,6 @@
   .cc-feed { position: fixed; left: 16px; bottom: 42vh; z-index: 7; display: flex; flex-direction: column; align-items: flex-start;
         gap: calc(var(--u) * .3); max-width: min(calc(var(--u) * 30), calc(100vw - 32px)); pointer-events: none;
         transition: transform .18s ease-out, opacity .18s ease-out; }
-  .cc.picking .cc-feed { transform: translateX(calc(var(--card) + 14px)); max-width: calc(100vw - var(--card) - 46px); }
   .cc-line { max-width: 100%; padding: calc(var(--u) * .3) calc(var(--u) * .8) calc(var(--u) * .3) calc(var(--u) * .65);
         background: linear-gradient(90deg, rgba(6, 12, 22, .8), rgba(6, 12, 22, .5)); border-left: 2px solid var(--cyan);
         transform: skewX(-12deg); text-shadow: 0 1px 2px rgba(0, 0, 0, .8); transition: opacity .6s ease; animation: cc-in .18s ease-out; }
@@ -104,34 +96,36 @@
         letter-spacing: .2em; text-transform: uppercase; color: var(--cyan); display: flex; align-items: center; gap: 10px; white-space: nowrap; }
   .cc-card h2::after { content: ""; flex: 1; height: 2px; transform: skewX(-30deg);
         background: linear-gradient(90deg, var(--cyan), transparent); opacity: .5; }
-  .cc-row { display: flex; align-items: center; gap: calc(var(--u) * .6); width: 100%; margin: 0 0 4px;
-        padding: calc(var(--u) * .5) calc(var(--u) * .7); cursor: pointer; text-align: left;
-        font: italic 700 1.05em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .06em;
-        text-transform: uppercase; color: var(--ink); background: rgba(95, 228, 242, .04); border: 1px solid transparent;
-        transform: skewX(-8deg); transition: background .12s ease, border-color .12s ease, opacity .12s ease; }
-  .cc-row > * { transform: skewX(8deg); }
-  .cc-row.on, .cc-row:hover { background: rgba(95, 228, 242, .14); border-color: var(--cyan); }
-  .cc-say { white-space: nowrap; }
-  .cc-peek { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        font: 500 .7em/1 "Avenir Next", system-ui, sans-serif; letter-spacing: 0; text-transform: none; color: var(--dim); }
-  .cc-card.waiting .cc-phrase { opacity: .4; }
   .cc-foot { margin-top: calc(var(--u) * .5); font-size: .72em; font-weight: 500; color: var(--dim); }
-  .cc-card.waiting .cc-foot { color: var(--ink); }
   .cc-compose input { width:100%;padding:.65em;background:#091321;color:var(--ink);border:1px solid var(--line);font:inherit; }
   .cc-compose input:focus-visible, .cc-compose button:focus-visible { outline:2px solid var(--cyan);outline-offset:2px; }
   .cc-compose-actions { display:flex;gap:8px;margin-top:10px; }
-  .cc-compose button, .cc-type { padding:.5em .75em;background:#102735;color:var(--ink);border:1px solid var(--line);font:inherit;cursor:pointer; }
-  .cc-type { width:100%;margin-top:8px;font-size:.85em; }
+  .cc-compose button { padding:.5em .75em;background:#102735;color:var(--ink);border:1px solid var(--line);font:inherit;cursor:pointer; }
+  .cc-recent { position:fixed;left:16px;bottom:42vh;z-index:7;display:flex;flex-direction:column;
+    align-items:flex-start;gap:4px;width:min(380px,calc(100vw - 32px));pointer-events:none; }
+  .cc-recent .cc-line > span { display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
+  .cc-line.quiet { background:rgba(6,12,22,.35); }
+  .cc-feed { bottom:18vh; }
+  .cc.composing .cc-recent, .cc.composing .cc-feed { visibility:hidden; }
+  .cc-compose { top:8vh;max-height:84vh;overflow:auto;width:min(460px,calc(100vw - 32px)); }
+  .cc-history { height:32vh;min-height:80px;overflow-y:auto;overscroll-behavior:contain;
+    margin:8px 0 12px;padding:4px 8px;scrollbar-color:var(--dim) #09121e; }
+  .cc-history .cc-line { transform:none;animation:none;margin-bottom:6px;background:transparent;padding:5px 8px; }
+  .cc-history .cc-line > span { transform:none; }
+  .cc-empty { color:var(--dim);font-size:.85em;font-weight:500; }
+  .cc-history:focus-visible { outline:2px solid var(--cyan);outline-offset:2px; }
+  .cc-compose button:hover { background:#193d50; }
+  .cc-compose button:active { background:#24546a; }
   .cc [hidden] { display: none !important; }
   @keyframes cc-in { from { opacity: 0; translate: -8px 0; } }
-  @media (max-width: 560px) { .cc.picking .cc-feed { transform: none; opacity: 0; } } /* no room beside the card */
   @media (prefers-reduced-motion: reduce) {
-    .cc-feed, .cc-row, .cc-line { transition: none; } .cc-line, .cc-card { animation: none; }
+    .cc-feed, .cc-line { transition: none; } .cc-line, .cc-card { animation: none; }
   }
   `;
 
-  let root, feed, card, title, rows, foot, composer, messageInput, composeStatus;
+  let root, feed, composer, messageInput, composeStatus;
   let composing = false;
+  let recent, history;
   // What the player's keyboard prints on a key (Chrome tells; else US names).
   const printed = {};
   const label = (code) => printed[code] || code.slice(3);
@@ -144,38 +138,29 @@
     root.className = "cc";
     root.innerHTML = `
     <style>${css}</style>
+    <div class="cc-recent" role="log" aria-live="polite" aria-label="Recent messages"></div>
     <div class="cc-feed" role="log" aria-live="polite" aria-label="Chat"></div>
-    <div class="cc-card" role="dialog" aria-label="Quick chat" hidden>
-      <h2></h2>
-      <div class="cc-rows"></div>
-      <div class="cc-foot"></div>
-      <button type="button" class="cc-type">Type a message</button>
-    </div>
     <form class="cc-card cc-compose" role="dialog" aria-label="Online chat" hidden>
       <h2>Online chat</h2>
+      <div class="cc-history" role="log" aria-label="Session messages" tabindex="0"><p class="cc-empty">No messages yet. Messages stay here until you reload.</p></div>
       <label for="cc-message">Message · 120 characters maximum</label>
       <input id="cc-message" maxlength="120" autocomplete="off" placeholder="Say something to nearby players…">
       <div class="cc-foot" role="status"></div>
       <div class="cc-compose-actions"><button type="submit">Send</button><button type="button">Cancel</button></div>
     </form>`;
     document.body.append(root);
+    recent = root.querySelector(".cc-recent");
+    history = root.querySelector(".cc-history");
     feed = root.querySelector(".cc-feed");
-    card = root.querySelector(".cc-card");
-    title = card.querySelector("h2");
-    rows = card.querySelector(".cc-rows");
-    foot = card.querySelector(".cc-foot");
     composer = root.querySelector(".cc-compose");
     messageInput = composer.querySelector("input");
     composeStatus = composer.querySelector("[role=status]");
-    card.querySelector(".cc-type").addEventListener("click", openComposer);
     composer.querySelector("button[type=button]").addEventListener("click", closeComposer);
     composer.addEventListener("submit", (e) => { e.preventDefault(); sendTyped(); });
     for (const type of ["keydown", "keypress"]) composer.addEventListener(type, (e) => {
       e.stopPropagation();
       if (type === "keydown" && e.code === "Escape") { e.preventDefault(); closeComposer(); }
     });
-    // Clicks pick a row without taking the keyboard from the game.
-    card.addEventListener("mousedown", (e) => e.preventDefault());
     navigator.keyboard?.getLayoutMap?.().then((map) => {
       for (const code of [...CHAT_KEYS, ...HORN_KEYS]) {
         const k = map.get(code);
@@ -217,7 +202,6 @@
     if (chat === chatKey && horn === hornKey) return false;
     chatKey = chat;
     hornKey = horn;
-    if (!chatKey) closePicker();
     return true;
   }
   // Another player's car now: the newest pose in its slot, and how far left or
@@ -303,9 +287,20 @@
   function say(name, crew, text, kind) {
     const t = document.createElement("span");
     t.textContent = text;
-    line([who(name, crew), t], kind);
+    const el = document.createElement("div");
+    el.className = `cc-line ${kind || ""}`;
+    const inner = document.createElement("span");
+    inner.append(who(name, crew), t);
+    el.append(inner);
+    const follow = history.scrollHeight - history.scrollTop - history.clientHeight < 40;
+    history.querySelector(".cc-empty")?.remove();
+    history.append(el.cloneNode(true));
+    while (history.children.length > HISTORY_LIMIT) history.firstElementChild.remove();
+    if (composing && follow) history.scrollTop = history.scrollHeight;
+    recent.append(el);
+    while (recent.children.length > RECENT_LIMIT) recent.firstElementChild.remove();
+    setTimeout(() => el.classList.add("quiet"), SHOW_MS);
   }
-  const note = (...parts) => line(parts, "note");
 
   // The keys, once the player is in a car and again whenever they move (the
   // old hint goes, so no line names a key that no longer works).
@@ -314,12 +309,12 @@
     hinted = true;
     for (const out of unhint.splice(0)) out();
     const parts = [];
-    if (chatKey) parts.push(kbd(label(chatKey)), " Quick chat · ", kbd(`Shift+${label(chatKey)}`), " Type");
+    if (chatKey) parts.push(kbd(label(chatKey)), " Chat");
     if (chatKey && hornKey) parts.push("  ·  ");
     if (hornKey) parts.push(kbd(label(hornKey)), " Horn (hold)");
     if (parts.length) unhint.push(line(parts, "note", 10000));
     const all = (codes) => `${codes.slice(0, -1).map(label).join(", ")} and ${label(codes.at(-1))}`;
-    if (!chatKey) unhint.push(line([`Quick chat off: ${all(CHAT_KEYS)} are all bound in Controls`], "note", 10000));
+    if (!chatKey) unhint.push(line([`Chat off: ${all(CHAT_KEYS)} are all bound in Controls`], "note", 10000));
     if (!hornKey) unhint.push(line([`Horn off: ${all(HORN_KEYS)} are all bound in Controls`], "note", 10000));
   }
 
@@ -351,20 +346,20 @@
 
   function openComposer() {
     if (!active || !driving() || menuOpen()) return;
-    closePicker();
     hornUp();
     composing = true;
     composer.hidden = false;
-    root.classList.add("picking");
+    root.classList.add("composing");
     globalThis.recompMenuOpen = true; // suppress controller driving while typing
     composeStatus.textContent = "Enter sends · Esc cancels · Nearby players in this room";
+    history.scrollTop = history.scrollHeight;
     messageInput.focus();
   }
   function closeComposer() {
     if (!composing) return;
     composing = false;
     composer.hidden = true;
-    root.classList.remove("picking");
+    root.classList.remove("composing");
     globalThis.recompMenuOpen = menuOpen();
     if (!menuOpen()) document.getElementById("canvas")?.focus();
   }
@@ -377,84 +372,6 @@
     say(myName(), myCrew(), text, "mine");
     messageInput.value = "";
     closeComposer();
-  }
-
-  // ---- The picker ----
-  let picker = false, group = -1, sel = 0, idle = 0;
-  function openPicker() {
-    picker = true;
-    group = -1;
-    sel = 0;
-    card.hidden = false;
-    root.classList.add("picking");
-    draw();
-    touch();
-  }
-  function closePicker() {
-    if (!picker) return;
-    picker = false;
-    card.hidden = true;
-    root.classList.remove("picking");
-    clearTimeout(idle);
-  }
-  function touch() {
-    clearTimeout(idle);
-    idle = setTimeout(closePicker, IDLE_MS);
-  }
-  function draw() {
-    title.textContent = group < 0 ? "Quick chat" : `Quick chat · ${GROUPS[group].name}`;
-    const list = group < 0 ? GROUPS.map((g) => g.name) : GROUPS[group].phrases;
-    rows.replaceChildren(...list.map((text, i) => {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.tabIndex = -1;
-      row.className = `cc-row${group < 0 ? "" : " cc-phrase"}${i === sel ? " on" : ""}`;
-      const words = document.createElement("span");
-      words.className = "cc-say";
-      words.textContent = text;
-      row.append(kbd(String(i + 1)), words);
-      if (group < 0) {
-        const peek = document.createElement("span");
-        peek.className = "cc-peek";
-        peek.textContent = GROUPS[i].phrases.join(" · ");
-        row.append(peek);
-      }
-      row.addEventListener("click", () => pick(i));
-      return row;
-    }));
-    waiting();
-  }
-  // While the relay would refuse another message, the phrases are dimmed and
-  // the card says how long to wait. Otherwise it names the keys, the chat key
-  // as it is now.
-  function waiting() {
-    const ms = chatLimit.wait();
-    card.classList.toggle("waiting", ms > 0);
-    const close = chatKey ? `${label(chatKey)} or Esc closes` : "Esc closes";
-    const text = ms > 0 ? `Next message in ${Math.ceil(ms / 1000)} s`
-      : group < 0 ? `1–4 or ↑ ↓ Enter · ${close}` : `1–4 or ↑ ↓ Enter · ← back · ${close}`;
-    if (foot.textContent !== text) foot.textContent = text;
-  }
-  function pick(i) {
-    touch();
-    if (group < 0) {
-      group = i;
-      sel = 0;
-      draw();
-    } else {
-      send(GROUPS[group].phrases[i]);
-    }
-  }
-  function send(text) {
-    if (!linkOpen()) {
-      closePicker();
-      note("Not connected, so it was not sent.");
-      return;
-    }
-    if (!chatLimit.take()) { waiting(); return; }
-    window.recompOnlineSend({ t: "chat", text });
-    closePicker();
-    say(myName(), myCrew(), text, "mine");
   }
 
   // ---- The horn ----
@@ -590,36 +507,19 @@
     addEventListener("pointerdown", unlock, true);
 
     addEventListener("keydown", (e) => {
-      if (e.code === "F9" || e.code === "F10") { closePicker(); closeComposer(); return; } // the menu's key: it takes over
+      if (e.code === "F9" || e.code === "F10") { closeComposer(); return; } // the menu's key: it takes over
       if (menuOpen() || typing(e.target) || e.target?.closest?.(".cm")) return;
-      if (picker) {
-        eat(e);
-        if (e.repeat) return; // a key held from driving does not scroll the list
-        touch();
-        if (e.code in DIGITS) pick(DIGITS[e.code]);
-        else if (e.code === "ArrowDown" || e.code === "ArrowUp") {
-          sel = (sel + (e.code === "ArrowDown" ? 1 : 3)) % 4;
-          draw();
-        } else if (e.code === "Enter" || e.code === "NumpadEnter" || (e.code === "ArrowRight" && group < 0)) pick(sel);
-        else if ((e.code === "ArrowLeft" || e.code === "Backspace") && group >= 0) {
-          sel = group;
-          group = -1;
-          draw();
-        } else if (e.code === "Escape" || e.code === chatKey) closePicker();
-        else if (e.code === hornKey) hornDown(e.code);
-        return;
-      }
       // chatKey / hornKey are null when every key of their list is the game's.
       if ((e.code !== chatKey && e.code !== hornKey) || e.ctrlKey || e.metaKey || !driving()) return;
       if (e.code === hornKey && window.recompPoliceKey?.(e)) { eat(e); return; } // the police player's siren (net.js)
       eat(e);
       if (e.repeat) return;
-      if (e.code === chatKey) { if (e.shiftKey) openComposer(); else openPicker(); }
+      if (e.code === chatKey) openComposer();
       else hornDown(e.code);
     }, true);
     addEventListener("keypress", (e) => {
       if (composing) return;
-      if (picker || ((e.code === chatKey || e.code === hornKey) && !e.ctrlKey && !e.metaKey && driving() && !menuOpen())) eat(e);
+      if ((e.code === chatKey || e.code === hornKey) && !e.ctrlKey && !e.metaKey && driving() && !menuOpen()) eat(e);
     }, true);
     addEventListener("keyup", (e) => { if (e.code === mine?.code) hornUp(); }, true); // never stopped
     addEventListener("blur", hornUp);
@@ -630,10 +530,8 @@
     if (pickKeys()) hinted = false; // show the new keys (once in a car)
     const inCar = driving(), menu = menuOpen();
     if (inCar && !hinted) hint();
-    if (picker && (!inCar || menu)) closePicker();
     if (composing && (!inCar || menu)) closeComposer();
     if (mine && (!inCar || menu)) hornUp();
-    if (picker) waiting();
     for (const [id, h] of horns) {
       const { level, pan } = hearing(id, h.at);
       h.voice?.set(level, pan);

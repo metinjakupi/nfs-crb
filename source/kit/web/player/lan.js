@@ -20,11 +20,10 @@
 //   [0] kind (3 UDP, 4 TCP)  [1..3] 0  [4..7] source address  [8..11] destination
 //   [12..13] source port  [14..15] destination port  [16..] payload (LAN header + data)
 // Text messages are JSON: {"t":"lan","vip","netmask"} and {"t":"gone","vip"}
-// from the switch, {"t":"hello","name","pk"} from here. pk is this browser's
-// player key (random, kept in localStorage): the server ties the name to it,
-// so another browser cannot sign in under it (EA Messenger's friends follow
-// the name). A test page may give one with ?pk=, only together with ?testing;
-// that one is never stored.
+// from the switch, {"t":"hello","name","pk","claim"} from here. claim is the opaque
+// cloud-save id that proves an explicit name claim; the keyphrase never comes here. pk is this
+// browser's random metadata (kept in localStorage). A test page
+// may give one with ?pk=, only together with ?testing; that one is never stored.
 "use strict";
 (() => {
   const params = new URLSearchParams(location.search);
@@ -47,6 +46,7 @@
     return;
   }
   const name = ((given && given.name) || params.get("name") || "Player").slice(0, 32);
+  const claim = /^[0-9a-f]{64}$/.test((given && given.claim) || "") ? given.claim : "";
   let pk = "";
   if (params.has("testing") && /^[A-Za-z0-9_-]{16,64}$/.test(params.get("pk") || "")) {
     pk = params.get("pk");
@@ -77,7 +77,7 @@
     const PAGE_CONNECTING = 1, PAGE_ONLINE = 2, PAGE_OFFLINE = 3;
     const IDLE_MS = 10000;
 
-    let url = "", name = "", pk = "", memory = null, ptr = 0, views = null;
+    let url = "", name = "", pk = "", claim = "", memory = null, ptr = 0, views = null;
     let ws = null, online = false, vip = 0, generation = 0, retry = 0, retryTimer = 0, idleSince = 0, flushTimer = 0;
     const backlog = []; // received TCP frames waiting for RX ring room, in order: TCP is never dropped
     const stats = { out: 0, in: 0, rxFull: 0, offline: 0, waitedMax: 0 };
@@ -226,7 +226,7 @@
       online = false;
       sock.binaryType = "arraybuffer";
       if (load(W_PAGE_STATE) !== PAGE_OFFLINE) setState(PAGE_CONNECTING);
-      sock.onopen = () => sock.send(JSON.stringify({ t: "hello", name, pk }));
+      sock.onopen = () => sock.send(JSON.stringify({ t: "hello", name, pk, claim }));
       sock.onmessage = (e) => {
         if (ws !== sock) return;
         if (typeof e.data === "string") {
@@ -289,6 +289,7 @@
         url = m.url;
         name = m.name;
         pk = m.pk || "";
+        claim = m.claim || "";
       } else if (m.t === "mailbox" && !memory) {
         memory = m.memory;
         ptr = m.ptr >>> 0; // above 2 GB the kit's address arrives as a negative int32
@@ -325,7 +326,7 @@
     }
   };
   worker.onerror = (e) => console.warn("[lan] the link stopped:", e.message);
-  worker.postMessage({ t: "start", url, name, pk });
+  worker.postMessage({ t: "start", url, name, pk, claim });
   // Leaving for another page: Chrome may keep this one in its back/forward cache, link and all,
   // so friends would still see the player online. The link ends at once instead, and a page
   // brought back from that cache starts again (its game has lost the link).

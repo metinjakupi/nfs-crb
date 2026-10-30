@@ -149,9 +149,13 @@
 #define MP_AHEAD 7.0f  /* escort test: metres in front of the player */
 #define MP_TAKE 900    /* test car: frames recorded, then replayed */
 #define MP_RING 4      /* poses per slot */
-#define MP_KEEP 8      /* poses the mod keeps per car */
+#define MP_KEEP 48     /* poses kept per car: enough history to smooth a recovered link */
 #define MP_DELAY 150.0 /* ms behind the sender */
 #define MP_EXTRAPOLATE 300.0
+#define MP_RECOVER_GAP 100.0  /* ms behind the target before catch-up becomes faster */
+#define MP_RECOVER_GAIN 100.0 /* ms: catch-up gain after a delivery interruption */
+#define MP_RECOVER_RATE 4.0   /* fastest playback while catching up */
+#define MP_RECOVER_SPEED 60.0f /* m/s added to the owner's speed while closing position */
 /* Touching another player's car (CONTACTS in the header comment). */
 #define MP_NEAR_DELAY 50.0   /* ms behind the sender for a solid car close to ours */
 #define MP_NEAR_FROM 45.0f   /* metres: closer than this the delay starts to shrink */
@@ -226,9 +230,11 @@ typedef struct MpCar {
     int wait;                  /* frames before the next build attempt */
     int tries;
     int visual_only; /* encounter copies: owner poses, no player inputs or contacts */
+    int paused;      /* connected but in a menu: keep the car, stationary and non-colliding */
     int spawn_overlap; /* no contact with our car until a shared spawn has cleared */
     uint32_t taken;            /* slot poses already kept */
     double play, played_at;    /* the playback clock (sender ms) and when it last moved (our ms) */
+    int recovering;            /* a delivery gap is still being closed without a position jump */
     int kept;
     double at[MP_KEEP];        /* each kept pose's sender time, ms */
     MpPose pose[MP_KEEP];      /* oldest first */
@@ -261,6 +267,7 @@ static int g_mp_recorded, g_mp_played;
 static float g_mp_drift;    /* furthest the physics moved the test car between two frames */
 static uint64_t g_mp_steps; /* 1/60 s physics steps since start */
 static uint32_t g_mp_player_simable, g_mp_impact_serial;
+static int g_mp_local_paused; /* Escape pause: keep the received world at its last drawn frame */
 
 static int g_mp_page_ghost; /* the page's menu asked for see-through cars */
 /* race.h: 1 for a player whose car is one of its racers (it builds and moves that car itself). */
@@ -570,6 +577,10 @@ static const char *mp_resolve_pair_body(const PopModApi *api, pop_cpu_v1 *cpu) {
     const uint32_t oa = a ? get_u32(a + 0x2c) : 0, ob = b ? get_u32(b + 0x2c) : 0;
     MpCar *ra = mp_remote_owner(oa), *rb = mp_remote_owner(ob);
     MpCar *remote = oa == g_mp_player_simable ? rb : ob == g_mp_player_simable ? ra : NULL;
+    if ((ra && ra->paused) || (rb && rb->paused)) {
+        api->hook_return(api, cpu, cpu->eax & 0xffffff00u, 0);
+        return "paused";
+    }
     const int shared = me && (flags & (MP_PAGE_GHOST | MP_PAGE_CONTACTS)) == MP_PAGE_CONTACTS;
     if (shared && ra && rb && ra->contacts && rb->contacts) {
         api->hook_return(api, cpu, cpu->eax & 0xffffff00u, 0);
@@ -1064,18 +1075,29 @@ static void mp_sample(const MpCar *c, double t, MpPose *out) {
     }
 }
 
-/* Moves a car's playback clock to now: real time passes, sped up or slowed
- * down by up to 10% to stay its lag (MP_DELAY, or less near our car) behind the
- * newest pose. Catch up when behind; never rewind an unchanged packet when
- * delivery pauses. Only a new sender timeline (mp_take) resets playback. */
+/* Moves a car's playback clock to now. Ordinarily it changes speed by at most
+ * 10% to keep its lag (MP_DELAY, or less near our car). After a delivery gap it
+ * catches up at up to MP_RECOVER_RATE instead of jumping straight to the newest
+ * pose; MP_KEEP preserves enough of the old timeline for that fast playback.
+ * It never rewinds an unchanged packet. Only a new sender timeline (mp_take)
+ * resets playback. */
 static double mp_playback(MpCar *c, double now) {
     const double target = c->at[c->kept - 1] - (c->lag > 0 ? c->lag : MP_DELAY);
-    if (!c->played_at || c->play < target - 500.0) {
+    if (!c->played_at) {
         c->play = target;
+        c->recovering = 0;
     } else {
-        double rate = 1.0 + (target - c->play) * 0.001;
-        rate = rate < 0.9 ? 0.9 : rate > 1.1 ? 1.1 : rate;
+        const double behind = target - c->play;
+        const int recovering = behind > MP_RECOVER_GAP;
+        if (recovering)
+            c->recovering = 1;
+        const double gain = recovering ? 1.0 / MP_RECOVER_GAIN : 0.001;
+        const double fastest = recovering ? MP_RECOVER_RATE : 1.1;
+        double rate = 1.0 + behind * gain;
+        rate = rate < 0.9 ? 0.9 : rate > fastest ? fastest : rate;
         c->play += (now - c->played_at) * rate;
+        if (recovering && c->play > target)
+            c->play = target;
     }
     const double limit = c->at[c->kept - 1] + MP_EXTRAPOLATE;
     if (c->play > limit)
@@ -1135,11 +1157,36 @@ static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
         c->play = c->at[c->kept - 1];
         c->played_at = now;
     }
+    const double previous_played_at = c->played_at;
     mp_sample(c, mp_playback(c, now), &target);
-    if (!c->visual_only && g_mp_drive_car)
+    if (!c->visual_only && !c->paused && g_mp_drive_car)
         g_mp_drive_car(c, c->play, late); /* its owner's controls of that moment */
-    if (!c->visual_only && g_mp_follow_target)
+    if (!c->visual_only && !c->paused && g_mp_follow_target)
         g_mp_follow_target(c, &target);
+    /* A fast owner can cover many metres during a gap. Even fast playback must not
+     * turn that distance into one rendered jump. Close the position at the owner's
+     * current speed plus MP_RECOVER_SPEED; collision recovery has its own spring. */
+    if (c->recovering && c->follow == MP_FOLLOWING && previous_played_at > 0) {
+        double dt = (now - previous_played_at) / 1000.0;
+        dt = dt < 0 ? 0 : dt > 0.05 ? 0.05 : dt;
+        float distance2 = 0, speed2 = 0;
+        for (int k = 0; k < 3; ++k) {
+            const float d = target.p[k] - c->drawn[k];
+            distance2 += d * d;
+            speed2 += target.v[k] * target.v[k];
+        }
+        const float distance = sqrtf(distance2);
+        const float step = (sqrtf(speed2) + MP_RECOVER_SPEED) * (float)dt;
+        if (distance > step && step > 0) {
+            const float scale = step / distance;
+            for (int k = 0; k < 3; ++k)
+                target.p[k] = c->drawn[k] + (target.p[k] - c->drawn[k]) * scale;
+        } else if (distance <= step) {
+            c->recovering = 0;
+        }
+    } else if (c->follow != MP_FOLLOWING) {
+        c->recovering = 0;
+    }
     const uint32_t state = c->follow != MP_FOLLOWING ? mp_state(get_u32(c->simable - 0x24 + 0x70)) : 0;
     if (state)
         mp_read(state, &car);
@@ -1203,6 +1250,11 @@ static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
 
 /* Places every built car where it belongs now. */
 static void mp_place_all(MpPose *first, int late) {
+    /* Carbon stops advancing the world's render connections on Escape pause. Moving only our
+     * rigid bodies then makes the web name tags follow new poses while the visible cars stay at
+     * their old matrices. Freeze both here; queued poses catch up smoothly after resume. */
+    if (g_mp_local_paused)
+        return;
     const double now = mp_now();
     for (int i = 0; i < MP_SLOTS; ++i) {
         MpCar *c = &g_mp_remote[i];
@@ -1335,9 +1387,16 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
                 g_mp_friend_car(i, c->id, 0);
             c->simable = 0;
         }
-        const int active = sh->page && s->id && s->mode == 1 && state && !(g_mp_racer && g_mp_racer(s->id));
-        const int relook = c->simable && active && c->id == s->id && g_mp_relook && g_mp_relook(i, s->id, s->key);
-        if (c->simable && (!active || c->id != s->id || c->key != s->key || c->kind != mp_friend_kind(s->id) || relook)) {
+        /* Mode 0 is a connected player in a menu. Keep its last car visible; only an empty
+         * slot (`left` from the page) removes it. The page zeros its speed, and the collision
+         * hook treats it as display-only until mode 1 returns. */
+        const int active = sh->page && s->id && s->count && s->mode <= 1 && state &&
+                           !(g_mp_racer && g_mp_racer(s->id));
+        const int freeze = g_mp_local_paused && c->simable && active && c->id == s->id;
+        const int relook = !freeze && c->simable && active && c->id == s->id && g_mp_relook &&
+                           g_mp_relook(i, s->id, s->key);
+        if (c->simable && (!active || c->id != s->id || (!freeze &&
+            (c->key != s->key || c->kind != mp_friend_kind(s->id) || relook)))) {
             if (g_mp_friend_car)
                 g_mp_friend_car(i, c->id, 0);
             mp_drop_friend(c, active ? "another player, car or look" : "left or stopped driving");
@@ -1348,7 +1407,7 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
             c->id = 0;
             continue;
         }
-        if (c->id != s->id || c->key != s->key) {
+        if (!freeze && (c->id != s->id || c->key != s->key)) {
             c->id = s->id;
             c->key = s->key;
             c->wait = 0;
@@ -1359,7 +1418,8 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
             c->follow = MP_FOLLOWING;
             c->contact_at = 0;
         }
-        c->contacts = s->pad[0];
+        c->paused = s->mode == 0;
+        c->contacts = c->paused ? 0 : s->pad[0];
         c->ack = s->pad[1];
         mp_take(c, s, now);
         if (!c->kept)
@@ -1383,6 +1443,10 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         float near = (MP_NEAR_FROM - sqrtf(d2)) / (MP_NEAR_FROM - MP_NEAR_TO);
         near = c->kind == MP_GHOST || near < 0 ? 0 : near > 1 ? 1 : near;
         c->lag = MP_DELAY + (MP_NEAR_DELAY - MP_DELAY) * near;
+        /* Keep the paused frame's existing cars. Do not remove one because its owner drove far,
+         * rebuild it for a model/look change, or introduce a new car behind the frozen menu. */
+        if (g_mp_local_paused)
+            continue;
         if (c->simable) {
             if (d2 > MP_FAR * MP_FAR) {
                 if (g_mp_friend_car)
@@ -1570,6 +1634,7 @@ static void mp_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation 
     if (player && mp_online_game())
         player = 0;
     const int paused = player && (mp_call(MP_IS_PAUSED, 0, NULL, 0) & 0xffu) != 0;
+    g_mp_local_paused = paused;
     g_mp_player_simable = player ? player + 0x24u : 0;
     MpShared *sh = mp_shared();
     if (sh) {

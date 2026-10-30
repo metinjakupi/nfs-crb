@@ -29,9 +29,11 @@ use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use crate::ea::{masked, theater_udp, ConnKey, Event, Hub, Packet, Service, Session, THEATER_PORT};
+use crate::identity::Claims;
 use crate::lan::{vip_str, FIN, RST, SYN, SYNACK, DATA};
 use crate::util::{file_stamp, iso_date};
 
@@ -121,7 +123,7 @@ fn since(t: Instant) -> f64 {
 }
 
 impl Trace {
-    pub fn new(dir: Option<PathBuf>) -> Trace {
+    pub fn new(dir: Option<PathBuf>, identities: Arc<Mutex<Claims>>) -> Trace {
         let dir = dir.filter(|d| match fs::create_dir_all(d) {
             Ok(()) => true,
             Err(e) => {
@@ -149,6 +151,7 @@ impl Trace {
                 .map(|_| tx)
         });
         let mut hub = Hub::default();
+        hub.identities = identities;
         hub.trace_game = std::env::var("CARBON_TRACE_GAME").is_ok_and(|v| !v.is_empty() && v != "0");
         hub.host_game = std::env::var("CARBON_HOST_GAME").is_ok_and(|v| !v.is_empty() && v != "0");
         // Messenger's friends, names and blocks are kept here between runs (else for this run).
@@ -559,8 +562,9 @@ impl Trace {
     }
 
     /// A browser left the network: its connections are over.
-    /// The page's player key for this vip (lan.js's /lan hello): only its SHA-256 is kept, for
-    /// FESL Login's check of the name's claim (messenger.rs). Never logged.
+    /// The page's non-authoritative browser key for this vip (lan.js's /lan hello): only its
+    /// SHA-256 is kept as Messenger and Player Stats metadata. It never owns a name and is
+    /// never logged.
     pub fn set_player_key(&mut self, vip: u32, key: &str) {
         if key.is_empty() {
             self.hub.player_keys.remove(&vip);
@@ -569,8 +573,18 @@ impl Trace {
         }
     }
 
+    /// The cloud-save id from lan.js's hello is converted to its domain-separated owner and
+    /// then discarded. FESL Login uses only that owner to check an explicit name claim.
+    pub fn set_player_claim(&mut self, vip: u32, token: &str) {
+        match crate::identity::owner_of(token) {
+            Some(owner) => { self.hub.player_claims.insert(vip, owner); }
+            None => { self.hub.player_claims.remove(&vip); }
+        }
+    }
+
     pub fn gone(&mut self, vip: u32) {
         self.hub.player_keys.remove(&vip);
+        self.hub.player_claims.remove(&vip);
         let keys: Vec<ConnKey> = self.conns.keys().filter(|k| k.0 == vip).copied().collect();
         for key in keys {
             if let Some(s) = self.conns.remove(&key) {

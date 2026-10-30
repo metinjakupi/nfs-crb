@@ -27,12 +27,12 @@
 //!   (Total_Rnkd_Evt_Games_<race>) and the wins (Evt_Wins_<race>). A race needs two players to
 //!   count; leaving a race, or not finishing a sprint, circuit or speed trap, is a loss and a DNF.
 //!
-//! Players are kept by their claimed name (ea.rs's Login, Messenger's name claims), as Messenger
-//! keeps friends: a name whose claim lapsed and was taken by another browser starts with empty
-//! stats, as it starts with an empty friends list. Kept with CARBON_STATS_DIR in `stats.json`
-//! (written whole through a temporary file); in memory only without it. Per player: its name, a
-//! short fingerprint of the claiming key's SHA-256 (to see a name change hands), the last day
-//! it signed in, and its stats. No addresses, nothing else.
+//! Players are kept by their display name (ea.rs's Login), as Messenger keeps friends. An
+//! explicit name claim adds an access check before Login; it does not rewrite or clear these
+//! statistics. Changing browsers or losing browser storage does not clear statistics. Kept with CARBON_STATS_DIR in
+//! `stats.json` (written whole through a temporary file); in memory only without it. Per player:
+//! its name, a short fingerprint of the latest browser key when supplied, the last sign-in day,
+//! and its stats. No addresses, nothing else.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -224,7 +224,7 @@ impl Stat {
 #[derive(Clone, Debug, PartialEq)]
 struct Person {
     name: String,
-    /// the first 16 hex digits of the claiming key's SHA-256, if a key ever claimed the name
+    /// the first 16 hex digits of the latest browser key's SHA-256, when supplied
     key: Option<String>,
     /// last sign-in, in days since 1970
     seen: u64,
@@ -477,23 +477,18 @@ impl Stats {
         self.people.get_mut(&k)
     }
 
-    /// A sign-in (FESL Login) under `name`, whose claim Messenger has just allowed. A name that
-    /// another browser's key claimed before (the old claim lapsed) starts empty, as its
-    /// friends list does.
-    pub fn signed_in(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) -> Option<String> {
+    /// A sign-in (FESL Login) under the display `name`. The latest browser-key fingerprint is
+    /// metadata only; changing or losing the key never clears statistics.
+    pub fn signed_in(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) {
         let fp = key.map(fingerprint);
         if !self.people.contains_key(&low(name)) {
             // kept in memory until it has stats (then saved with them): who holds the name
-            let p = self.person(name, now)?;
-            p.key = fp;
-            return None;
+            if let Some(p) = self.person(name, now) {
+                p.key = fp;
+            }
+            return;
         }
-        let p = self.people.get_mut(&low(name))?;
-        let mut note = None;
-        if fp.is_some() && p.key.is_some() && fp != p.key {
-            p.stats.clear();
-            note = Some(format!("{name} was claimed by another browser: its stats start empty"));
-        }
+        let Some(p) = self.people.get_mut(&low(name)) else { return };
         let changed = (fp.is_some() && fp != p.key) || p.seen != now / 86_400 || p.name != name;
         if fp.is_some() {
             p.key = fp;
@@ -503,7 +498,6 @@ impl Stats {
         if changed {
             self.save();
         }
-        note
     }
 
     /// Adds or changes one stat of a player; false if it could not be kept.
@@ -853,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn the_store_survives_a_restart_and_a_lapsed_name_starts_empty() {
+    fn the_store_survives_a_restart_and_a_new_browser_keeps_stats() {
         let dir = std::env::temp_dir().join(format!("carbon-stats-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let key_a = crate::messenger::digest("browser-a-key-0123456789");
@@ -862,7 +856,7 @@ mod tests {
             let mut s = Stats::open(Some(dir.clone()));
             s.race(RaceReport::Started { gid: 1, players: racers(&["Metin", "Jan"]) }, NOW);
             s.race(RaceReport::Ended { gid: 1, settings: circuit(), players: racers(&["Metin", "Jan"]), results: vec![(0, results(&[(1, 1, true, 100.0, 70.0), (5, 2, true, 101.0, 70.0)]))] }, NOW);
-            assert_eq!(s.signed_in("Metin", Some(&key_a), NOW), None);
+            s.signed_in("Metin", Some(&key_a), NOW);
         }
         let text = fs::read_to_string(dir.join("stats.json")).unwrap();
         assert!(!text.contains("browser-a"));
@@ -870,10 +864,10 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s.get(user_id("Metin"), &["Overall_Solo_On_Wins".into()], Period::All, 0, NOW)[0].1, 1.0);
         assert_eq!(s.ranked(user_id("Jan"), &["Evt_Bst_30F07253".into()], Period::Week, 0, NOW)[0].2, 2);
-        // the same browser again: kept; another browser (after the claim lapsed): empty
-        assert_eq!(s.signed_in("Metin", Some(&key_a), NOW + 86_400), None);
-        assert!(s.signed_in("Metin", Some(&key_b), NOW + 40 * 86_400).is_some());
-        assert_eq!(s.get(user_id("Metin"), &["Overall_Solo_On_Wins".into()], Period::All, 0, NOW)[0].1, 0.0);
+        // The same browser and a different browser both keep the name's statistics.
+        s.signed_in("Metin", Some(&key_a), NOW + 86_400);
+        s.signed_in("Metin", Some(&key_b), NOW + 40 * 86_400);
+        assert_eq!(s.get(user_id("Metin"), &["Overall_Solo_On_Wins".into()], Period::All, 0, NOW)[0].1, 1.0);
         let _ = fs::remove_dir_all(&dir);
     }
 

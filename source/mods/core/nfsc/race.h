@@ -161,7 +161,7 @@ typedef struct RaceShared {
     uint32_t rows, loaded, session; /* session: the one the game part describes */
     float lap_pct;
     uint32_t cp, ms; /* checkpoints this lap; the physics clock (mp_ms) of these values */
-    uint32_t spare;
+    uint32_t flow_flags; /* low byte: game flow; 0x100: waiting for measured finishes */
     RaceRow row[RACE_ROWS];
 } RaceShared;
 #define RACE_MAGIC 0x31435243u /* "CRC1" */
@@ -183,6 +183,9 @@ typedef struct RaceCar {
 
 static uint32_t g_race_hooks[12];
 static uint32_t g_race_block, g_race_buf;
+static int g_race_encounter, g_race_aborting;
+static int (*g_race_page_source)(RacePage *);
+static void (*g_race_finish_observer)(uint32_t,float);
 static RacePage g_race_page;           /* the last whole copy of the page's part */
 static RaceCar g_race_cars[RACE_PEERS + 1];
 static int g_race_cars_n;
@@ -196,6 +199,10 @@ static uint32_t g_race_frame, g_race_car_key, g_race_base;
 static int g_race_test;
 static int g_race_pilot; /* ms behind the AI that the player's own car drives (tests); 0 = off */
 static uint32_t g_race_finish_sent;
+/* The script counts finishes seen locally, which can disagree with network
+ * racers' measured times. Defer final placement until those times arrive. */
+static uint32_t g_race_result_activity, g_race_result_simable;
+static int g_race_result_replaying;
 /* test car: the followed AI's path */
 static MpPose g_race_path[RACE_FOLLOW];
 static double g_race_path_at[RACE_FOLLOW];
@@ -305,6 +312,12 @@ static int race_grid(uint32_t slot, float pos[3], float dir[3]) {
     const uint32_t b = g_race_buf + 0x80;
     for (uint32_t i = 0; i < 0x18; i += 4)
         mp_put(b + i, 0);
+    if (g_race_encounter && g_race_session && g_race_session == g_race_page.session) {
+        const uint32_t args[4] = {slot == g_race_page.grid ? 0u : 1u, b, b + 0x0c, 0};
+        if (!(mp_call(0x00617720u, 0, args, 4) & 0xffu)) return 0;
+        for (int i=0;i<3;i++) {pos[i]=bits_float(get_u32(b+4u*i));dir[i]=bits_float(get_u32(b+12+4u*i));}
+        return isfinite(pos[0]) && isfinite(pos[2]);
+    }
     const uint32_t args[4] = {slot, b, b + 0x0c, 0};
     if (!(mp_call(RACE_GRID, 0, args, 4) & 0xffu))
         return 0;
@@ -432,8 +445,10 @@ static void race_forget(const char *why) {
     g_race_cars_n = 0;
     g_race_session = 0;
     g_race_phase = RACE_IDLE;
+    g_race_encounter = g_race_aborting = 0;
     g_race_loaded_at = 0;
     g_race_finish_sent = 0;
+    g_race_result_activity = g_race_result_simable = 0;
     g_race_path_n = 0;
     g_race_no_ai = 0; /* kept until now: a restart runs InitRacers again */
 }
@@ -447,6 +462,7 @@ static void race_init_racers(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoc
     const uint32_t rs = race_status(), player = mp_player();
     if (!rs || !player)
         return;
+    g_race_result_activity = g_race_result_simable = 0;
     if (g_race_cars_n) {
         /* A restart runs InitRacers again with an empty table: the same cars
          * become racers again. */
@@ -516,6 +532,7 @@ static void race_wingman(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
 static int race_holding(void) {
     if (g_race_phase < RACE_SET_UP || g_race_phase >= RACE_RACING)
         return 0;
+    if(g_race_encounter)return !g_race_aborting && g_race_page.go != g_race_session;
     if (g_race_loaded_at > 0 && mp_now() - g_race_loaded_at > RACE_HOLD_MAX * 1000.0)
         return 0;
     if (g_race_test)
@@ -613,10 +630,22 @@ static void race_start(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation 
 }
 
 
+/* Flow 3 includes the startup screens, where the vehicle factories are not
+ * ready yet. Launch only from loaded race-selection or main-menu screens. */
+static int race_menu_ready(void) {
+    if (get_u32(RACE_FLOW) != 3) return 0;
+    const uint32_t feng = get_u32(0x00a97a78u);
+    if (!feng) return 0;
+    const uint32_t names[] = {0x009d0298u, 0x009d0284u, 0x009cfdccu, 0x009cfc50u};
+    for (uint32_t i = 0; i < sizeof names / sizeof names[0]; ++i)
+        if (mp_call(0x00572350u, feng, &names[i], 1) & 0xffu) return 1;
+    return 0;
+}
+
 /* From the front end: start the session's race, with the host's options. */
 static void race_launch(void) {
     const RacePage *p = &g_race_page;
-    if (!p->launch || p->launch != p->session || p->launch == g_race_launched || get_u32(RACE_FLOW) != 3)
+    if (!p->launch || p->launch != p->session || p->launch == g_race_launched || !race_menu_ready())
         return;
     g_race_launched = p->launch;
     uint32_t type = 0;
@@ -675,8 +704,73 @@ static uint32_t race_menu_car(void) {
     return record ? get_u32(record + 8) : 0;
 }
 
+#define RACE_PLACEMENT 0x006512e0u /* cdecl (activity, ISimable *, place) */
+static void race_placement(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)inv;
+    (void)user;
+    const uint32_t simable = get_u32(cpu->esp + 8), player = mp_player();
+    if(g_race_encounter && g_race_aborting) {api->hook_return(api,cpu,0,0);return;}
+    if (g_race_encounter && g_race_session && g_race_session == g_race_page.session) {
+        for(int i=0;simable && i<g_race_cars_n;i++)
+            if(g_race_cars[i].id && g_race_cars[i].car.simable==simable) {
+                race_log("core.nfsc: encounter: ignored a copied racer placement");
+                api->hook_return(api,cpu,0,0);return;
+            }
+    }
+    if (!g_race_result_replaying && g_race_session &&
+        g_race_page.session == g_race_session && g_race_page.launch == g_race_session &&
+        g_race_phase >= RACE_RACING && player && simable == player + 0x24) {
+        if(g_race_encounter && g_race_finish_observer) {
+            const uint32_t rs=race_status();const int mine=rs?race_row_of(rs,player+0x24):-1;
+            if(mine>=0 && race_u8(race_row(rs,(uint32_t)mine)+0x46))
+                g_race_finish_observer(g_race_session,bits_float(get_u32(race_row(rs,(uint32_t)mine)+0x184)));
+        }
+        g_race_result_activity = get_u32(cpu->esp + 4);
+        g_race_result_simable = simable;
+        race_log("core.nfsc: race: holding local placement %u for shared results", get_u32(cpu->esp + 12));
+        api->hook_return(api, cpu, 0, 0);
+        return;
+    }
+    api->call_original(api, cpu->target, cpu);
+}
+
+static void race_result(uint32_t rs, uint32_t player) {
+    /* Online Crew Challenges commit one first-finisher outcome in encounter.h. */
+    if(g_race_encounter)return;
+    if (!g_race_result_activity || !rs || !player)
+        return;
+    if (!g_race_session || g_race_session != g_race_page.session ||
+        g_race_result_simable != player + 0x24) {
+        g_race_result_activity = g_race_result_simable = 0;
+        return;
+    }
+    /* Every remote time must reach both the page and the native racer table.
+     * A missing player must never turn into a fabricated winning result. */
+    for (uint32_t k = 0; k < g_race_page.count && k < RACE_PEERS; ++k) {
+        const RacePeer *p = &g_race_page.peers[k];
+        if (!p->id) continue;
+        if (!p->done || !(p->time > 0)) return;
+        int finished = 0;
+        for (int i = 0; i < g_race_cars_n; ++i)
+            if (g_race_cars[i].id == p->id)
+                finished = race_u8(race_row(rs, g_race_cars[i].row) + 0x46);
+        if (!finished) return;
+    }
+    const int mine = race_row_of(rs, player + 0x24);
+    if (mine < 0 || !race_u8(race_row(rs, (uint32_t)mine) + 0x46)) return;
+    mp_call(RACE_RANK, rs, NULL, 0);
+    const uint32_t place = get_u32(race_row(rs, (uint32_t)mine) + 0x34);
+    const uint32_t args[3] = {g_race_result_activity, g_race_result_simable, place};
+    g_race_result_activity = g_race_result_simable = 0;
+    g_race_result_replaying = 1;
+    mp_call(RACE_PLACEMENT, 0, args, 3);
+    g_race_result_replaying = 0;
+    race_log("core.nfsc: race: shared placement %u released", place);
+}
+
 /* Copies the page's part when it is not being written. */
 static void race_read_page(RaceShared *sh) {
+    if(g_race_page_source && g_race_page_source(&g_race_page))return;
     const uint32_t before = __atomic_load_n(&sh->page_seq, __ATOMIC_ACQUIRE);
     if (before & 1)
         return;
@@ -874,11 +968,11 @@ static const RacePeer *race_peer(uint32_t id) {
 static void race_progress(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
     (void)inv;
     (void)user;
-    RaceCar *c = g_race_cars_n ? race_car_by_row(cpu->ecx) : NULL;
+    const uint32_t r = cpu->ecx;
+    RaceCar *c = g_race_cars_n ? race_car_by_row(r) : NULL;
     api->call_original(api, cpu->target, cpu);
     if (!c)
         return;
-    const uint32_t r = cpu->ecx;
     if (race_u8(r + 0x46))
         return; /* finished: the row keeps its time */
     float pct, lap_pct;
@@ -914,7 +1008,7 @@ static void race_project(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
     (void)inv;
     (void)user;
     const RaceCar *c = g_race_cars_n ? race_car_by_row(cpu->ecx) : NULL;
-    if (c && c->id && !race_u8(cpu->ecx + 0x46)) {
+    if (((g_race_encounter && g_race_session) || (c && c->id)) && !race_u8(cpu->ecx + 0x46)) {
         api->hook_return(api, cpu, cpu->eax, 0);
         return;
     }
@@ -926,8 +1020,9 @@ static void race_publish(RaceShared *sh, uint32_t rs, uint32_t player) {
     const int mine = player ? race_row_of(rs, player + 0x24) : -1;
     __atomic_fetch_add(&sh->game_seq, 1u, __ATOMIC_SEQ_CST);
     sh->phase = g_race_phase;
+    sh->flow_flags = get_u32(RACE_FLOW) | (g_race_result_activity ? 0x100u : 0);
     sh->session = g_race_session;
-    sh->car = player ? mp_model_key(player) : g_race_car_key;
+    sh->car = player ? mp_model_key(player) : race_menu_ready() ? g_race_car_key : 0;
     sh->loaded = g_race_loaded_at > 0;
     sh->ms = mp_ms();
     const uint32_t n = race_count(rs);
@@ -976,7 +1071,7 @@ static void race_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
     if (sh)
         race_read_page(sh);
     const uint32_t rs = race_status(), flow = get_u32(RACE_FLOW), player = mp_player();
-    if (flow == 3 || !rs || (g_race_phase >= RACE_RACING && get_u32(rs + 0x6a14) != 1u)) {
+    if (flow == 3 || !rs || ((g_race_phase >= RACE_RACING || (g_race_encounter && g_race_aborting && g_race_phase >= RACE_SET_UP)) && get_u32(rs + 0x6a14) != 1u)) {
         /* In the menus, or the race has turned into free roam (play mode 0). */
         if (g_race_cars_n || g_race_phase > RACE_LAUNCHED)
             race_forget(flow == 3 ? "back in the menus" : "left the race");
@@ -1048,6 +1143,7 @@ static void race_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
                      get_u32(race_row(rs, (uint32_t)mine) + 0x34));
         }
     }
+    race_result(rs, player);
     if (sh)
         race_publish(sh, rs, player);
 }
@@ -1127,6 +1223,7 @@ static void race_install(void) {
     race_hook(RACE_RACER_UPDATE, race_progress, POP_HOOK_REPLACE, 10);
     race_hook(0x0071b780u, race_view, POP_HOOK_BEFORE, 8);
     race_hook(0x0071b780u, race_view_ready, POP_HOOK_AFTER, 9);
+    race_hook(RACE_PLACEMENT, race_placement, POP_HOOK_REPLACE, 11);
     g_mp_racer = race_owns;
     g_mp_racer_car = race_racer_car;
     if (g_race_test || g_race_pilot)

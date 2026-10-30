@@ -21,7 +21,8 @@ bool g_buttons[kSdlPadButtonCount] = {};
 int16_t g_axes[kSdlAxisCount] = {};
 
 bool (*g_suppressed)() = nullptr;
-bool g_masked[kSdlPadButtonCount] = {}; // pressed for the host (the page toggle); hidden until released
+bool g_masked[kSdlPadButtonCount] =
+    {}; // pressed for the host (the page toggle); hidden until released
 bool g_was_suppressed = false;
 
 // While something of the host's owns the pad (the settings page, or the web page's own menu),
@@ -105,6 +106,11 @@ const char *web_sony_mapping(SDL_JoystickID id) {
 #endif
 
 void open_pad(SDL_JoystickID id) {
+    // HyperX Cloud headsets can expose media controls as a joystick. They
+    // must not occupy the first-controller slot ahead of a real gamepad.
+    const char *device_name = SDL_GetJoystickNameForID(id);
+    if (device_name && SDL_strcasestr(device_name, "HyperX Cloud"))
+        return;
 #ifdef __EMSCRIPTEN__
     const char *layout = web_sony_mapping(id);
 #endif
@@ -135,12 +141,13 @@ void open_pad(SDL_JoystickID id) {
             {
                 var pad = {};
                 pad['name'] = UTF8ToString($0);
+                pad['deviceName'] = UTF8ToString($3);
                 pad['type'] = UTF8ToString($1);
                 pad['layout'] = UTF8ToString($2);
                 globalThis['recompGameController'] = pad;
                 globalThis.dispatchEvent(new Event('recomp-controller'));
             },
-            name ? name : "", type ? type : "", how);
+            name ? name : "", type ? type : "", how, device_name ? device_name : "");
     }
 #else
     // Which SDL driver serves it decides how rumble reaches the motors (HIDAPI

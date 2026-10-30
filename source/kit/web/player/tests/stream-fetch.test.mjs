@@ -132,11 +132,16 @@ test('retries a temporary network failure and a failed byte check before failing
 });
 
 test('a permanently interrupted body stops after bounded retries without caching partial bytes', async () => {
-  const s = await setup(new Map(), 'body-always', () => {}, () => {}, true);
-  assert.equal(await s.api.read(1, 0, 20, 0), -5);
-  assert.equal(s.requests.filter(r => r.headers).length, 5);
-  assert.equal(s.saved.size, 0);
-  assert.equal(s.messages.some(m => m.type === 'unavailable'), true);
+  for (const path of ['TRACKS/large.bun', 'CARS/RX7/GEOMETRY.BIN']) {
+    const s = await setup(new Map(), 'body-always', () => {}, () => {}, true, () => {}, path);
+    assert.equal(await s.api.read(1, 0, 20, 0), -5);
+    const ranges = s.requests.filter(r => r.headers);
+    assert.equal(ranges.filter(r => r.headers.Range === 'bytes=0-1048575').length, 5);
+    for (const range of new Set(ranges.map(r => r.headers.Range)))
+      assert.ok(ranges.filter(r => r.headers.Range === range).length <= 5, 'each background or required range has bounded retries');
+    assert.equal(s.saved.size, 0);
+    assert.equal(s.messages.find(m => m.type === 'unavailable')?.path, '/files/' + path);
+  }
 });
 
 test('an urgent game read proceeds while optional preparation downloads are stalled', async () => {

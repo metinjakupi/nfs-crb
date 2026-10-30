@@ -82,6 +82,47 @@
     return window.Module ? "no (sent while the game was running)" : "no (sent before the game started)";
   }
   const encoder = new TextEncoder();
+  function raceSnapshot() {
+    const block = window.carbonRaceBlock;
+    if (!block?.memory || !Number.isInteger(block.ptr)) return null;
+    try {
+      const view = new DataView(block.memory.buffer), p = block.ptr;
+      const u = offset => view.getUint32(p + offset, true);
+      const seq = u(0x260);
+      if (seq & 1) return { busy: true };
+      const count = Math.min(u(0x2b4), 30), rows = [];
+      for (let i = 0; i < count; i++) {
+        const at = 0x2d0 + i * 48;
+        rows.push({ id: u(at), place: u(at + 4), finished: u(at + 12), local: u(at + 24) });
+      }
+      const result = { phase: u(0x264), flow: u(0x2cc) & 255, car: u(0x268), session: u(0x2bc), loaded: u(0x2b8), count, rows };
+      return seq === u(0x260) ? result : { busy: true };
+    } catch { return { unavailable: true }; }
+  }
+  // Preserve only roster transitions, not frame-by-frame progress or player names.
+  // sessionStorage retains the last transitions after a same-tab restart.
+  const raceHistoryKey = 'carbon.race-diagnostics.v1', raceRun = Date.now();
+  let raceHistory = [], raceSignature = '';
+  try {
+    const saved = sessionStorage.getItem(raceHistoryKey);
+    if (saved && saved.length < 64000) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) raceHistory = parsed.slice(-40);
+    }
+  } catch {}
+  function recordRace() {
+    const race = raceSnapshot();
+    if (!race || race.busy || race.unavailable) return;
+    // Places change while driving; that does not explain a missing grid opponent.
+    const signature = JSON.stringify({ ...race, rows: race.rows.map(({ place, ...row }) => row) });
+    if (signature === raceSignature) return;
+    raceSignature = signature;
+    raceHistory.push({ at: new Date().toISOString(), run: raceRun,
+      runtime: window.recompRuntimeBuild?.id || 'unknown', ...race });
+    raceHistory = raceHistory.slice(-40);
+    try { sessionStorage.setItem(raceHistoryKey, JSON.stringify(raceHistory)); } catch {}
+  }
+  setInterval(recordRace, 500);
   const bytes = (s) => encoder.encode(s).length;
   async function build(budget, note) {
     const canvas = document.getElementById("canvas");
@@ -104,6 +145,10 @@
     const f = window.recompFailure;
     if (f?.stack) head.push("Stack:", ...String(f.stack).split("\n").slice(0, 30).map((l) => "  " + l));
     if (window.carbonTestAssets) head.push(`Game files: ${safeJson(window.carbonTestAssets)}`);
+    const race = raceSnapshot();
+    if (race) head.push(`Race roster: ${safeJson(race)}`);
+    recordRace();
+    if (raceHistory.length) head.push(`Race history: ${safeJson(raceHistory)}`);
     if (note) head.push("", "Player's note:", ...note.slice(0, 2000).split("\n").map((l) => "  " + l));
     const page = pageLines.slice(-400);
     let pageText = page.join("\n");

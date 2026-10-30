@@ -65,7 +65,7 @@ Node relay: `?mp=ws://127.0.0.1:61234/<room>`. Environment variables (an empty v
 | `CARBON_RELAY_BIN` | `0`: no compact (binary) poses; every page gets JSON, as from a relay before 2026-10-25. Default `1`. |
 | `CARBON_SAVES_DIR` | Turns cloud saves on, stored in that folder. Without it, `/saves/*` answers 501. |
 | `CARBON_SAVES_MAX_MB` | All saves together, default 1024. |
-| `CARBON_MESSENGER_DIR` | Keeps EA Messenger's names, friend lists, pending requests and blocks in `messenger.json` in that folder, so they survive a restart. Without it they last until the server stops. |
+| `CARBON_MESSENGER_DIR` | Keeps EA Messenger's names, friend lists, pending requests and blocks in `messenger.json`, and explicit name claims in `names.json`, so they survive a restart. Without it they last until the server stops. |
 | `CARBON_STATS_DIR` | Keeps Player Stats and the Leaderboard in `stats.json` in that folder, so they survive a restart. Without it they last until the server stops. |
 | `CARBON_TRACE_DIR` | Where the trace host writes one file per connection or UDP flow. Without it, the trace host and the stand-ins still answer and print summary lines. |
 | `CARBON_HOST_GAME` | `1`: PlayNow (Custom and Quick Match) sends players to a game the server hosts (id 200000 and up, 10.77.0.1, UDP port 19000 and up), which runs the race (`host.rs`). Without it nobody hosts, and Custom Match ends with "Could not create game session". |
@@ -210,10 +210,13 @@ session" (PlayNow `NOMATCH`); with it, PlayNow answers `JOIN` with the server's 
   big-endian word (FESL: the transaction id, top bits 0x8 for a whole transaction and 0xb for a fragment; Theater and
   Messenger: 0), the big-endian length of the whole packet (12 to 0x8000), then `key=value` lines and a NUL. A stream
   with a length outside that range is reset (RST).
-- **No accounts.** Any name signs in; the id is a stable hash of the name. Passwords and CD keys are dropped when a
-  packet is parsed, never logged and masked in the trace files. A name is held by the browser that first used it
-  (its player key, below): another browser's Login under it gets FESL error 122, which the game shows as "The
-  password you have entered does not match the password for this account."
+- **Optional name claims.** A new name remains open until a player claims it. During migration, every existing
+  Messenger or Player Stats name is first reserved with its old browser-key fingerprint. This stops another player
+  from typing an old name, claiming it, and inheriting its friends or statistics. The old browser can claim the
+  existing name from the start page with a cloud-save keyphrase. The browser sends only the opaque cloud-save id as
+  proof; the server never receives the keyphrase and stores only a separate SHA-256 digest in `names.json`. A claim
+  protects the same name-keyed records. It does not copy, rename or clear them. The server also checks protection in
+  free roam. Passwords and CD keys are dropped when a packet is parsed, never logged and masked in trace files.
 - **FESL, TCP 18210:**
   - `fsys`: Hello (the Theater and Messenger addresses, then a server MemCheck with an empty list, as EA's server
     did), MemCheck (the game's answer, not answered), Ping, GetPingSites (three sites at 10.77.0.1,
@@ -284,20 +287,20 @@ The game's own Messenger screens (the M key in the online menus, "EA Messenger" 
 - **Game invites.** "Send Game Invite" (offered by the game in an unranked room with space) reaches the friend as
   the game's own "Metin wants to play." and "Read Game Invite"; Accept joins the room through Theater (above),
   Decline shows the sender "Jan has declined your Game Invite."
-- **Same name twice.** A second sign-in under a name already online logs the first off (ADMN DUPL, the game's
-  "Multiple log-ins detected"); with player keys that only happens within one browser.
-- **Who may use a name.** lan.js makes a random player key per browser (localStorage `carbon-player-key`) and sends
-  it in the `/lan` hello. The first browser to sign in under a name with a key holds it; another browser's Login is
-  refused (FESL error 122, the game's wrong-password text). A claim lapses after **30 days without a sign-in**: then
-  another browser may take the name, and starts with an empty list (the old player's friends are not handed over).
-  A page without a key (an older page, or one without localStorage) may use any name nobody holds, without holding
-  it. The test-only `?testing&pk=` sets a key from the address and is never stored.
+- **Same name twice.** A second Messenger sign-in under a name already online logs the first off (ADMN DUPL, the
+  game's "Multiple log-ins detected"). A reserved old name needs its original browser until it is claimed. A claimed
+  name needs the matching cloud-save proof and can then be recovered in another browser with the keyphrase.
+- **Display names.** lan.js makes a random player key per browser (localStorage `carbon-player-key`) and sends it in
+  the `/lan` hello. The server keeps only its digest. During migration, that digest proves which old browser may
+  convert an existing name into an explicit claim. It is not used after that claim. A new name works without browser
+  storage, but an old reserved name without its original browser needs manual recovery. The test-only `?testing&pk=`
+  sets a key from the address and is never stored.
 - **Limits.** 100 friends, 50 open requests and 100 blocks a player; chat 6 messages, then one a second; invites
-  3, then one every 5 s; 256 characters a message. 10,000 names are kept; past that, a new name takes the place of
-  the longest-unseen name that holds nothing (no live claim, no friends, requests or blocks), or signs in
-  without being kept.
+  3, then one every 5 s; 256 characters a message. 10,000 Messenger names and 10,000 explicit claims are kept.
+  A new Messenger name can replace the longest-unseen name that has no recent browser metadata, friends, requests
+  or blocks. An explicit claim is kept separately and is not removed by this cleanup.
 - **Kept** (with `CARBON_MESSENGER_DIR`, in `messenger.json`, written whole through a temporary file): names, the
-  SHA-256 of each claiming key (never the key; it is not logged either), the last sign-in (to the day), friend
+  SHA-256 of the latest browser key when supplied (never the key; it is not logged either), the last sign-in, friend
   links, open requests and blocks. No chat, no addresses.
 
 ### Player Stats and the Leaderboard (`stats.rs`)
@@ -323,10 +326,11 @@ through FESL's `rank` service (`plans/lan-protocol.md` has the fields and addres
   sprints), the games and the wins. A race needs two players; leaving it or not finishing a sprint or circuit is a
   loss and a DNF. What the game itself sends (`UpdateStats`) is kept only for keys the online screens read (best
   times, Pursuit and Canyon stats); its career upload at sign-in (cars, cash, reward cards) is left out.
-- **Who.** Players are kept by their claimed name, as Messenger keeps friends. A name whose claim lapsed and was
-  taken by another browser starts with empty stats, as it starts with an empty friends list.
+- **Who.** Players are kept by display name, as Messenger keeps friends. Claiming a name protects the existing
+  record; it does not create a new record or clear statistics. Changing browsers or losing browser storage does not
+  clear the name's statistics.
 - **Kept** (with `CARBON_STATS_DIR`, in `stats.json`, written whole through a temporary file): per player its name,
-  a 16-hex-digit fingerprint of the claiming key's SHA-256 (to see a name change hands), the day it last signed in,
+  a 16-hex-digit fingerprint of the latest browser key's SHA-256 when supplied, the day it last signed in,
   and its stats (all time, and for leaderboard keys this and last day and week). No addresses. Limits: 10,000
   players and 256 stats each.
 

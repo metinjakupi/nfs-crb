@@ -57,19 +57,21 @@
     if (params.get("key")) relay += `${relay.includes("?") ? "&" : "?"}key=${encodeURIComponent(params.get("key"))}`;
   }
   const name = ((given ? given.name : params.get("name")) || "Player").slice(0, 20);
+  const claim = /^[0-9a-f]{64}$/.test((given && given.claim) || "") ? given.claim : "";
+  const legacy = /^[A-Za-z0-9_-]{16,64}$/.test((given && given.legacy) || "") ? given.legacy : "";
   const SLOTS = 8, SLOT0 = 0x60, SLOT = 0x100;
   const LABELS = SLOT0 + SLOTS * SLOT; // {x, y, depth, spare} floats per slot
 
   // Everything below runs in the worker; it is started from this function's text.
   function link() {
     const MAGIC = 0x31504d43, SLOTS = 8, SLOT0 = 0x60, SLOT = 0x100, RING = 4, SNAP = 0x38;
-    const POLL_MS = 8, SEND_MS = 33, STALE = 5000;
+    const POLL_MS = 8, SEND_MS = 33, STALE = 5000, POSE_RECOVER_MS = 100;
     const LABELS = SLOT0 + SLOTS * SLOT, CONTACTS = 0x8e0, IMPACTS = 32, IMPACT = 0x40;
     const TX = CONTACTS + 0x10, RX = TX + IMPACTS * IMPACT;
     // Who gets a slot (see the top of the file). FRESH: a player heard from this recently may
     // take one; CREW_NEAR: a little past where the game builds a car (300 m).
     const PICK_MS = 250, SLOT_HOLD = 3000, SWAP = 0.7, FRESH = 1500, CREW_NEAR = 400, FAR = 1e9, TOP_SPEED = 100;
-    let relay = "", name = "", crew = "", memory = null, ptr = 0, views = null, ws = null, me = 0;
+    let relay = "", name = "", crew = "", claim = "", legacy = "", memory = null, ptr = 0, views = null, ws = null, me = 0;
     let latest = null, sentMs = -1, sentMode = -1, sentAt = 0, told = "", ghost = false, hidden = false;
     let physics = false, serverPhysics = false;
     // Compact poses (tools/carbon-net-relay.mjs, "Compact poses"): the format this page reads and
@@ -295,6 +297,7 @@
         people: [...players].filter(([, p]) => p.name).map(([id, p]) => ({ id, name: p.name, crew: p.crew })),
         slots: owners.map((id) => (id ? players.get(id)?.name || "Player" : "")),
         slotIds: owners.slice(),
+        slotModes: owners.map((id) => (id ? players.get(id)?.mode ?? 0 : -1)),
         crew,
         me, // our relay id (race.js tells its own messages from others' by it)
       };
@@ -347,7 +350,7 @@
     function player(id) {
       let p = players.get(id);
       if (!p) players.set(id, (p = { id, name: "", crew: "", key: 0, mode: 0, heard: 0, slot: -1, at: null, physics: false,
-                                     pos: null, vel: null, last: null }));
+                                     pos: null, vel: null, last: null, applied: -Infinity, pending: 0 }));
       return p;
     }
 
@@ -378,20 +381,35 @@
     const better = (w, h) => w.group < h.group || (w.group === h.group && w.d < FAR && w.d < SWAP * h.d);
 
     // p's newest pose into its slot.
-    function put(p) {
+    function put(p, now = performance.now()) {
       const l = p.last;
       writeSlot(p.slot, p.id, p.key, p.mode, l.ms, l.s, l.contacts, l.ack, l.drive);
+      p.applied = now;
+    }
+
+    // TCP can already hold old poses when a connection stalls. After the stall it can deliver
+    // those poses much faster than the sender made them. Keep only the newest pose until the
+    // normal 30 Hz apply time, so the game resumes once instead of replaying the backlog.
+    function queuePut(p, now, recovered) {
+      if (p.pending) return;
+      const wait = recovered ? SEND_MS : SEND_MS - (now - p.applied);
+      if (wait <= 0) { put(p, now); return; }
+      p.pending = setTimeout(() => {
+        p.pending = 0;
+        if (memory && me && p.slot >= 0 && p.last) put(p);
+      }, wait);
     }
 
     // p takes slot i (empty or just emptied); its look goes to the game first, so the car is built in it.
     function take(p, i, now) {
+      if (p.pending) { clearTimeout(p.pending); p.pending = 0; }
       p.slot = i;
       owners[i] = p.id;
       slotAt[i] = now;
       const l = looks.get(p.id);
       if (l) lookPut(p.id, l.k, l.bytes);
       writeSlot(i, 0, 0, 0, 0, null);
-      if (p.last) put(p);
+      if (p.last) put(p, now);
     }
 
     // Free slots to the best players waiting; then, slot by slot, a clearly better one takes
@@ -436,6 +454,7 @@
     // A player's car goes; the player stays known (with their name) until they leave.
     function park(p) {
       if (p.slot < 0) return;
+      if (p.pending) { clearTimeout(p.pending); p.pending = 0; }
       owners[p.slot] = 0;
       if (memory) writeSlot(p.slot, 0, 0, 0, 0, null);
       p.slot = -1;
@@ -755,6 +774,7 @@
         rivalDrop(m.id);
       } else if (m.t === "pose" && m.id !== me) {
         const p = player(m.id), now = performance.now();
+        const recovered = p.heard > 0 && now - p.heard > POSE_RECOVER_MS;
         p.key = m.k >>> 0;
         p.mode = m.m | 0;
         p.physics = m.physics === 1;
@@ -769,7 +789,7 @@
                    ack: Number.isInteger(ack) ? ack : 0,
                    drive: driveOk && m.drive instanceof Uint8Array && m.drive.length === DRIVE_BYTES ? m.drive : null };
         if (!memory || !me) return;
-        if (p.slot >= 0) { put(p); return; } // nothing the page shows has changed
+        if (p.slot >= 0) { queuePut(p, now, recovered); return; } // nothing the page shows has changed
         // A free slot goes at once to a player among the best of those waiting for one; the
         // rest wait for arrange(). (The relay sends a joiner its cars nearest first.)
         const free = owners.filter((o) => !o).length;
@@ -799,7 +819,7 @@
     function connect() {
       ws = new WebSocket(relay);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1, rivals: 1 })); tell(); };
+      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1, rivals: 1 })); tell(); };
       ws.onmessage = (e) => {
         try {
           const m = typeof e.data === "string" ? JSON.parse(e.data) : unpack(e.data);
@@ -833,6 +853,8 @@
         relay = m.relay;
         name = m.name;
         crew = m.crew || "";
+        claim = m.claim || "";
+        legacy = m.legacy || "";
         ghost = !!m.ghost;
         hidden = !!m.hidden;
         connect();
@@ -1135,14 +1157,18 @@
       if (!latest) return;
       const mode = hidden ? 0 : latest.state;
       if ((latest.ms === sentMs && mode === sentMode) || (mode === sentMode && now - sentAt < SEND_MS)) return;
-      const outbound = mode === latest.state ? latest : { ...latest, state: mode };
+      // A connected player in a menu keeps the last car pose, but it must be stationary.
+      // Mode 0 tells friends to show PAUSED; a real disconnect still sends `left`.
+      const stopped = mode === 0;
+      const still = stopped ? [...latest.s.slice(0, 7), 0, 0, 0, 0, 0, 0] : latest.s;
+      const outbound = mode === latest.state && !stopped ? latest : { ...latest, state: mode, s: still };
       if (bin) {
-        const b = packPose(outbound, physics && serverPhysics, driveOk && mode === 1 ? driveOwn() : null);
+        const b = packPose(outbound, mode === 1 && physics && serverPhysics, driveOk && mode === 1 ? driveOwn() : null);
         if (b) ws.send(b);
       } else {
-        const s = latest.s.map((x, i) => (i < 4 ? Math.round(x * 1e5) / 1e5 : Math.round(x * 1e3) / 1e3));
+        const s = outbound.s.map((x, i) => (i < 4 ? Math.round(x * 1e5) / 1e5 : Math.round(x * 1e3) / 1e3));
         ws.send(JSON.stringify({ t: "pose", k: latest.key, s, m: mode, ts: latest.ms,
-          ...(physics && serverPhysics ? { ghost, acks: latest.acks || [] } : {}) }));
+          ...(mode === 1 && physics && serverPhysics ? { ghost, acks: latest.acks || [] } : {}) }));
       }
       sentMs = latest.ms;
       sentMode = mode;
@@ -1269,7 +1295,7 @@
   // Other players' cars are always solid: the user dropped the see-through switch (2026-10-24),
   // so a "nfsc.ghost" left in this browser from before is ignored. recompOnlineGhost stays for
   // tests and a possible later option.
-  worker.postMessage({ t: "start", relay, name, crew, ghost: false, hidden: document.hidden });
+  worker.postMessage({ t: "start", relay, name, crew, claim, legacy, ghost: false, hidden: document.hidden });
   document.addEventListener("visibilitychange", () =>
     worker.postMessage({ t: "visibility", hidden: document.hidden }));
   window.recompOnlineGhost = (on) => worker.postMessage({ t: "ghost", on: !!on });
@@ -1602,7 +1628,8 @@
       if (el.crew !== c || el.paint !== paint) dress(el, c);
       const isPolice = police.has(state.slotIds?.[i]);
       el.badge.style.display = isPolice ? "inline-block" : "none";
-      const text = `${who} · ${Math.round(depth)} m`;
+      const paused = state.slotModes?.[i] === 0;
+      const text = paused ? `${who} · PAUSED` : `${who} · ${Math.round(depth)} m`;
       if (el.text.data !== text) el.text.data = text;
       const size = Math.max(11, Math.min(16, 17 - depth / 25));
       el.style.display = "block";

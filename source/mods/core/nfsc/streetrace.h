@@ -192,6 +192,9 @@ static double g_sr_flash_from; /* when the current flash began, 0 none */
 static int g_sr_flash_used;    /* this flash already did something */
 static double g_sr_link_lost;  /* the page's link has been down since */
 
+static int (*g_sr_native_offer)(uint32_t,const char *,double);
+static int (*g_sr_native_receive)(const SrRec *,uint32_t,double);
+
 static SrShared *sr_shared(void) {
   void *p = NULL;
   return g_sr_block && g_api->guest_ptr(g_api, g_sr_block, sizeof(SrShared),
@@ -655,6 +658,7 @@ static void sr_forfeit(uint32_t why, double now) {
 
 /* A record from the page. */
 static void sr_receive(const SrRec *r, uint32_t player, double now) {
+  if(g_sr_native_receive && g_sr_native_receive(r,player,now))return;
   SrShared *sh = sr_shared();
   char name[16];
   sr_clean(name, r->name, sizeof r->name);
@@ -974,6 +978,7 @@ static void sr_service(const PopModApi *api, pop_cpu_v1 *cpu,
         sr_say(&k_sr_info, "%s is the police: no race", name);
         break;
       }
+      if(g_sr_native_offer && g_sr_native_offer(id,name,now))break;
       g_sr.opp = id;
       {
         static uint32_t made;

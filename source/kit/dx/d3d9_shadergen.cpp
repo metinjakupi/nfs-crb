@@ -1230,7 +1230,8 @@ bool vertex_source(const d9sh::Program &p, std::string *out, std::string *why) {
          "    var vv: array<vec4f, 16>;\n";
     for (uint32_t i : seen) {
         const std::string k = std::to_string(i);
-        s += "    vv[" + k + "] = vin.v" + k + " * P.ascale[" + k + "];\n";
+        s += "    vv[" + k + "] = select(vin.v" + k + ", vin.v" + k +
+             ".bgra, ((P.bgra.x >> " + k + ") & 1) != 0) * P.ascale[" + k + "];\n";
     }
     s += g.body;
     s += "    var o: V2F;\n"

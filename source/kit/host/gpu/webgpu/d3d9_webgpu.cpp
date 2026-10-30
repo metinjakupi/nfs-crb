@@ -48,14 +48,16 @@ extern "C" void recompWgpuRenderPassSetBindGroup(WGPURenderPassEncoder pass, uin
 // RECOMP_D3D9_STATS: one row per presented frame in globalThis.__d3d9Gpu (same order as
 // d3d9_host.cpp's __d3d9Frames): [draws into cube faces (the car reflection map), cube faces
 // drawn, draws into other off-screen targets, render passes, bind groups made, pipelines
-// made, submits, uniform + inline-geometry bytes staged, "WxH:draws" of the busiest targets].
+// made, submits, uniform + inline-geometry bytes staged, "WxH:draws" of the busiest targets,
+// sampler fast-path hits, bind-group fast-path hits, pipeline lookup fast-path hits].
 EM_JS(void, d3d9_webgpu_stats_frame,
       (int cube_draws, int cube_faces, int offscreen_draws, int passes, int groups, int pipes,
-       int submits, double ring_bytes, const char *targets),
+       int submits, double ring_bytes, const char *targets, int sampler_hits, int group_hits,
+       int pipeline_hits),
       {
           const f = globalThis.__d3d9Gpu || (globalThis.__d3d9Gpu = []);
           f.push([ cube_draws, cube_faces, offscreen_draws, passes, groups, pipes, submits, ring_bytes,
-                   UTF8ToString(targets) ]);
+                   UTF8ToString(targets), sampler_hits, group_hits, pipeline_hits ]);
           if (f.length > 200000) f.splice(0, 100000);
       });
 
@@ -187,7 +189,7 @@ bool vertex_format(uint32_t type, WGPUVertexFormat *fmt, float scale[4]) {
         *fmt = WGPUVertexFormat_Float32x4;
         return true;
     case 4:
-        *fmt = WGPUVertexFormat_Unorm8x4BGRA;
+        *fmt = WGPUVertexFormat_Unorm8x4; // BGRA is restored by the vertex shader (older WebGPU).
         return true;
     case 5:
         *fmt = WGPUVertexFormat_Unorm8x4;
@@ -471,16 +473,23 @@ class WebGpuRenderer final : public D9Backend {
         WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
         if (t.info.block) {
             const uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-            scratch_.assign((size_t)bw * bh * t.info.bytes, 0);
-            for (uint32_t y = 0; y < bh; ++y)
-                memcpy(&scratch_[(size_t)y * bw * t.info.bytes], bytes + (size_t)y * pitch,
-                       (size_t)bw * t.info.bytes);
-            layout.bytesPerRow = bw * t.info.bytes;
+            const uint32_t row_bytes = bw * t.info.bytes;
             WGPUExtent3D size = {bw * 4, bh * 4, 1};
             size.width = std::min(size.width, std::max<uint32_t>(t.width >> level, 1));
             size.height = std::min(size.height, std::max<uint32_t>(t.height >> level, 1));
             size.width = (size.width + 3) & ~3u;
             size.height = (size.height + 3) & ~3u;
+            layout.bytesPerRow = row_bytes;
+            if (pitch == row_bytes) {
+                // DXT textures are normally already a tightly packed sequence of complete
+                // blocks. Give those bytes to WebGPU directly instead of copying every block
+                // row into an identical temporary buffer first.
+                wgpuQueueWriteTexture(queue_, &dst, bytes, (size_t)row_bytes * bh, &layout, &size);
+                return;
+            }
+            scratch_.assign((size_t)row_bytes * bh, 0);
+            for (uint32_t y = 0; y < bh; ++y)
+                memcpy(&scratch_[(size_t)y * row_bytes], bytes + (size_t)y * pitch, row_bytes);
             wgpuQueueWriteTexture(queue_, &dst, scratch_.data(), scratch_.size(), &layout, &size);
             return;
         }
@@ -500,6 +509,17 @@ class WebGpuRenderer final : public D9Backend {
         }
         uint32_t pw = std::max<uint32_t>(t.width >> level, 1),
                  ph = std::max<uint32_t>(t.height >> level, 1);
+        // Most Carbon textures already have the exact dimensions and byte format that WebGPU
+        // needs. Queue those source rows directly. Packing them pixel by pixel first produced
+        // identical bytes, but added a full CPU read and write for every streamed texture.
+        if (pw == w && ph == h && t.info.conv == Conv::Direct && !t.info.rgba16_to_float &&
+            pitch >= pw * bpp) {
+            layout.bytesPerRow = pitch;
+            WGPUExtent3D size = {pw, ph, 1};
+            const size_t source_bytes = (size_t)(ph - 1) * pitch + (size_t)pw * bpp;
+            wgpuQueueWriteTexture(queue_, &dst, src, source_bytes, &layout, &size);
+            return;
+        }
         std::vector<uint8_t> &packed = packed_;
         uint32_t out_bpp = bpp;
         if (t.info.rgba16_to_float)
@@ -724,6 +744,7 @@ class WebGpuRenderer final : public D9Backend {
         ps.bias = (int32_t)std::lround(bias * 16777215.0f);
         ps.slope = slope;
         ps.colors = d9msl::pixel_color_outputs(pp);
+        ps.state_version = d.state_version;
         WGPURenderPipeline pso = pipeline(ps, vkey);
         if (!pso) {
             skip("no pipeline");
@@ -759,9 +780,13 @@ class WebGpuRenderer final : public D9Backend {
             (uses_blend_factor(rs[RS_SRCBLEND]) || uses_blend_factor(rs[RS_DESTBLEND]) ||
              uses_blend_factor(rs[RS_SRCBLENDALPHA]) || uses_blend_factor(rs[RS_DESTBLENDALPHA]))) {
             uint32_t f = rs[RS_BLENDFACTOR];
-            WGPUColor c = {((f >> 16) & 255) / 255.0, ((f >> 8) & 255) / 255.0, (f & 255) / 255.0,
-                           ((f >> 24) & 255) / 255.0};
-            wgpuRenderPassEncoderSetBlendConstant(pass_, &c);
+            if (!es_.blend_valid || es_.blend_factor != f) {
+                WGPUColor c = {((f >> 16) & 255) / 255.0, ((f >> 8) & 255) / 255.0,
+                               (f & 255) / 255.0, ((f >> 24) & 255) / 255.0};
+                wgpuRenderPassEncoderSetBlendConstant(pass_, &c);
+                es_.blend_factor = f;
+                es_.blend_valid = true;
+            }
         }
 
         // Uniforms, at dynamic offsets into this frame's ring.
@@ -770,6 +795,7 @@ class WebGpuRenderer final : public D9Backend {
         vparams.halfpix[0] = d.viewport[2] ? (63.0f / 64.0f) / d.viewport[2] : 0.0f;
         vparams.halfpix[1] = d.viewport[3] ? -(63.0f / 64.0f) / d.viewport[3] : 0.0f;
         memcpy(vparams.ascale, vl.ascale, sizeof vl.ascale);
+        vparams.bgra[0] = (int32_t)vl.bgra;
         D9PSParams pparams{};
         memcpy(pparams.bconst, d.pbool, sizeof pparams.bconst);
         pparams.alpha_func = rs[RS_ALPHATESTENABLE] ? (int32_t)rs[RS_ALPHAFUNC] : 8;
@@ -823,7 +849,8 @@ class WebGpuRenderer final : public D9Backend {
             if (view)
                 t->used = serial_;
             gk.views[st] = view ? view : depth ? far_depth_view_ : placeholder(cube, volume);
-            gk.samplers[st] = depth ? shadow_sampler() : sampler(d.sampler_state + st * 14, t);
+            gk.samplers[st] =
+                depth ? shadow_sampler() : sampler(d.sampler_state + st * 14, t, st);
         }
         WGPUBindGroup group = bind_group(gk);
         if (!group) {
@@ -964,7 +991,7 @@ class WebGpuRenderer final : public D9Backend {
             q.rect[3] = 1.0f - 2.0f * y1 / lh;
             q.z = z;
             memcpy(q.color, rgba, sizeof rgba);
-            draw_quad(q, placeholder(false), sampler(nullptr, nullptr));
+            draw_quad(q, placeholder(false), sampler(nullptr, nullptr, 16));
         }
         es_ = EncoderState{};
     }
@@ -1020,7 +1047,7 @@ class WebGpuRenderer final : public D9Backend {
         uint32_t ss[14] = {};
         ss[1] = ss[2] = ss[3] = 3;
         ss[5] = ss[6] = filter >= 2 ? 2 : 1;
-        draw_quad(q, view, sampler(ss, nullptr));
+        draw_quad(q, view, sampler(ss, nullptr, 16));
         wgpuTextureViewRelease(view);
         end_pass();
     }
@@ -1077,7 +1104,9 @@ class WebGpuRenderer final : public D9Backend {
             }
             d3d9_webgpu_stats_frame((int)fs_.cube_draws, __builtin_popcount(fs_.cube_faces),
                                     offscreen, (int)fs_.passes, (int)fs_.groups, (int)fs_.pipes,
-                                    (int)fs_.submits, (double)fs_.ring_bytes, targets.c_str());
+                                    (int)fs_.submits, (double)fs_.ring_bytes, targets.c_str(),
+                                    (int)fs_.sampler_hits, (int)fs_.group_hits,
+                                    (int)fs_.pipeline_hits);
             fs_ = FrameStats{};
         }
         follow_drawable();
@@ -1424,6 +1453,7 @@ class WebGpuRenderer final : public D9Backend {
         groups_.clear();
         view_groups_.clear();
         es_.group = nullptr; // a new group may get a released one's handle
+        last_group_ = nullptr;
     }
     void drop_groups_of(WGPUTextureView view) {
         if (ab_old_) { // TEST ONLY (RECOMP_AB_PERIOD): the earlier behaviour
@@ -1438,6 +1468,8 @@ class WebGpuRenderer final : public D9Backend {
             if (g != groups_.end()) {
                 if (g->second == es_.group)
                     es_.group = nullptr; // a new group may get a released one's handle
+                if (g->second == last_group_)
+                    last_group_ = nullptr;
                 wgpuBindGroupRelease(g->second);
                 groups_.erase(g);
             }
@@ -1745,6 +1777,7 @@ class WebGpuRenderer final : public D9Backend {
         std::vector<WGPUVertexBufferLayout> buffers;
         std::vector<std::vector<WGPUVertexAttribute>> attributes;
         float ascale[16][4] = {};
+        uint32_t bgra = 0;
         uint32_t streams = 0;
         uint32_t slot_of[8] = {};
         bool zero = false;
@@ -1784,6 +1817,7 @@ class WebGpuRenderer final : public D9Backend {
                 a.shaderLocation = reg;
                 per_stream[stream].push_back(a);
                 memcpy(v.ascale[reg], scale, sizeof scale);
+                if (type == 4) v.bgra |= 1u << reg;
                 v.streams |= 1u << stream;
                 stream_end[stream] =
                     std::max<uint32_t>(stream_end[stream], offset + vertex_format_bytes(type));
@@ -1843,8 +1877,42 @@ class WebGpuRenderer final : public D9Backend {
         int32_t bias;
         float slope;
         uint32_t colors;
+        uint64_t state_version;
     };
+    struct PipelineInput {
+        uint64_t state_version = 0, vkey = 0;
+        WGPUShaderModule vmod = nullptr, fmod = nullptr;
+        WGPUPipelineLayout layout = nullptr;
+        WGPUPrimitiveTopology topology = WGPUPrimitiveTopology_Undefined;
+        uint32_t samples = 0, color_count = 0, colors = 0;
+        WGPUTextureFormat formats[4] = {};
+        WGPUTextureFormat depth = WGPUTextureFormat_Undefined;
+    };
+    static bool same_pipeline_input(const PipelineInput &a, const PipelineInput &b) {
+        return a.state_version == b.state_version && a.vkey == b.vkey && a.vmod == b.vmod &&
+               a.fmod == b.fmod && a.layout == b.layout && a.topology == b.topology &&
+               a.samples == b.samples && a.color_count == b.color_count && a.colors == b.colors &&
+               a.depth == b.depth && memcmp(a.formats, b.formats, sizeof a.formats) == 0;
+    }
     WGPURenderPipeline pipeline(const PipeState &p, uint64_t vkey) {
+        PipelineInput input{};
+        input.state_version = p.state_version;
+        input.vkey = vkey;
+        input.vmod = p.vmod;
+        input.fmod = p.fmod;
+        input.layout = p.layout->pipeline;
+        input.topology = p.topology;
+        input.samples = pass_samples_;
+        input.color_count = pass_color_count_;
+        input.colors = p.colors;
+        memcpy(input.formats, pass_formats_, sizeof input.formats);
+        input.depth = pass_depth_view_ ? depth_format_ : WGPUTextureFormat_Undefined;
+        if (!ab_old_ && input.state_version && last_pipeline_ &&
+            same_pipeline_input(input, last_pipeline_input_)) {
+            if (stats_)
+                ++fs_.pipeline_hits;
+            return last_pipeline_;
+        }
         const uint32_t *rs = p.rs;
         uint64_t key = mix(mix((uint64_t)(uintptr_t)p.vmod, (uint64_t)(uintptr_t)p.fmod), vkey);
         key = mix(key, (uint64_t)p.topology | (uint64_t)p.cull << 8 |
@@ -1873,12 +1941,15 @@ class WebGpuRenderer final : public D9Backend {
         key = mix(key, dkey);
         key = mix(key, (uint64_t)(uint32_t)p.bias << 32 |
                            (uint64_t)(uint32_t)std::lround(p.slope * 4096.0f));
-        if (key == last_pipeline_key_ && last_pipeline_)
+        if (key == last_pipeline_key_ && last_pipeline_) {
+            last_pipeline_input_ = input;
             return last_pipeline_;
+        }
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) {
             last_pipeline_key_ = key;
             last_pipeline_ = it->second;
+            last_pipeline_input_ = input;
             return it->second;
         }
         WGPUBlendState blends[4];
@@ -1978,9 +2049,14 @@ class WebGpuRenderer final : public D9Backend {
         pipelines_[key] = pso;
         last_pipeline_key_ = key;
         last_pipeline_ = pso;
+        last_pipeline_input_ = input;
         return pso;
     }
 
+    struct LastSampler {
+        uint32_t state[14] = {};
+        WGPUSampler sampler = nullptr;
+    };
     struct GroupKey {
         WGPUBindGroupLayout layout;
         WGPUBuffer uniforms;
@@ -1989,10 +2065,17 @@ class WebGpuRenderer final : public D9Backend {
         WGPUSampler samplers[16];
     };
     WGPUBindGroup bind_group(const GroupKey &k) {
+        if (!ab_old_ && last_group_ && memcmp(&k, &last_group_key_, sizeof k) == 0) {
+            if (stats_)
+                ++fs_.group_hits;
+            return last_group_;
+        }
         const uint64_t key = fnv(&k, sizeof k);
         auto it = groups_.find(key);
-        if (it != groups_.end())
+        if (it != groups_.end()) {
+            remember_group(k, it->second);
             return it->second;
+        }
         std::vector<WGPUBindGroupEntry> e;
         for (uint32_t i = 0; i < 4; ++i) {
             WGPUBindGroupEntry b = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -2024,10 +2107,18 @@ class WebGpuRenderer final : public D9Backend {
         for (uint32_t s = 0; s < 16; ++s)
             if (k.views[s] && (s == 0 || k.views[s] != k.views[s - 1]))
                 view_groups_[k.views[s]].push_back(key);
+        remember_group(k, g);
         return g;
     }
 
-    WGPUSampler sampler(const uint32_t *st, const Tex *t) {
+    void remember_group(const GroupKey &k, WGPUBindGroup group) {
+        if (ab_old_)
+            return;
+        last_group_key_ = k;
+        last_group_ = group;
+    }
+
+    WGPUSampler sampler(const uint32_t *st, const Tex *t, uint32_t stage) {
         static const uint32_t none[14] = {0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
         if (!st)
             st = none;
@@ -2038,10 +2129,18 @@ class WebGpuRenderer final : public D9Backend {
             (t->info.format == WGPUTextureFormat_R32Float ||
              t->info.format == WGPUTextureFormat_RGBA32Float))
             s[5] = s[6] = s[7] = 1;
+        LastSampler &last = last_sampler_[stage];
+        if (!ab_old_ && last.sampler && memcmp(last.state, s, sizeof s) == 0) {
+            if (stats_)
+                ++fs_.sampler_hits;
+            return last.sampler;
+        }
         uint64_t key = fnv(s, sizeof s);
         auto it = samplers_.find(key);
-        if (it != samplers_.end())
+        if (it != samplers_.end()) {
+            remember_sampler(last, s, it->second);
             return it->second;
+        }
         WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
         sd.addressModeU = address_mode(s[1]);
         sd.addressModeV = address_mode(s[2]);
@@ -2056,7 +2155,14 @@ class WebGpuRenderer final : public D9Backend {
             sd.maxAnisotropy = (uint16_t)std::max<uint32_t>(1, std::min<uint32_t>(16, s[10]));
         WGPUSampler out = wgpuDeviceCreateSampler(device_, &sd);
         samplers_[key] = out;
+        remember_sampler(last, s, out);
         return out;
+    }
+    void remember_sampler(LastSampler &last, const uint32_t state[14], WGPUSampler sampler) {
+        if (ab_old_)
+            return;
+        memcpy(last.state, state, sizeof last.state);
+        last.sampler = sampler;
     }
     WGPUSampler shadow_sampler() {
         if (shadow_sampler_)
@@ -2417,7 +2523,8 @@ class WebGpuRenderer final : public D9Backend {
     struct EncoderState {
         WGPURenderPipeline pipeline = nullptr;
         uint32_t stencil_ref = 0xffffffffu;
-        bool viewport_valid = false, scissor_valid = false;
+        bool viewport_valid = false, scissor_valid = false, blend_valid = false;
+        uint32_t blend_factor = 0;
         float viewport[6] = {};
         uint32_t scissor[4] = {};
         WGPUBindGroup group = nullptr; // group 0 and its dynamic offsets
@@ -2475,6 +2582,7 @@ class WebGpuRenderer final : public D9Backend {
     std::unordered_map<uint64_t, WGPURenderPipeline> pipelines_;
     uint64_t last_pipeline_key_ = 0;
     WGPURenderPipeline last_pipeline_ = nullptr;
+    PipelineInput last_pipeline_input_{};
     // The previous draw's lookups (draw()): programs, vertex layout.
     uint64_t last_vs_key_ = 0, last_ps_key_ = 0;
     const d9sh::Program *last_vp_ = nullptr, *last_pp_ = nullptr;
@@ -2482,9 +2590,12 @@ class WebGpuRenderer final : public D9Backend {
     uint64_t last_vkey_ = 0, last_vl_vs_key_ = 0, last_strides_ = 0;
     uint32_t last_decl_id_ = 0, last_decl_size_ = 0;
     std::unordered_map<uint64_t, WGPUBindGroup> groups_;
+    GroupKey last_group_key_{};
+    WGPUBindGroup last_group_ = nullptr;
     // For each texture view, the groups made with it (keys into groups_; some may be gone).
     std::unordered_map<WGPUTextureView, std::vector<uint64_t>> view_groups_;
     std::unordered_map<uint64_t, WGPUSampler> samplers_;
+    LastSampler last_sampler_[17]; // the last slot is for clear/stretch utility draws
     WGPUSampler shadow_sampler_ = nullptr;
     std::unordered_map<uint64_t, WGPUTextureView> fitted_;
     WGPUTextureView black_ = nullptr, black_cube_ = nullptr, black_volume_ = nullptr,
@@ -2498,7 +2609,7 @@ class WebGpuRenderer final : public D9Backend {
     // RECOMP_D3D9_STATS (d3d9_webgpu_stats_frame): this frame's counts so far.
     struct FrameStats {
         uint32_t cube_draws = 0, cube_faces = 0, passes = 0, groups = 0, pipes = 0, submits = 0;
-        uint64_t ring_bytes = 0;
+        uint64_t ring_bytes = 0, sampler_hits = 0, group_hits = 0, pipeline_hits = 0;
         std::unordered_map<uint32_t, uint32_t> target_draws; // colour target id -> draws
     } fs_;
     const bool stats_ = recomp_env("D3D9_STATS") != nullptr;

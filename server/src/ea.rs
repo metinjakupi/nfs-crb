@@ -1,9 +1,9 @@
 //! Stand-ins for EA's online services at 10.77.0.1 (plans/lan-protocol.md, phase 4): just
 //! enough of FESL (TCP 18210), Theater (TCP and UDP 18215) and EA Messenger (TCP 13505) for
-//! Carbon's own Online mode to log in under any name, look for a Custom Match (PlayNow) and
-//! join a game that a host has made. No accounts exist: every name is accepted, and passwords
-//! and CD keys are never read, kept or written (their values are dropped when a packet is
-//! parsed and masked in the trace).
+//! Carbon's own Online mode to log in, look for a Custom Match (PlayNow) and join a game that
+//! a host has made. Unclaimed names stay open. An explicit claim can protect a name with a
+//! cloud-save proof. Passwords and CD keys are never read, kept or written (their values are
+//! dropped when a packet is parsed and masked in the trace).
 //!
 //! Theater is the game browser, and the one stand-in that links players: a host's CGAM makes
 //! a game (Games, below) that GLST/GDAT list to everyone and PlayNow offers (JOIN); a
@@ -36,12 +36,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host::{Expected, Host};
+use crate::identity::{Claims, Owner};
 use crate::messenger::{KeyDigest, Messenger};
 use crate::stats::{num, Period, Stats};
-use crate::util::{base64, base64_decode, http_date};
+use crate::util::{base64, base64_decode, http_date, lock};
 
 /// A connection to a stand-in, as the trace host keys it: (client vip, client port, our port,
 /// connection id).
@@ -389,8 +391,14 @@ pub struct Hub {
     pub races: BTreeMap<String, Vec<String>>,
     /// EA Messenger: friends, presence, chat, invites (messenger.rs).
     pub messenger: Messenger,
-    /// Each page's player key (lan.js), as its SHA-256, by vip: it claims the name at Login.
+    /// Each page's non-authoritative browser key (lan.js), as its SHA-256, by vip. Messenger
+    /// and Player Stats keep a short fingerprint as metadata; this key never owns a name.
     pub player_keys: HashMap<u32, KeyDigest>,
+    /// The cloud-keyphrase owner each page proves in lan.js's hello. The raw cloud-save id is
+    /// never kept here.
+    pub player_claims: HashMap<u32, Owner>,
+    /// Explicit name claims, shared with /names and the free-roam relay.
+    pub identities: Arc<Mutex<Claims>>,
     /// Player Stats and the Leaderboard: FESL's rank service (stats.rs).
     pub stats: Stats,
 }
@@ -842,21 +850,21 @@ impl Session {
                 Self::send(ev, r);
             }
             (b"acct", "Login") => {
-                // The password is never looked at (it was dropped when parsed). A name another
-                // browser has claimed (its player key, sent by lan.js) is refused as a wrong
-                // password, the game's own words for "this account is someone else's".
+                // The password is never looked at (it was dropped when parsed). An unclaimed
+                // name stays open. A claimed name needs the cloud keyphrase's derived proof.
                 let name = clean_name(p.get("name").unwrap_or(""));
-                let key = hub.player_keys.get(&self.key.0).copied();
-                if !hub.messenger.store.claim(&name, key.as_ref(), unix_secs()) {
-                    ev.push(Event::Note(format!("{name} is claimed by another browser: login refused")));
-                    Self::send(ev, error_code(p, &txn, "The password the user specified is incorrect", 122));
+                let owner = hub.player_claims.get(&self.key.0);
+                let browser = hub.player_keys.get(&self.key.0).map(crate::identity::browser_digest);
+                if !lock(&hub.identities).may_use(&name, owner, browser.as_deref()) {
+                    ev.push(Event::Note(format!("{name} is protected: login refused without its identity proof")));
+                    Self::send(ev, error_code(p, &txn, "This online name is claimed by another player", 122));
                     return;
                 }
+                let key = hub.player_keys.get(&self.key.0).copied();
+                hub.messenger.store.use_name(&name, key.as_ref(), unix_secs());
                 let user = hub.logins.login(&name);
                 ev.push(Event::Note(format!("{} logged in (userId {})", user.name, user.id)));
-                if let Some(n) = hub.stats.signed_in(&user.name, key.as_ref(), unix_secs()) {
-                    ev.push(Event::Note(n));
-                }
+                hub.stats.signed_in(&user.name, key.as_ref(), unix_secs());
                 let r = reply()
                     .with("lkey", &user.lkey)
                     .with("profileId", user.id)

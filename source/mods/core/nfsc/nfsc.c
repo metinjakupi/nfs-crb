@@ -145,6 +145,7 @@ static void log_line(const char *text) {
 #include "police.h" /* be the police in free roam (plans/shared-pursuit.md) */
 #include "rivals.h"
 #include "streetrace.h" /* flash a friend to race to a common GPS finish */
+#include "encounter.h" /* native Crew Challenge with online opponents */
 
 /* ---- the resolution list --------------------------------------------------
  * The host scales the frame smoothly to the window, aspect kept (game.toml
@@ -609,6 +610,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     police_install();
     rivals_install();
     streetrace_install();
+    encounter_install();
     /* Match the effect-render caller patched by XenonEffectFix.ixx, rather
      * than changing blending for every use of this shared setup routine. */
     if (setting("xenon_effects", 1) && api->hook_install_at_callsite &&

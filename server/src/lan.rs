@@ -17,8 +17,9 @@
 //!   EA's services on their ports (ea.rs).
 //! - When a vip leaves, every browser it had a TCP connection with through the switch gets a
 //!   TCP GONE frame (op 6) per connection, and every browser the {"t":"gone","vip":..} message.
-//! - Text frames from the page are JSON: {"t":"hello","name":..,"pk":..} names it in the logs;
-//!   pk, the page's player key, claims its name for EA Messenger (only its SHA-256 is kept).
+//! - Text frames from the page are JSON: {"t":"hello","name":..,"pk":..,"claim":..} names it
+//!   in the logs; pk is non-authoritative browser metadata. claim is the opaque cloud-save id
+//!   that proves an explicit name claim; only its domain-separated digest is kept.
 //!
 //! Limits: per client address (X-Real-IP behind nginx) PER_CLIENT connections; per connection
 //! a budget of frames and bytes a second (a broadcast costs one per receiver), past which it
@@ -209,6 +210,10 @@ impl Switch {
         lock(&self.st).trace.set_player_key(vip, key);
     }
 
+    fn player_claim(&self, vip: u32, token: &str) {
+        lock(&self.st).trace.set_player_claim(vip, token);
+    }
+
     /// Routes one frame from `from`; false when the sender is over its budget.
     pub fn route(&self, from: u32, mut f: Vec<u8>, budget: &mut Budget) -> bool {
         if f.len() < HDR + LAN_HDR || f.len() > HDR + MAX_PAYLOAD {
@@ -385,6 +390,8 @@ impl Session for Node {
             // a page from before player keys sends none: its name is used, not claimed
             let pk = m.get("pk").and_then(Value::as_str).filter(|k| (16..=128).contains(&k.len())).unwrap_or("");
             self.app.lan.player_key(self.vip, pk);
+            let claim = m.get("claim").and_then(Value::as_str).unwrap_or("");
+            self.app.lan.player_claim(self.vip, claim);
         }
     }
 

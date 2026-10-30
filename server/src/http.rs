@@ -234,6 +234,7 @@ fn reason(status: u16) -> &'static str {
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -244,6 +245,7 @@ fn reason(status: u16) -> &'static str {
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         507 => "Insufficient Storage",
         _ => "Internal Server Error",
     }
@@ -380,6 +382,9 @@ async fn route(app: &App, conn: &mut Conn, req: &mut Request) -> io::Result<()> 
     }
     if url.path == "/reports" {
         return crate::reports::handle(app, conn, req, &url).await;
+    }
+    if url.path == "/names" {
+        return crate::identity::handle(app, conn, req, &url).await;
     }
     if url.path == "/stats" {
         // {players, here}: how many are on the relay and in that room (empty: the lobby),

@@ -113,10 +113,11 @@
   .cs-mode b { color: var(--cyan); font-weight: 600; }
   .cs-btn { font: italic 800 15px/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .14em;
         text-transform: uppercase; color: var(--ink); background: rgba(95, 228, 242, .06); border: 1px solid var(--line);
-        padding: 11px 18px; cursor: pointer; transform: skewX(-12deg); transition: background .15s ease, border-color .15s ease, box-shadow .15s ease;
+        padding: 11px 18px; cursor: pointer; transform: skewX(-12deg); transition: transform .14s cubic-bezier(.23, 1, .32, 1), background .15s ease, border-color .15s ease, box-shadow .15s ease;
         text-decoration: none; display: inline-block; }
   .cs-btn > span { display: inline-block; transform: skewX(12deg); }
   .cs-btn:hover { background: rgba(95, 228, 242, .14); border-color: var(--cyan); }
+  .cs-btn:active { transform: skewX(-12deg) scale(.97); }
   .cs-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--cyan); }
   .cs-btn.cs-discord { color: #fff; background: #5865f2; border-color: #8c95ff; min-height: 44px; }
   .cs-btn.cs-discord > span { display: inline-flex; align-items: center; gap: 9px; }
@@ -124,6 +125,10 @@
   .cs-btn.cs-discord:hover { background: #4752c4; border-color: #b3b9ff; }
   .cs-btn.cs-discord:active { background: #3c45a5; }
   .cs-btn.cs-discord:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+  .cs-btn.cs-support { color: #160506; background: #ff5e5b; border-color: #ffaaa8; min-height: 44px; }
+  .cs-btn.cs-support:hover { background: #ff7774; border-color: #ffd0cf; }
+  .cs-btn.cs-support:active { background: #e94f4c; transform: skewX(-12deg) scale(.97); }
+  .cs-btn.cs-support:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
   .cs-btn:disabled { opacity: .4; cursor: default; }
   .cs-btn.big { font-size: 30px; padding: 18px 34px; color: #021018; border-color: transparent;
         background: linear-gradient(100deg, #9ff3fb, var(--cyan) 40%, #2aa4dc); box-shadow: 0 0 28px rgba(95, 228, 242, .35); }
@@ -137,6 +142,12 @@
   .cs input[type=text], .cs select { font: inherit; color: var(--ink); background: rgba(0, 0, 0, .45); border: 1px solid var(--line);
         padding: 9px 11px; width: 100%; border-radius: 0; outline: none; }
   .cs input[type=text]:focus, .cs select:focus { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan); }
+  .cs-identity { display: flex; align-items: baseline; gap: 8px; min-height: 20px; margin: -8px 0 14px;
+        color: var(--dim); font-size: 12px; }
+  .cs-identity[data-state="ok"] { color: #7cf3b0; }
+  .cs-identity[data-state="bad"] { color: #ff8197; }
+  .cs-identity button { border: 0; padding: 0; color: var(--cyan); background: none; font: inherit; text-decoration: underline; cursor: pointer; }
+  .cs-identity button:disabled { opacity: .5; cursor: default; }
   .cs-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; margin-bottom: 14px; }
   .cs-switch input { appearance: none; -webkit-appearance: none; width: 46px; height: 24px; flex: none; margin: 0; cursor: pointer;
         background: rgba(255, 255, 255, .1); border: 1px solid var(--line); transform: skewX(-12deg); position: relative; transition: background .15s ease; }
@@ -160,6 +171,21 @@
   .cs-dialog .cs-panel { width: min(440px, 100%); padding: 24px; }
   .cs-dialog p { margin: 0 0 16px; color: var(--ink); }
   .cs-dialog .cs-actions { margin-top: 18px; }
+  .cs-claim-dialog { width: min(500px, calc(100% - 32px)); max-width: none; padding: 0; border: 0; color: var(--ink);
+        background: transparent; overflow: visible; }
+  .cs-claim-dialog::backdrop { background: rgba(0, 2, 6, .82); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+  .cs-claim-dialog .cs-panel { width: 100%; padding: 26px; box-shadow: 0 24px 80px rgba(0, 0, 0, .58);
+        opacity: 1; transform: translateY(0) scale(1); transition: opacity .18s cubic-bezier(.23, 1, .32, 1), transform .18s cubic-bezier(.23, 1, .32, 1); }
+  @starting-style { .cs-claim-dialog[open] .cs-panel { opacity: 0; transform: translateY(8px) scale(.98); } }
+  .cs-claim-dialog p { margin: 0 0 16px; color: var(--ink); }
+  .cs-claim-name { color: var(--cyan); }
+  .cs-claim-safe { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin: 0; padding: 13px 14px;
+        color: var(--dim); font-size: 13px; background: rgba(95, 228, 242, .055); border: 1px solid var(--line); }
+  .cs-claim-safe li::before { content: "✓"; margin-right: 7px; color: #7cf3b0; font-weight: 800; }
+  .cs-claim-status { min-height: 20px; margin-top: 12px; color: #ff8197; font-size: 12px; }
+  .cs-claim-dialog .cs-actions { margin-top: 14px; }
+  .cs-btn.cs-primary { color: #021018; border-color: transparent; background: linear-gradient(100deg, #9ff3fb, var(--cyan) 45%, #2aa4dc); }
+  .cs-btn.cs-primary:hover { background: linear-gradient(100deg, #c8f9fd, #7deaf5 45%, #36b2e6); box-shadow: 0 0 28px rgba(95, 228, 242, .3); }
   .cs [hidden] { display: none !important; }
   .cs-ext:empty { display: none; }
   .cs-credits { margin: 0; padding-left: 18px; display: grid; gap: 5px; color: var(--dim); font-size: 13px; }
@@ -168,7 +194,8 @@
     .cs-grid { grid-template-columns: 1fr; } .cs-col { display: contents; } .cs-btn.big { width: 100%; }
     .cs-panel { order: 3; } .cs-panel.cs-play { order: 1; } .cs-panel.cs-online { order: 2; } .cs-panel.cs-about { order: 4; }
   }
-  @media (prefers-reduced-motion: reduce) { .cs::before, .cs-btn, .cs-switch input, .cs-switch input::after { transition: none; } }
+  @media (max-width: 520px) { .cs-claim-safe { grid-template-columns: 1fr; } .cs-claim-dialog .cs-actions { display: grid; } .cs-claim-dialog .cs-btn { width: 100%; min-height: 44px; } }
+  @media (prefers-reduced-motion: reduce) { .cs::before, .cs-btn, .cs-switch input, .cs-switch input::after, .cs-claim-dialog .cs-panel { transition: none; } }
   `;
 
   const root = document.createElement("div");
@@ -203,7 +230,7 @@
             <dt>Esc</dt><dd>pause, menus back</dd>
             <dt>F9 or F10</dt><dd>the menu: settings, full screen, online, quit (fn+F9 on a Mac)</dd>
             <dt>Controller</dt><dd>PS5, PS4 or Xbox: press any button. The touchpad (or Create + Options) opens the menu</dd>
-            <dt>Y</dt><dd>quick chat, when online</dd>
+            <dt>Y</dt><dd>type a message, when online</dd>
             <dt>H</dt><dd>horn, hold it, when online</dd>
           </dl>
           <label class="cs-switch" style="margin:14px 0 0"><span>Full screen when the game starts</span><input type="checkbox" class="cs-full"></label>
@@ -217,6 +244,7 @@
           <div class="cs-when-on">
             <label class="cs-row"><span class="cs-label">Your name</span>
               <input type="text" class="cs-name" maxlength="20" autocomplete="nickname" spellcheck="false" placeholder="Name others see"></label>
+            <div class="cs-identity" aria-live="polite"><span class="cs-identity-text"></span><button class="cs-identity-action" type="button" hidden></button></div>
             <label class="cs-row"><span class="cs-label">Crew</span>
               <input type="text" class="cs-crew" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Optional: same name = same crew"></label>
             <label class="cs-row"><span class="cs-label">Room</span>
@@ -235,6 +263,7 @@
           <div class="cs-note">Play solo or join other drivers online. Your saves stay on this device.</div>
           <div class="cs-actions" style="margin-top:12px">
             <a class="cs-btn cs-discord" href="https://discord.gg/UP3fhwbB2" target="_blank" rel="noopener"><span><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>Join Discord</span></a>
+            <a class="cs-btn cs-support" href="https://ko-fi.com/nfscrbn" target="_blank" rel="noopener" hidden><span>Support on Ko-fi</span></a>
             <a class="cs-btn cs-source" href="https://github.com/metinjakupi/nfs-crb" target="_blank" rel="noopener"><span>Source code on GitHub</span></a>
           </div>
           <div class="cs-note cs-community" style="margin-top:12px">Find players, ask for help, or report a bug in <a href="https://discord.com/channels/1565102068673286255/1565102215327387658" target="_blank" rel="noopener">#bug-reports</a> after joining. Include your browser, graphics card, and steps to reproduce the problem. Use F9 → Send report for game logs.</div>
@@ -265,7 +294,21 @@
         <button class="cs-btn cs-no" type="button"><span>Not now</span></button>
       </div>
     </form>
-  </div>`;
+  </div>
+  <dialog class="cs-claim-dialog" aria-labelledby="cs-claim-title" aria-describedby="cs-claim-copy">
+    <form class="cs-panel" method="dialog">
+      <h2 id="cs-claim-title">Protect your online name</h2>
+      <p id="cs-claim-copy"><strong class="cs-claim-name"></strong> <span class="cs-claim-copy"></span></p>
+      <ul class="cs-claim-safe" aria-label="Data that stays unchanged">
+        <li>Career and cloud save</li><li>Friends and blocks</li><li>Rankings and statistics</li><li>Cars and customisation</li>
+      </ul>
+      <div class="cs-claim-status" role="status" aria-live="polite"></div>
+      <div class="cs-actions">
+        <button class="cs-btn cs-primary cs-claim-confirm" type="submit" value="claim"><span>Claim name</span></button>
+        <button class="cs-btn cs-claim-cancel" type="submit" value="cancel"><span>Not now</span></button>
+      </div>
+    </form>
+  </dialog>`;
   document.body.append(root);
   // Keep player controls visible on the same homepage as Play.
   if (game.streamAssets) {
@@ -301,6 +344,7 @@
   const online = store.get("online", true); // New players start online; keep a saved choice.
   const on = $(".cs-on"), nameEl = $(".cs-name"), roomEl = $(".cs-room"), serverEl = $(".cs-server"), fullEl = $(".cs-full");
   const crewEl = $(".cs-crew");
+  const identityEl = $(".cs-identity"), identityText = $(".cs-identity-text"), identityAction = $(".cs-identity-action");
   for (const [id, s] of Object.entries(SERVERS)) serverEl.append(new Option(s.label, id));
   on.checked = !!online;
   roomEl.value = store.get("room", "");
@@ -317,6 +361,7 @@
     serverEl.value = "internet";
     serverEl.closest("details").hidden = true;
     $(".cs-licences").hidden = false;
+    $(".cs-support").hidden = false;
     // The guide and FAQ pages (tools/site/), and the site's own title (the player page sets the
     // game's; this one is the same as tools/site/seo-head.html's).
     document.title = "NFS Carbon Online – Need for Speed: Carbon multiplayer in your browser";
@@ -343,14 +388,15 @@
   slotReady.then(() => {
     nameEl.value = store.get(nameKey(), "");
     reflect();
+    scheduleIdentity();
     $(".cs-slot").textContent = !slot ? "Four game windows are already open. Close one to play here." : slot > 1
       ? `This is window ${slot} on this computer: it plays with its own save, a copy of the main one.`
       : "";
     serversReady.then(count);
   });
 
-  on.addEventListener("change", () => { store.set("online", on.checked); reflect(); count(); });
-  nameEl.addEventListener("input", reflect);
+  on.addEventListener("change", () => { store.set("online", on.checked); reflect(); count(); scheduleIdentity(); });
+  nameEl.addEventListener("input", () => { identityState = ""; showIdentity(); reflect(); scheduleIdentity(); });
   roomEl.addEventListener("input", reflect);
   nameEl.addEventListener("change", () => store.set(nameKey(), nameEl.value.trim()));
   roomEl.addEventListener("change", () => { store.set("room", roomEl.value.trim()); count(); });
@@ -368,7 +414,7 @@
     reflect();
   });
   crewEl.addEventListener("change", () => { crewEl.value = crewEl.value.trim(); store.set("crew", crewEl.value); });
-  serverEl.addEventListener("change", () => { store.set("server", serverEl.value); reflect(); count(); });
+  serverEl.addEventListener("change", () => { store.set("server", serverEl.value); reflect(); count(); scheduleIdentity(); });
   fullEl.addEventListener("change", () => store.set("fullscreen", fullEl.checked));
 
   // For the start page's add-ons (saves.js draws its panel into .cs-ext[data-for=saves]):
@@ -395,6 +441,170 @@
       document.body.append(preferences);
     }
   });
+
+  // A name can be claimed with this save slot's cloud keyphrase. saves.js exposes only the
+  // opaque cloud-save id; the keyphrase stays there. Existing names keep their migration
+  // reservation until the original browser confirms this dialog.
+  let identitySeq = 0, identityTimer = 0, identityState = "", claimBusy = false;
+  const cloudIdentity = () => window.recompCloudIdentity;
+  const claimDialog = $(".cs-claim-dialog"), claimForm = claimDialog.querySelector("form");
+  const claimNameText = $(".cs-claim-name"), claimCopy = $(".cs-claim-copy"), claimStatus = $(".cs-claim-status");
+  const claimConfirm = $(".cs-claim-confirm"), claimCancel = $(".cs-claim-cancel"), claimConfirmText = claimConfirm.querySelector("span");
+  function browserProof(create = true) {
+    try {
+      let key = localStorage.getItem("carbon-player-key") || "";
+      if (!/^[A-Za-z0-9_-]{16,64}$/.test(key) && create) {
+        const bytes = crypto.getRandomValues(new Uint8Array(24));
+        key = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        localStorage.setItem("carbon-player-key", key);
+      }
+      return /^[A-Za-z0-9_-]{16,64}$/.test(key) ? key : "";
+    } catch { return ""; }
+  }
+  function showIdentity(text = "", state = "", action = "", run = null) {
+    identityText.textContent = text;
+    identityEl.dataset.state = state;
+    identityAction.hidden = !action;
+    identityAction.textContent = action;
+    identityAction.disabled = false;
+    identityAction.onclick = run;
+  }
+  function showCloudSaves() {
+    if (claimDialog.open) claimDialog.close("cloud");
+    cloudIdentity()?.show?.();
+  }
+  function namesUrl(server, name = "") {
+    const base = new URL(server.url.replace(/^ws(s?):/i, "http$1:"));
+    base.pathname = `${base.pathname.replace(/\/+$/, "")}/names`;
+    base.search = "";
+    if (name) base.searchParams.set("name", name);
+    if (server.key) base.searchParams.set("key", server.key);
+    return base.href;
+  }
+  async function namesRequest(method, name, token) {
+    const server = SERVERS[serverEl.value];
+    if (!server) return null;
+    const headers = {};
+    if (token) headers.authorization = `Bearer ${token}`;
+    const browser = browserProof();
+    if (browser) headers["x-carbon-player-key"] = browser;
+    if (method === "POST") headers["content-type"] = "application/json";
+    try {
+      const r = await fetch(namesUrl(server, method === "GET" ? name : ""), {
+        method, headers, body: method === "POST" ? JSON.stringify({ name }) : undefined,
+        cache: "no-store", credentials: "omit", signal: AbortSignal.timeout(8000),
+      });
+      const body = await r.json().catch(() => null);
+      return body && typeof body === "object" ? { status: r.status, body } : null;
+    } catch { return null; }
+  }
+  function scheduleIdentity() {
+    clearTimeout(identityTimer);
+    identityTimer = setTimeout(refreshIdentity, 250);
+  }
+  async function refreshIdentity() {
+    const seq = ++identitySeq, name = nameEl.value.trim();
+    if (!on.checked || !name) { identityState = ""; showIdentity(); return; }
+    const token = cloudIdentity()?.token?.() || "";
+    const got = await namesRequest("GET", name, token);
+    if (seq !== identitySeq) return;
+    if (!got || got.status !== 200) { identityState = ""; showIdentity(); return; }
+    const shown = got.body.name || name;
+    identityState = got.body.state || "";
+    if (got.body.state === "yours") {
+      showIdentity(`Claimed with your cloud keyphrase. ${shown} is protected.`, "ok");
+    } else if (got.body.state === "taken") {
+      showIdentity(`Another player claimed ${shown}. Load your keyphrase under Cloud saves if this is yours.`, "bad", "Cloud saves", showCloudSaves);
+    } else if (got.body.state === "reserved") {
+      showIdentity(`${shown} is an existing protected name. Use its original browser, or choose another name. No data will be transferred.`, "bad");
+    } else if (got.body.state === "legacy" && !token) {
+      showIdentity(`${shown} is reserved for this browser. Turn on cloud saves to protect it permanently.`, "ok", "Cloud saves", showCloudSaves);
+    } else if (got.body.state === "legacy") {
+      showIdentity(`${shown} is reserved for this browser.`, "ok", "Claim", openClaimDialog);
+    } else if (got.body.state === "default") {
+      showIdentity(`${shown} is a shared default name and cannot be claimed.`, "bad");
+    } else if (!token) {
+      showIdentity(`${shown} is not claimed. Turn on cloud saves to protect it.`, "", "Cloud saves", showCloudSaves);
+    } else {
+      showIdentity(`${shown} is not claimed.`, "", "Claim", openClaimDialog);
+    }
+  }
+  function openClaimDialog() {
+    const name = nameEl.value.trim(), token = cloudIdentity()?.token?.() || "";
+    if (!token) { showCloudSaves(); return; }
+    claimNameText.textContent = name;
+    claimCopy.textContent = identityState === "legacy"
+      ? "is reserved for this browser. Confirm the claim with your cloud keyphrase. This adds protection only."
+      : "is available. Confirm the claim with your cloud keyphrase. This adds protection only.";
+    claimStatus.textContent = "";
+    claimConfirm.disabled = false;
+    claimCancel.disabled = false;
+    claimBusy = false;
+    claimConfirmText.textContent = `Claim ${name}`;
+    if (!claimDialog.open) claimDialog.showModal();
+    claimConfirm.focus();
+  }
+  async function claimName() {
+    const name = nameEl.value.trim(), token = cloudIdentity()?.token?.() || "";
+    if (!token) { showCloudSaves(); return; }
+    claimBusy = true;
+    claimConfirm.disabled = true;
+    claimCancel.disabled = true;
+    claimConfirmText.textContent = "Claiming…";
+    claimStatus.textContent = "Saving the protection…";
+    showIdentity(`Claiming ${name}…`);
+    const got = await namesRequest("POST", name, token);
+    if (got?.status === 200 && got.body.state === "yours") {
+      identityState = "yours";
+      claimBusy = false;
+      claimDialog.close("claimed");
+      showIdentity(`Claimed with your cloud keyphrase. ${got.body.name || name} is protected.`, "ok");
+      return;
+    }
+    const error = got?.body?.error;
+    const text = error === "keyphrase" ? "Save your career to the cloud first, then claim the name."
+      : error === "taken" ? "Another player claimed this name just now."
+      : error === "old-browser" ? "Use the original browser that owned this existing name. No data was transferred."
+      : error === "recovery" ? "This existing name needs manual recovery. No data was changed."
+      : error === "one-name" ? "This cloud keyphrase already protects another name."
+      : error === "busy" ? "Too many name claims from this network. Try again later."
+      : error === "default" ? "This shared default name cannot be claimed."
+      : error === "full" ? "The server cannot keep more name claims right now."
+      : error === "storage" ? "The server could not save the claim. Nothing changed. Try again later."
+      : "The server did not take the claim. Try again later.";
+    claimStatus.textContent = text;
+    claimBusy = false;
+    claimConfirm.disabled = false;
+    claimCancel.disabled = false;
+    claimConfirmText.textContent = "Try again";
+    showIdentity(text, "bad", error === "keyphrase" ? "Cloud saves" : "Try again", error === "keyphrase" ? showCloudSaves : openClaimDialog);
+  }
+  claimForm.addEventListener("submit", (e) => {
+    if (e.submitter !== claimConfirm) return;
+    e.preventDefault();
+    claimName();
+  });
+  claimDialog.addEventListener("cancel", (e) => { if (claimBusy) e.preventDefault(); });
+  claimDialog.addEventListener("click", (e) => { if (e.target === claimDialog && !claimBusy) claimDialog.close("cancel"); });
+  async function identityForPlay(name) {
+    const token = cloudIdentity()?.token?.() || "";
+    const browser = browserProof();
+    const got = await namesRequest("GET", name, token);
+    if (got?.status === 200 && got.body.state === "taken") {
+      const shown = got.body.name || name;
+      showIdentity(`Another player claimed ${shown}. Choose another name, or load its keyphrase under Cloud saves.`, "bad", "Cloud saves", showCloudSaves);
+      nameEl.focus();
+      return { ok: false, claim: "", browser };
+    }
+    if (got?.status === 200 && got.body.state === "reserved") {
+      const shown = got.body.name || name;
+      showIdentity(`${shown} is an existing protected name. Use its original browser, or choose another name. No data will be transferred.`, "bad");
+      nameEl.focus();
+      return { ok: false, claim: "", browser };
+    }
+    return { ok: true, claim: token, browser };
+  }
+  addEventListener("recomp-cloud-identity", scheduleIdentity);
 
   // How many are on the server now (the relay's /stats).
   let counting = 0;
@@ -609,6 +819,8 @@
     const name = nameEl.value.trim();
     if (on.checked && !name) { ask(); return; }
     starting = true;
+    const identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
+    if (!identity.ok) { starting = false; return; }
     if (!restoring && fullEl.checked && document.documentElement.requestFullscreen)
       document.documentElement.requestFullscreen().catch(() => {});
     const server = SERVERS[serverEl.value];
@@ -622,10 +834,10 @@
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).
     window.recompBoot({
       profile: slot > 1 ? String(slot) : null,
-      online: on.checked ? { relay, name, room: roomEl.value.trim(), crew: crewEl.value.trim() } : null,
-      lan: on.checked ? { url: `${server.url}/lan${key}`, name } : null,
+      online: on.checked ? { relay, name, room: roomEl.value.trim(), crew: crewEl.value.trim(), claim: identity.claim, legacy: identity.browser } : null,
+      lan: on.checked ? { url: `${server.url}/lan${key}`, name, claim: identity.claim } : null,
     });
-    for (const src of ["menu.js", "chat.js", "race.js", "worldmap.js", "report.js"]) { // the in-game menu (F9), quick chat and horn, the radar, racing together, friends on the world map, Download log / Send report
+    for (const src of ["menu.js", "chat.js", "race.js", "worldmap.js", "report.js", "encounter.js"]) { // the in-game menu (F9), chat and horn, the radar, racing together, friends on the world map, Download log / Send report
       const script = document.createElement("script");
       script.src = src;
       document.body.append(script);

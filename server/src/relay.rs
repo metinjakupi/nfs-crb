@@ -54,12 +54,13 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
 use crate::http::Conn;
+use crate::identity::{owner_of, Claims};
 use crate::util::{js_slice, js_trim, json_str, label, lock};
 use crate::ws::{self, Outbox, Session};
 use crate::App;
@@ -934,7 +935,7 @@ impl Relay {
         }
     }
 
-    fn handle(&mut self, room: &str, id: u64, text: &str) {
+    fn handle(&mut self, room: &str, id: u64, text: &str, identities: &Mutex<Claims>) {
         let Ok(Value::Object(m)) = serde_json::from_str::<Value>(text) else { return };
         let (k, bin) = (self.k, self.bin);
         let Some(r) = self.rooms.get_mut(room) else { return };
@@ -942,7 +943,7 @@ impl Relay {
         let now = Instant::now();
         let named = r.members[i].named;
         match m.get("t").and_then(Value::as_str) {
-            Some("hi") => hi(r, i, &m, room, k, bin),
+            Some("hi") => hi(r, i, &m, room, k, bin, identities),
             Some("pose") if named => pose(r, i, &m, now),
             Some("follow") if named => follow(r, i, &m, now, k),
             Some("physics") if named => {
@@ -1225,12 +1226,19 @@ fn look(room: &mut Room, i: usize, m: &Map<String, Value>, now: Instant) {
     }
 }
 
-fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, bin: usize) {
+fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, bin: usize, identities: &Mutex<Claims>) {
     let members = &mut room.members;
     let id = members[i].id;
     // JSON objects can shadow toString/valueOf in the Node relay, so it never coerces client
     // fields; here: anything but a string is "".
     members[i].name = label(m.get("name"), "Player", 20);
+    let owner = m.get("claim").and_then(Value::as_str).and_then(owner_of);
+    let browser = m.get("pk").and_then(Value::as_str).and_then(crate::identity::browser_fingerprint);
+    if !lock(identities).may_use(&members[i].name, owner.as_ref(), browser.as_deref()) {
+        println!("{name}: {} ({id}) refused: the name is protected", members[i].name);
+        members[i].out.finish(Some(ws::close_frame(1008, "name protected")));
+        return;
+    }
     members[i].crew = label(m.get("crew"), "", 16);
     members[i].crew_key = crew_key(&members[i].crew);
     let physics = number(m.get("physics"));
@@ -1531,7 +1539,7 @@ struct Player {
 
 impl Session for Player {
     fn text(&mut self, text: &str) {
-        lock(&self.app.relay).handle(&self.room, self.id, text);
+        lock(&self.app.relay).handle(&self.room, self.id, text, &self.app.identities);
     }
 
     fn binary(&mut self, data: Vec<u8>) {

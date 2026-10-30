@@ -20,10 +20,12 @@
 //! - A second sign-in under the same name logs the first one off (ADMN {TYPE=DUPL}: "Multiple
 //!   log-ins detected. You have been logged off.").
 //!
-//! Names are claimed by a per-browser player key (lan.js sends it in the /lan hello; only its
-//! SHA-256 is kept): a name claimed by another key is refused at FESL Login. A claim lapses
-//! after 30 days without a sign-in, and whoever claims it next starts with an empty list. A
-//! client without a key may use a name nobody has claimed, without claiming it.
+//! Names start as open display names. A player can explicitly protect one through identity.rs
+//! with the cloud-save keyphrase's derived proof. That adds an access check before Login; it
+//! does not move or erase this store's existing friends. identity.rs snapshots the SHA-256 of
+//! an existing name's last browser key as a one-time migration proof. The browser key stops
+//! controlling access after the explicit claim. The newest Messenger sign-in under a name
+//! replaces the older one.
 //!
 //! Kept between sessions (with CARBON_MESSENGER_DIR, in `messenger.json`): names with the key
 //! digest and the last sign-in day, friend links, pending requests and blocks. Nothing else: no
@@ -47,15 +49,14 @@ const MAX_PENDING: usize = 50;
 const MAX_BLOCKED: usize = 100;
 /// Names kept at most (about 100 bytes each in messenger.json, which is written whole on each
 /// change). When full, a new name makes room by taking the place of the longest-unseen name
-/// that holds nothing (no live claim, no friends, requests or blocks); when there is none, it
-/// signs in without being kept.
+/// that holds nothing (no recent browser-key metadata, friends, requests or blocks); when
+/// there is none, it signs in without being kept.
 const MAX_PEOPLE: usize = 10_000;
-/// A name's last sign-in is written at most once a day (it only counts for the 30-day lapse),
+/// A name's last sign-in is written at most once a day (it counts for metadata retention),
 /// so signing in does not rewrite the file each time.
 const SEEN_STEP_SECS: u64 = 24 * 3600;
-/// A name's claim ends after this long without a sign-in (a player who lost its browser's key
-/// gets the name back after a month).
-pub const CLAIM_LAPSE_SECS: u64 = 30 * 24 * 3600;
+/// Browser-key metadata does not keep an otherwise empty name forever.
+pub const KEY_RETENTION_SECS: u64 = 30 * 24 * 3600;
 /// Chat: a burst of 6, then one message a second; invites: 3, then one every 5 s.
 const CHAT_BURST: f64 = 6.0;
 const CHAT_PER_MS: f64 = 1.0 / 1000.0;
@@ -93,7 +94,7 @@ fn clean_text(s: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 struct Person {
     name: String,
-    /// the player key's digest (hex) of the browser that claimed the name, if one did
+    /// the latest browser key's digest (hex), when supplied; metadata only
     key: Option<String>,
     /// last sign-in, in seconds since 1970 (a day's precision would do)
     seen: u64,
@@ -191,28 +192,14 @@ impl Store {
         }
     }
 
-    /// Sign-in under `name` with the browser's key digest (if it sent one). False: the name is
-    /// another browser's (claimed, the claim not lapsed). A key claims a free name; a lapsed
-    /// claim taken by another key starts empty (the old player's friends are not handed over).
-    pub fn claim(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) -> bool {
+    /// Remember a display name and its latest browser-key digest, when supplied. Browser keys
+    /// are metadata only: changing or losing one never blocks sign-in or removes relationships.
+    pub fn use_name(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) {
         let k = low(name);
         let key = key.map(hex);
-        let fresh = |p: &Person| p.key.is_some() && now.saturating_sub(p.seen) < CLAIM_LAPSE_SECS;
-        match self.people.get(&k) {
-            Some(p) if fresh(p) => {
-                if key.is_none() || key != p.key {
-                    return false;
-                }
-            }
-            Some(p) if p.key.is_some() && key.is_some() && key != p.key => {
-                // a lapsed claim, taken over: what the old player had stays with nobody
-                self.forget(&k);
-            }
-            _ => {}
-        }
         let new = !self.people.contains_key(&k);
         if new && self.people.len() >= MAX_PEOPLE && !self.make_room(now) {
-            return true;
+            return;
         }
         let p = self.people.entry(k).or_insert(Person { name: name.to_string(), key: None, seen: now });
         let changed = new || p.name != name || (key.is_some() && key != p.key) || now.saturating_sub(p.seen) >= SEEN_STEP_SECS;
@@ -224,17 +211,16 @@ impl Store {
             p.seen = now;
             self.save();
         }
-        true
     }
 
-    /// The store is full: forgets the longest-unseen name that holds nothing (no key or a
-    /// lapsed claim, and no friends, requests or blocks). False if every name holds something.
+    /// The store is full: forgets the longest-unseen name that holds nothing (no recent key
+    /// metadata, friends, requests or blocks). False if every name holds something.
     fn make_room(&mut self, now: u64) -> bool {
         let busy: BTreeSet<&String> = self.friends.iter().chain(&self.pending).chain(&self.blocked).flat_map(|(a, b)| [a, b]).collect();
         let idle = self
             .people
             .iter()
-            .filter(|(k, p)| !busy.contains(k) && (p.key.is_none() || now.saturating_sub(p.seen) >= CLAIM_LAPSE_SECS))
+            .filter(|(k, p)| !busy.contains(k) && (p.key.is_none() || now.saturating_sub(p.seen) >= KEY_RETENTION_SECS))
             .min_by_key(|(_, p)| p.seen)
             .map(|(k, _)| k.clone());
         match idle {
@@ -244,13 +230,6 @@ impl Store {
             }
             None => false,
         }
-    }
-
-    fn forget(&mut self, k: &str) {
-        self.friends.retain(|(a, b)| a != k && b != k);
-        self.pending.retain(|(a, b)| a != k && b != k);
-        self.blocked.retain(|(a, b)| a != k && b != k);
-        self.people.remove(k);
     }
 
     fn display(&self, k: &str) -> String {
@@ -366,7 +345,7 @@ impl Messenger {
             self.online.remove(&previous);
         }
         if !self.store.known(&k) {
-            self.store.claim(name, None, now / 1000);
+            self.store.use_name(name, None, now / 1000);
         }
         self.by_conn.insert(conn, k.clone());
         self.online.insert(
@@ -779,8 +758,8 @@ mod tests {
 
     fn two() -> Messenger {
         let mut m = Messenger::default();
-        m.store.claim("Metin", Some(&digest("a")), 1000);
-        m.store.claim("Jan", Some(&digest("b")), 1000);
+        m.store.use_name("Metin", Some(&digest("a")), 1000);
+        m.store.use_name("Jan", Some(&digest("b")), 1000);
         m.sign_in(A, "Metin", 1);
         m.sign_in(B, "Jan", 1);
         m
@@ -888,34 +867,30 @@ mod tests {
     }
 
     #[test]
-    fn names_are_claimed_by_key_and_lapse_after_a_month() {
+    fn browser_key_changes_preserve_a_display_names_friends() {
         let mut s = Store::default();
-        assert!(s.claim("Metin", Some(&digest("a")), 100));
-        assert!(!s.claim("metin", Some(&digest("b")), 200), "another browser");
-        assert!(!s.claim("Metin", None, 200), "no key, claimed name");
-        assert!(s.claim("Metin", Some(&digest("a")), 300), "its own browser");
-        assert!(s.claim("Nobody", None, 300) && s.people["nobody"].key.is_none(), "no key: used, not claimed");
-        assert!(s.claim("Nobody", Some(&digest("c")), 301), "then claimed by a key");
+        s.use_name("Metin", Some(&digest("a")), 100);
+        s.use_name("Nobody", None, 300);
+        assert!(s.people["nobody"].key.is_none(), "a missing key is valid");
         s.friends.insert(pair("metin", "nobody"));
-        // a month without Metin: another browser may take the name, and starts empty
-        assert!(s.claim("Metin", Some(&digest("b")), 300 + CLAIM_LAPSE_SECS));
-        assert!(s.friends.is_empty());
-        assert!(!s.claim("Metin", Some(&digest("a")), 301 + CLAIM_LAPSE_SECS));
+        s.use_name("metin", Some(&digest("b")), 301);
+        s.use_name("Metin", None, 302);
+        assert!(s.are_friends("metin", "nobody"));
     }
 
     #[test]
     fn a_full_store_makes_room_only_from_names_that_hold_nothing() {
         let mut s = Store::default();
         for i in 0..MAX_PEOPLE {
-            assert!(s.claim(&format!("p{i}"), Some(&digest(&format!("k{i}"))), 1000 + i as u64));
+            s.use_name(&format!("p{i}"), Some(&digest(&format!("k{i}"))), 1000 + i as u64);
         }
-        // every name is claimed: a new one signs in without being kept
-        assert!(s.claim("Late", Some(&digest("late")), 5000));
+        // recent browser-key metadata keeps each otherwise empty name for now
+        s.use_name("Late", Some(&digest("late")), 5000);
         assert!(!s.known("late") && s.people.len() == MAX_PEOPLE);
-        // a month on, the claims have lapsed: the longest-unseen name without friends goes
+        // a month on, old metadata no longer keeps the longest-unseen empty name
         s.friends.insert(pair("p0", "p1"));
-        let later = 1000 + CLAIM_LAPSE_SECS + MAX_PEOPLE as u64;
-        assert!(s.claim("Late", Some(&digest("late")), later));
+        let later = 1000 + KEY_RETENTION_SECS + MAX_PEOPLE as u64;
+        s.use_name("Late", Some(&digest("late")), later);
         assert!(s.known("late") && s.known("p0") && s.known("p1") && !s.known("p2"));
         assert_eq!(s.people.len(), MAX_PEOPLE);
     }
@@ -938,8 +913,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         {
             let mut m = Messenger::new(Some(dir.clone()));
-            m.store.claim("Metin", Some(&digest("a")), 1000);
-            m.store.claim("Jan", Some(&digest("b")), 1000);
+            m.store.use_name("Metin", Some(&digest("a")), 1000);
+            m.store.use_name("Jan", Some(&digest("b")), 1000);
             m.sign_in(A, "Metin", 1);
             m.sign_in(B, "Jan", 1);
             friends(&mut m);
@@ -948,7 +923,8 @@ mod tests {
         assert!(!text.contains("\"a\"") && text.contains(&hex(&digest("a"))), "only the digest");
         let mut m = Messenger::new(Some(dir.clone()));
         assert!(m.store.are_friends("metin", "jan"));
-        assert!(!m.store.claim("Metin", Some(&digest("x")), 2000));
+        m.store.use_name("Metin", Some(&digest("x")), 2000);
+        assert!(m.store.are_friends("metin", "jan"), "a new browser keeps the friend list");
         let _ = fs::remove_dir_all(&dir);
     }
 

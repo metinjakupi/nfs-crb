@@ -196,6 +196,58 @@ static struct {
     uint64_t draws, bytes, const_bytes, state_puts, state_bytes, batches, fresh, grows;
 } g_queue_stats;
 
+#ifdef __EMSCRIPTEN__
+// WebGPU reads only these render states. Keep its queue payload dense instead of copying all
+// 256 D3D slots and the 256 diagnostic "was set" flags after every state change.
+static constexpr uint8_t kWebRenderStates[] = {
+    d9gpu::RS_ZENABLE,
+    d9gpu::RS_ZWRITEENABLE,
+    d9gpu::RS_ALPHATESTENABLE,
+    d9gpu::RS_SRCBLEND,
+    d9gpu::RS_DESTBLEND,
+    d9gpu::RS_CULLMODE,
+    d9gpu::RS_ZFUNC,
+    d9gpu::RS_ALPHAREF,
+    d9gpu::RS_ALPHAFUNC,
+    d9gpu::RS_ALPHABLENDENABLE,
+    d9gpu::RS_FOGENABLE,
+    d9gpu::RS_FOGCOLOR,
+    d9gpu::RS_FOGTABLEMODE,
+    d9gpu::RS_FOGSTART,
+    d9gpu::RS_FOGEND,
+    d9gpu::RS_FOGDENSITY,
+    d9gpu::RS_STENCILENABLE,
+    d9gpu::RS_STENCILFAIL,
+    d9gpu::RS_STENCILZFAIL,
+    d9gpu::RS_STENCILPASS,
+    d9gpu::RS_STENCILFUNC,
+    d9gpu::RS_STENCILREF,
+    d9gpu::RS_STENCILMASK,
+    d9gpu::RS_STENCILWRITEMASK,
+    d9gpu::RS_COLORWRITEENABLE,
+    d9gpu::RS_BLENDOP,
+    d9gpu::RS_SCISSORTESTENABLE,
+    d9gpu::RS_SLOPESCALEDEPTHBIAS,
+    d9gpu::RS_TWOSIDEDSTENCILMODE,
+    d9gpu::RS_CCW_STENCILFAIL,
+    d9gpu::RS_CCW_STENCILZFAIL,
+    d9gpu::RS_CCW_STENCILPASS,
+    d9gpu::RS_CCW_STENCILFUNC,
+    d9gpu::RS_COLORWRITEENABLE1,
+    d9gpu::RS_COLORWRITEENABLE2,
+    d9gpu::RS_COLORWRITEENABLE3,
+    d9gpu::RS_BLENDFACTOR,
+    d9gpu::RS_DEPTHBIAS,
+    d9gpu::RS_SEPARATEALPHABLENDENABLE,
+    d9gpu::RS_SRCBLENDALPHA,
+    d9gpu::RS_DESTBLENDALPHA,
+    d9gpu::RS_BLENDOPALPHA,
+};
+static constexpr size_t kSamplerStateBytes = 16 * 14 * sizeof(uint32_t);
+static constexpr size_t kWebRenderStateBytes = sizeof(kWebRenderStates) * sizeof(uint32_t);
+static constexpr size_t kWebStateBytes = kSamplerStateBytes + kWebRenderStateBytes;
+#endif
+
 // A batch's bytes. Each draw puts half a dozen small pieces (its declaration, constants,
 // state tables...), thousands of draws a frame, and std::vector::insert cost more per call
 // than the copy itself on the game thread; this is a capacity check and a memcpy.
@@ -250,10 +302,12 @@ struct Batch {
     // The last draw's state tables in `bytes`, reused while the version holds.
     uint64_t state_version = 0;
     size_t state_at = 0;
+    bool state_compact = false;
     void clear() {
         commands.clear();
         bytes.clear();
         state_version = 0;
+        state_compact = false;
     }
     size_t put(const void *p, size_t n) {
         size_t at = bytes.size();
@@ -264,6 +318,21 @@ struct Batch {
         }
         return at;
     }
+#ifdef __EMSCRIPTEN__
+    size_t put_web_state(const uint32_t *samplers, const uint32_t *render) {
+        const size_t at = bytes.size();
+        if (bytes.capacity() - at < kWebStateBytes)
+            ++g_queue_stats.grows;
+        uint8_t *out = bytes.append(kWebStateBytes);
+        memcpy(out, samplers, kSamplerStateBytes);
+        out += kSamplerStateBytes;
+        for (uint8_t state : kWebRenderStates) {
+            memcpy(out, render + state, sizeof(uint32_t));
+            out += sizeof(uint32_t);
+        }
+        return at;
+    }
+#endif
 };
 
 class RenderThread {
@@ -552,9 +621,23 @@ class RenderThread {
                 d.pconst = (const float *)take(d.pconst_count * 16u);
                 d.inline_vertices = take(d.inline_bytes);
                 d.inline_indices = take(d.inline_index_bytes);
-                d.sampler_state = (const uint32_t *)(base + cmd.state_at);
-                d.render_state = (const uint32_t *)(base + cmd.state_at + 16 * 14 * 4);
-                d.render_state_set = base + cmd.state_at + 16 * 14 * 4 + 256 * 4;
+#ifdef __EMSCRIPTEN__
+                if (cmd.b) {
+                    d.sampler_state = (const uint32_t *)(base + cmd.state_at);
+                    const uint8_t *packed = base + cmd.state_at + kSamplerStateBytes;
+                    for (uint8_t state : kWebRenderStates) {
+                        memcpy(&web_render_state_[state], packed, sizeof(uint32_t));
+                        packed += sizeof(uint32_t);
+                    }
+                    d.render_state = web_render_state_;
+                    d.render_state_set = nullptr;
+                } else
+#endif
+                {
+                    d.sampler_state = (const uint32_t *)(base + cmd.state_at);
+                    d.render_state = (const uint32_t *)(base + cmd.state_at + 16 * 14 * 4);
+                    d.render_state_set = base + cmd.state_at + 16 * 14 * 4 + 256 * 4;
+                }
                 d.label = cmd.a ? (const char *)take(cmd.a) : nullptr;
                 if (cmd.op == Op::RejectedDraw)
                     r_->rejected_draw(d);
@@ -641,6 +724,9 @@ class RenderThread {
     std::atomic<uint64_t> game_wait_ns_{0};
     double pump_ms_ = 0, exec_started_ = 0, defer_ms_ = 0, deferred_at_ = 0; // main thread only
     uint32_t frame_draws_ = 0;
+#ifdef __EMSCRIPTEN__
+    uint32_t web_render_state_[256] = {};
+#endif
     std::thread worker_;
     std::mutex m_;
     std::condition_variable work_cv_, idle_cv_;
@@ -913,14 +999,25 @@ static void queue_draw(const HostD9Draw *draw, bool rejected) {
     static const uint32_t zero_states[256] = {};
     static const uint8_t zero_set[256] = {};
     if (!draw->state_version || draw->state_version != b.state_version) {
-        b.state_at = b.put(draw->sampler_state ? draw->sampler_state : zero_samplers, 16 * 14 * 4);
-        b.put(draw->render_state ? draw->render_state : zero_states, 256 * 4);
+        const uint32_t *samplers = draw->sampler_state ? draw->sampler_state : zero_samplers;
+        const uint32_t *render = draw->render_state ? draw->render_state : zero_states;
+        size_t state_bytes;
+#ifdef __EMSCRIPTEN__
+        b.state_compact = true;
+        b.state_at = b.put_web_state(samplers, render);
+        state_bytes = kWebStateBytes;
+#else
+        b.state_at = b.put(samplers, 16 * 14 * 4);
+        b.put(render, 256 * 4);
         b.put(draw->render_state_set ? draw->render_state_set : zero_set, 256);
+        state_bytes = 16 * 14 * 4 + 256 * 4 + 256;
+#endif
         b.state_version = draw->state_version;
         ++g_queue_stats.state_puts;
-        g_queue_stats.state_bytes += 16 * 14 * 4 + 256 * 4 + 256;
+        g_queue_stats.state_bytes += state_bytes;
     }
     c.state_at = b.state_at;
+    c.b = b.state_compact;
     ++g_queue_stats.draws;
     g_queue_stats.bytes += b.bytes.size() - bytes_before;
     g_queue_stats.const_bytes += (draw->vconst ? draw->vconst_count * 16u : 0) + (draw->pconst ? draw->pconst_count * 16u : 0);

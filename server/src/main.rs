@@ -8,16 +8,19 @@
 //!   the same protocol, limits and log lines as tools/carbon-net-relay.mjs, whose header is the
 //!   protocol reference, plus GET /stats, the start page's player count;
 //! - cloud saves (saves.rs): sealed blobs under /saves/<id>, with CARBON_SAVES_DIR set;
+//! - optional name claims (identity.rs): GET/POST /names; a claim protects the existing
+//!   name-keyed Messenger and Player Stats records without moving or rewriting them;
 //! - problem reports (reports.rs): POST /reports, the game page's log as text, with
 //!   CARBON_REPORTS_DIR set (CARBON_REPORTS_MAX_MB for all of them, default 200);
 //! - GET /lan (lan.rs): the switch of the virtual network that the game's own Online mode
 //!   talks through (plans/lan-protocol.md), with the trace host at 10.77.0.1 (trace.rs).
 //!   (So a free-roam room cannot be called "lan".)
 //!
-//! Environment: CARBON_RELAY_KEY (WebSockets, /lan and /saves must carry ?key=<it>),
+//! Environment: CARBON_RELAY_KEY (WebSockets, /lan, /saves and /names must carry ?key=<it>),
 //! CARBON_SAVES_DIR, CARBON_SAVES_MAX_MB (default 1024), CARBON_TRACE_DIR (the trace host's
-//! files), CARBON_TRACE_GAME (1: PlayNow sends players to a game the trace host "hosts", to
-//! record what a joining game sends its host). Empty counts as unset.
+//! files), CARBON_MESSENGER_DIR (Messenger data and names.json claims), CARBON_TRACE_GAME
+//! (1: PlayNow sends players to a game the trace host "hosts", to record what a joining game
+//! sends its host). Empty counts as unset.
 //!
 //! Everything runs on one thread, as the Node relay did: rooms of a few hundred players (each
 //! getting the cars of the 24 nearest; relay.rs) and a LAN of a few players fit in one core,
@@ -30,6 +33,7 @@
 mod ea;
 mod host;
 mod http;
+mod identity;
 mod lan;
 mod messenger;
 mod olmsg;
@@ -52,6 +56,7 @@ pub struct App {
     /// CARBON_RELAY_KEY, "" for none
     pub key: String,
     pub relay: Mutex<relay::Relay>,
+    pub identities: Arc<Mutex<identity::Claims>>,
     pub saves: Option<saves::Saves>,
     pub reports: Option<reports::Reports>,
     pub lan: lan::Switch,
@@ -86,10 +91,21 @@ fn main() {
             std::process::exit(1);
         })
     });
-    let trace = trace::Trace::new(env("CARBON_TRACE_DIR").map(PathBuf::from));
+    let identities = Arc::new(Mutex::new(
+        identity::Claims::open(
+            env("CARBON_MESSENGER_DIR").map(PathBuf::from),
+            env("CARBON_STATS_DIR").map(PathBuf::from),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("carbon-server: cannot protect existing names: {e}");
+            std::process::exit(1);
+        }),
+    ));
+    let trace = trace::Trace::new(env("CARBON_TRACE_DIR").map(PathBuf::from), identities.clone());
     let app = Arc::new(App {
         key: env("CARBON_RELAY_KEY").unwrap_or_default(),
         relay: Mutex::new(relay::Relay::default()),
+        identities,
         saves,
         reports,
         lan: lan::Switch::new(trace),

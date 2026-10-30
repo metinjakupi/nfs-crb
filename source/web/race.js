@@ -43,12 +43,13 @@
   const GAME_SEQ = 0x260, ROW0 = 0x2d0, ROW = 0x30, MAX_ROWS = 8;
   const CATCH = 1, KEEP_AI = 2;
   const PHASE = { idle: 0, launched: 1, setUp: 2, holding: 3, racing: 4, done: 5 };
-  const TYPES = ["Sprint", "Circuit", "Drag", "Lap knockout", "Tollbooth", "Speedtrap", "Checkpoint", "Cash grab",
+  // DAL 0xbc3 returns the frontend type: Lincoln Boulevard (Sprint) is 2.
+  const TYPES = ["Sprint", "Circuit", "Sprint", "Lap knockout", "Tollbooth", "Speedtrap", "Checkpoint", "Cash grab",
     "Challenge", "Speedtrap jump", "Milestone jump", "Drift", "Canyon drift", "Canyon duel", "Pursuit tag",
     "Pursuit knockout", "Encounter"];
   const LOBBY_EVERY = 4000;  // the host repeats the lobby, so players who arrive later see it
   const PROGRESS_EVERY = 250;
-  const GO_AFTER = 60000;    // the host lets everyone go even if someone never loads
+  const LOAD_TIMEOUT = 60000;
   const FORGET = 15000;      // a lobby nobody repeats is gone
 
   let active = false, me = 0;
@@ -83,7 +84,7 @@
       caughtType: u32[at(0x274)], caughtOpts: Array.from(u8.subarray(p + 0x278, p + 0x2a0)),
       place: u32[at(0x2a0)], laps: u32[at(0x2a4)], done: u32[at(0x2a8)], pct: f32[at(0x2ac)], time: f32[at(0x2b0)],
       loaded: u32[at(0x2b8)], session: u32[at(0x2bc)], lapPct: f32[at(0x2c0)], cp: u32[at(0x2c4)], ms: u32[at(0x2c8)],
-      rows: [],
+      flow: u32[at(0x2cc)] & 255, waitingResult: !!(u32[at(0x2cc)] & 256), rows: [],
     };
     for (let i = 0; i < Math.min(u32[at(0x2b4)], MAX_ROWS); i++) {
       const o = ROW0 + i * ROW;
@@ -112,7 +113,10 @@
     return true;
   }
   // Session, flags, us, the other players, launch and go (RacePage in race.h).
+  let nativeEncounterOwnsPage=!!globalThis.carbonEncounterSession;
+  addEventListener("carbon-encounter-session",e=>{nativeEncounterOwnsPage=e.detail===true;if(!nativeEncounterOwnsPage)tellGame();});
   function tellGame() {
+    if(nativeEncounterOwnsPage)return;
     page((w) => {
       const others = race ? race.roster.filter((r) => r.id !== me) : [];
       const mine = race?.roster.find((r) => r.id === me);
@@ -121,8 +125,8 @@
       w.u32(0x08, me);
       w.u32(0x0c, mine ? mine.grid : 0);
       w.u32(0x10, others.length);
-      w.u32(0x14, race?.went ? race.race : 0);
-      w.u32(0x18, race ? race.race : 0);
+      w.u32(0x14, race?.went || race?.cancelled ? race.race : 0);
+      w.u32(0x18, race && !race.cancelled ? race.race : 0);
       w.u32(0x1c, race ? race.key : 0);
       w.bytes(0x20, race ? race.opts : [], 40);
       for (let i = 0; i < MAX_PEERS; i++) {
@@ -192,9 +196,11 @@
       draw();
     } else if (m.k === "cancel") {
       invites.delete(m.race);
-      if (race && race.race === m.race && race.host === from && !race.launched) { race = null; tellGame(); }
+      if (race && race.race === m.race && race.host === from && !race.went) cancelLoading();
       draw();
     } else if (m.k === "start") {
+      // Relay duplicates and another lobby must not replace an in-flight race.
+      if (race) return;
       invites.delete(m.race);
       const r = roster(m.roster), opts = unhex(m.opts);
       if (!r || !opts || !uint(m.key)) return;
@@ -209,15 +215,15 @@
       tellGame();
       draw();
     } else if (m.k === "ready") {
-      if (race && race.race === m.race) {
+      if (race && !race.cancelled && race.race === m.race && race.roster.some((r) => r.id === from)) {
         race.ready.add(from);
         maybeGo();
         draw();
       }
     } else if (m.k === "go") {
-      if (race && race.race === m.race && from === race.host && !race.went) { race.went = true; tellGame(); draw(); }
+      if (race && !race.cancelled && race.race === m.race && from === race.host && !race.went) { race.went = true; tellGame(); draw(); }
     } else if (m.k === "progress" || m.k === "finish") {
-      if (!race || race.race !== m.race || !standings.has(from)) return;
+      if (!race || race.cancelled || !race.went || race.race !== m.race || !standings.has(from)) return;
       const s = standings.get(from);
       if (m.k === "progress") {
         for (const k of ["place", "lap", "cp"]) if (Number.isInteger(m[k]) && m[k] >= 0 && m[k] < 100) s[k] = m[k];
@@ -245,17 +251,23 @@
   }
   let pendingJoin = 0;
 
-  // The host: everyone is loaded (or the wait is over): go.
+  // Only the roster's explicit ready messages can release the shared start.
   function maybeGo() {
-    if (!race || race.host !== me || race.wentSent) return;
-    const here = new Set([me, ...(window.recompOnlineState?.people || []).map((p) => p.id)]);
-    const waiting = race.roster.filter((r) => here.has(r.id) && !race.ready.has(r.id));
-    if (waiting.length && performance.now() - race.startedAt < GO_AFTER) return;
+    if (!race || race.cancelled || race.host !== me || race.wentSent) return;
+    if (race.roster.some((r) => !race.ready.has(r.id))) return;
     race.wentSent = true;
     send("go", { race: race.race });
   }
 
   // ---- Actions ----
+  function cancelLoading() {
+    if (!race || race.went || race.cancelled) return;
+    race.cancelled = true;
+    // Release an already loaded game, but never launch a queued race later.
+    // This is an abandoned race; neither client may publish a result for it.
+    tellGame();
+    draw();
+  }
   function host(on) {
     hosting = on;
     if (!on && lobby) cancelLobby();
@@ -275,8 +287,10 @@
     send("start", { ...lobbyFields(l), roster: l.roster.map((r, grid) => ({ id: r.id, name: r.name, car: r.car, grid })) });
   }
   function join(inv) {
+    const g = game(), car = g?.car;
+    if (race || lobby || !uint(car) || g.flow !== 3) return;
     pendingJoin = inv.race;
-    send("join", { race: inv.race, car: game()?.car || 0 });
+    send("join", { race: inv.race, car });
     inv.joined = true;
     draw();
   }
@@ -292,6 +306,14 @@
     const g = game();
     const now = performance.now();
     for (const [k, inv] of invites) if (now - inv.at > FORGET) invites.delete(k);
+    // A stalled native writer must not disable the page's loading timeout.
+    // Give the host time to announce its decision before a disconnected guest
+    // falls back to local cancellation (still before the native 120 s release).
+    const loadLimit = race?.host === me ? LOAD_TIMEOUT : LOAD_TIMEOUT + 30000;
+    if (race && !race.went && !race.cancelled && now - race.startedAt >= loadLimit) {
+      if (race.host === me) send("cancel", { race: race.race });
+      cancelLoading();
+    }
     if (!g) return;
     // The host pressed Start in the Quick Race menu: the lobby opens.
     if (lastCaught < 0) lastCaught = g.caught;
@@ -313,17 +335,18 @@
     }
     if (race) {
       if (!race.launched && g.session === race.race && g.phase >= PHASE.launched) race.launched = true;
-      if (g.phase >= PHASE.holding && !race.readySent && g.session === race.race) {
+      if (!race.cancelled && g.phase >= PHASE.holding && !race.readySent && g.session === race.race) {
         race.readySent = true;
         send("ready", { race: race.race });
       }
       if (race.host === me) maybeGo();
-      if (g.phase >= PHASE.racing && now - lastProgress > PROGRESS_EVERY) {
+      const current = !race.cancelled && race.went && g.session === race.race && g.phase >= PHASE.racing;
+      if (current && now - lastProgress > PROGRESS_EVERY) {
         lastProgress = now;
         send("progress", { race: race.race, place: g.place, lap: g.laps, cp: g.cp, pct: Math.round(g.pct * 1000) / 1000,
                            lp: Math.round(g.lapPct * 1000) / 1000, rt: Math.round(g.time * 1000) / 1000, ms: g.ms });
       }
-      if (g.done && g.time > 0 && finishSent !== race.race) {
+      if (current && g.done && g.time > 0 && finishSent !== race.race) {
         finishSent = race.race;
         send("finish", { race: race.race, time: Math.round(g.time * 1000) / 1000 });
       }
@@ -331,9 +354,11 @@
       if (race.launched && g.phase === PHASE.idle && lastPhase !== PHASE.idle) {
         race.over = now;
       }
-      if (race.over && now - race.over > 20000) { race = null; tellGame(); }
+      if (race.over) { race = null; tellGame(); }
       checkList(g);
     }
+    const cardState = `${g.flow}:${g.car}:${g.waitingResult}`;
+    if (cardState !== lastCardState) { lastCardState = cardState; draw(); }
     lastPhase = g.phase;
     drawBoard(g);
   }
@@ -391,7 +416,7 @@
   @keyframes crc-in { from { opacity: 0; translate: 8px 0; } }
   @media (prefers-reduced-motion: reduce) { .crc-card { animation: none; } }
   `;
-  let root, card, board;
+  let root, card, board, lastCardState = "";
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -417,7 +442,19 @@
     card.replaceChildren();
     const inv = [...invites.values()].sort((a, b) => b.at - a.at)[0];
     const g = game();
-    if (race && !race.went) {
+    if (race?.cancelled) {
+      card.append(el("h2", null, "Race cancelled"));
+      card.append(el("p", null, "Not everyone was ready. No shared result will be recorded."));
+      card.append(el("div", "crc-note", race.launched
+        ? "Use F9 → Quit to the start page to leave this race."
+        : "Return to the game's menus before joining another race."));
+      if (!race.launched || g?.phase === PHASE.idle)
+        card.append(button("Dismiss", () => { race = null; tellGame(); draw(); }));
+    } else if (race && g?.waitingResult && g.session === race.race) {
+      card.append(el("h2", null, "Waiting for race results"));
+      card.append(el("p", null, "Your finish time is recorded. Waiting for the other players to finish."));
+      card.append(el("div", "crc-note", "If a player cannot finish, use F9 → Quit to the start page. No shared winner is confirmed until all finish times arrive."));
+    } else if (race && !race.went) {
       const host = race.roster.find((r) => r.id === race.host);
       card.append(el("h2", null, "Race together"));
       const p = el("p");
@@ -442,14 +479,16 @@
       row.append(button(lobby.roster.length > 1 ? `Start · ${lobby.roster.length} players` : "Start alone", startLobby, true),
                  button("Cancel", cancelLobby));
       card.append(row, el("div", "crc-note", "Friends in this room can join now, from the game's menus."));
-    } else if (inv) {
+    } else if (inv && !race) {
       const joined = !!inv.joined;
       card.append(el("h2", null, "Race together"));
       const p = el("p");
       p.append(el("b", null, inv.name || "A player"), " started a race: ", el("b", null, what(inv)), inv.ai ? " (with AI)" : "");
       card.append(p, names(inv.roster));
       const row = el("div", "crc-row");
-      row.append(joined ? button("Leave", () => leave(inv)) : button("Join", () => join(inv), true),
+      const joinButton = joined ? button("Leave", () => leave(inv)) : button(g?.car && g.flow === 3 ? "Join" : "Return to main menu", () => join(inv), true);
+      joinButton.disabled = !joined && (!g?.car || g.flow !== 3);
+      row.append(joinButton,
                  button("Not now", () => { invites.delete(inv.race); if (inv.joined) leave(inv); draw(); }));
       card.append(row, el("div", "crc-note", joined ? `Joined · waiting for ${inv.name || "the host"} to start`
         : "Join from the game's menus; F9 lists it too."));
@@ -470,11 +509,11 @@
   let boardKey = "";
   function drawBoard(g = game()) {
     if (!root) return;
-    const show = race && race.went && g && g.phase >= PHASE.racing - 1;
+    const show = race && !race.cancelled && race.went && g && g.session === race.race && g.phase >= PHASE.racing;
     if (!show) { board.hidden = true; boardKey = ""; return; }
-    const list = [...standings].map(([id, s]) => ({ id, ...s }));
     const mine = standings.get(me);
     if (mine && g) { mine.place = g.place; mine.lap = g.laps; mine.pct = g.pct; mine.t = g.time; if (g.done) { mine.done = true; mine.time = g.time; } }
+    const list = [...standings].map(([id, s]) => ({ id, ...s }));
     // Finished first, by time; then by progress.
     list.sort((a, b) => (b.done - a.done) || (a.done ? a.time - b.time : b.pct - a.pct));
     const lead = list[0];
