@@ -8,6 +8,10 @@ Game features, performance improvements, and bug fixes for NFS Carbon in the bro
 - HyperX Cloud headset media controls no longer occupy the game controller slot.
 - Controller check confirms the displayed device matches the controller used by the game.
 
+### Chat
+- Removed the preset quick-chat menu; Y opens typed chat directly.
+- Added scrollable session chat history and recent messages.
+
 ### Startup and reports
 - Retry startup once when the browser changes its downloaded-game storage handles.
 - Give save-preserving recovery instructions when startup storage remains unavailable.
