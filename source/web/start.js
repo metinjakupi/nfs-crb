@@ -109,6 +109,7 @@
   .cs-state.ready .cs-dot { background: var(--cyan); color: var(--cyan); }
   .cs-state.bad .cs-dot { background: #ff5d7a; color: #ff5d7a; }
   .cs-note { color: var(--dim); font-size: 13px; }
+  .cs-play-status:empty { display: none; }
   .cs-mode { color: var(--ink); font-size: 14px; }
   .cs-mode b { color: var(--cyan); font-weight: 600; }
   .cs-btn { font: italic 800 15px/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .14em;
@@ -222,6 +223,7 @@
           <div class="cs-state"><span class="cs-dot"></span><span class="cs-state-text">Checking your game files…</span></div>
           <div class="cs-actions"><button class="cs-btn big cs-go" disabled><span>Play<span class="cs-key">Enter</span></span></button><button class="cs-btn cs-local"><span>Use local game folder</span></button></div>
           <div class="cs-note cs-local-status" role="status"></div>
+          <div class="cs-note cs-play-status" role="status" aria-live="polite"></div>
           <div class="cs-mode"></div>
           <div class="cs-note cs-slot"></div>
         </section>
@@ -431,13 +433,15 @@
 
   // For the start page's add-ons (saves.js draws its panel into .cs-ext[data-for=saves]):
   // this window's save slot and the folder the player page will use for it.
-  // After online.js, so server() already has the internet server's key. Resolves when
-  // language.js has run (or failed): Play needs its prepareLanguage, even right after a reload.
+  // After online.js, so server() already has the internet server's key.
   const languageReady = Promise.all([slotReady, serversReady]).then(() => {
     window.recompStartPage = {
       slot, store, panel: (id) => root.querySelector(`.cs-ext[data-for="${id}"]`),
       profileFolder: slot > 1 ? `profile-${slot}` : "profile", server: () => SERVERS[serverEl.value],
       gameFolder, entry,
+      playStarting: () => starting,
+      // saves.js sets restoring while it replaces the save.
+      restoring: false,
       async prepareProfile() {
         await (await navigator.storage.getDirectory()).getDirectoryHandle(game.id, { create: true });
         return profileFolder(game.id, slot > 1 ? String(slot) : null);
@@ -451,7 +455,7 @@
     const languageLoaded = new Promise(resolve => {
       const language = document.createElement("script");
       language.src = "language.js";
-      const timeout = setTimeout(resolve, 5000); // a stalled add-on must not hold up Play
+      const timeout = setTimeout(resolve, 5000);
       language.onload = () => { clearTimeout(timeout); resolve(); };
       language.onerror = () => { clearTimeout(timeout); language.remove(); resolve(); };
       document.body.append(language);
@@ -943,24 +947,32 @@
   const reflectionsHalfOnce = (folder) =>
     settingOnce(folder, REFLECTION_DEFAULT_MARK, "g_CarEnvironmentMapEnable", (level) => (level > 2 ? 2 : undefined));
   let starting = false;
+  const playStatus = $(".cs-play-status");
+  function setStarting(value, message = "") {
+    starting = value;
+    playStatus.textContent = value ? "Getting the game ready…" : message;
+    dispatchEvent(new Event("recomp-play-state"));
+  }
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
-    // Taken before the first wait: a second click or Enter while the settings and the
-    // language are written must not start the game twice.
-    starting = true;
-    let identity, name;
+    if (window.recompStartPage?.restoring) { playStatus.textContent = "Wait a moment: your save is being written."; return; }
+    // Set before the first wait, so a second click or Enter cannot start the game twice.
+    setStarting(true);
+    let identity, name, problem = "";
     try {
       await slotReady;
       await serversReady;
       if (!slot) return;
       await languageReady;
-      try { await window.recompStartPage?.flushSettings?.(); } catch { return; }
-      try { await window.recompStartPage?.prepareLanguage?.(); } catch { return; }
+      try { await window.recompStartPage?.flushSettings?.(); }
+      catch { problem = "Your settings could not be saved. Reload the page to try again."; return; }
+      try { await window.recompStartPage?.prepareLanguage?.(); }
+      catch { problem = "The game language could not be saved. Reload the page to try again."; return; }
       name = nameEl.value.trim();
       if (on.checked && !name) { ask(); return; }
       identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
     } finally {
-      if (!identity?.ok) starting = false;
+      if (!identity?.ok) setStarting(false, problem);
     }
     if (!identity.ok) return;
     if (!restoring && fullEl.checked && document.documentElement.requestFullscreen)
