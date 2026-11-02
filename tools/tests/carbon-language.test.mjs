@@ -8,7 +8,6 @@ const KEY = 'HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Need for Speed Carbo
 const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
 const notFound = () => Object.assign(new Error('missing'), { name: 'NotFoundError' });
 
-// A small OPFS: folders are Maps, files are { text }.
 function folder(tree = {}) {
   const items = new Map();
   for (const [name, value] of Object.entries(tree))
@@ -32,18 +31,24 @@ function folder(tree = {}) {
   return dir;
 }
 
-async function startPage({ files = {}, registry, manifest, failWrites = false, stall = false, hooks = {} } = {}) {
-  const profile = {};
-  if (registry !== undefined) profile['registry.json'] = typeof registry === 'string' ? registry : JSON.stringify(registry);
-  const root = folder({ nfsc: { game: files, profile } });
-  const profileDir = root.items.get('nfsc').items.get('profile');
-  profileDir.failWrites = failWrites;
+// slot > 1: `main` is the main save that prepareProfile copies; `registry` means the copy exists.
+async function startPage({ files = {}, registry, main, slot = 1, manifest, manifestReady, failWrites = false, stall = false, hooks = {} } = {}) {
+  const json = value => typeof value === 'string' ? value : JSON.stringify(value);
+  const folderName = slot > 1 ? `profile-${slot}` : 'profile';
+  const profiles = { profile: main !== undefined ? { 'registry.json': json(main) } : {} };
+  if (registry !== undefined) profiles[folderName] = { 'registry.json': json(registry), ...(slot > 1 ? { '.copied': '' } : {}) };
+  const root = folder({ nfsc: { game: files, ...profiles } });
+  const nfsc = root.items.get('nfsc');
+  const profileDir = () => nfsc.items.get(folderName);
+  if (profileDir()) profileDir().failWrites = failWrites;
   const host = { children: [], append(n) { this.children.push(n); } };
   const select = { value: '', options: [], listeners: [], append(o) { this.options.push(o); }, addEventListener(_, fn) { this.listeners.push(fn); } };
   const note = { textContent: '' };
-  const locks = [];
+  let prepared = 0, playing = false;
+  const playListeners = [];
   const page = {
     ...hooks,
+    slot, profileFolder: folderName,
     panel: id => id === 'language' ? host : null,
     gameFolder: async () => (await root.getDirectoryHandle('nfsc')).getDirectoryHandle('game'),
     async entry(dir, ...parts) {
@@ -54,16 +59,27 @@ async function startPage({ files = {}, registry, manifest, failWrites = false, s
       }
       return dir;
     },
-    prepareProfile: async () => 'profile',
+    async prepareProfile() {
+      prepared++;
+      await new Promise(r => setImmediate(r));
+      const own = await nfsc.getDirectoryHandle(folderName, { create: true });
+      if (slot > 1 && !own.items.has('.copied')) {
+        for (const [name, item] of nfsc.items.get('profile').items) if (item.kind === 'file') own.items.set(name, { ...item });
+        own.items.set('.copied', { kind: 'file', text: '' });
+      }
+      return folderName;
+    },
+    playStarting: () => playing,
   };
   const controller = new AbortController();
   const scope = {
     window: { recompStartPage: page, recompGame: { id: 'nfsc', streamAssets: !!manifest, downloadManifest: manifest ? 'https://assets.example/manifest.json' : '' } },
-    navigator: { storage: { getDirectory: async () => root }, locks: { request: async (name, fn) => { locks.push(name); return fn(); } } },
+    navigator: { storage: { getDirectory: async () => root } },
+    addEventListener: (type, fn) => { if (type === 'recomp-play-state') playListeners.push(fn); },
     document: { createElement: () => ({ set innerHTML(_) {}, querySelector: s => s === 'select' ? select : note }) },
     fetch: async (_, { signal } = {}) => {
-      // stalled: answers only when aborted, and never without a signal
       if (stall) return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+      await manifestReady;
       return { ok: true, json: async () => ({ files: (manifest || []).map(path => ({ path, size: 1 })) }) };
     },
     AbortSignal: { timeout: () => controller.signal },
@@ -72,10 +88,11 @@ async function startPage({ files = {}, registry, manifest, failWrites = false, s
   };
   vm.runInNewContext(source, scope);
   await settle();
-  const saved = () => { const f = profileDir.items.get('registry.json'); return f ? JSON.parse(f.text) : undefined; };
+  const saved = () => { const f = profileDir()?.items.get('registry.json'); return f ? JSON.parse(f.text) : undefined; };
   const choose = async prefix => { select.value = prefix; for (const fn of select.listeners) fn(); await settle(); };
-  const replace = value => profileDir.items.set('registry.json', { kind: 'file', text: JSON.stringify(value) });
-  return { page, host, select, note, saved, choose, locks, replace, abort: () => controller.abort() };
+  const replace = value => profileDir().items.set('registry.json', { kind: 'file', text: JSON.stringify(value) });
+  const play = value => { playing = value; for (const fn of playListeners) fn(); };
+  return { page, host, select, note, saved, choose, replace, play, prepared: () => prepared, abort: () => controller.abort() };
 }
 
 const both = { LANGUAGES: { 'ENGLISH_FRONTEND.BIN': 'en', 'FRENCH_FRONTEND.BIN': 'fr', 'LABELS.BIN': 'x' } };
@@ -87,7 +104,6 @@ test('French in the game files is offered and saved as Carbon\'s Language value,
   await p.choose('FRENCH');
   assert.deepEqual(p.saved(), { [KEY]: { g_Brightness: { type: 4, data: 52 }, Language: { type: 1, data: 'French' } } });
   assert.match(p.note.textContent, /Français is saved/);
-  assert.deepEqual(p.locks, ['nfsc:registry:profile']);
   await p.page.prepareLanguage();
   assert.equal(p.saved()[KEY].Language.data, 'French');
 });
@@ -178,5 +194,36 @@ test('a hosted manifest that never answers gives up, and Play keeps the saved la
   assert.equal(done, false);
   p.abort();
   await play;
+  assert.deepEqual(p.saved(), french);
+});
+
+test('the list is locked while Play gets the game ready, and usable again when Play stops', async () => {
+  const p = await startPage({ files: both });
+  assert.equal(p.select.disabled, false);
+  p.play(true);
+  assert.equal(p.select.disabled, true);
+  p.play(false);
+  assert.equal(p.select.disabled, false);
+});
+
+test('Play pressed while the languages are still being found prepares the save folder once', async () => {
+  let ready;
+  const manifestReady = new Promise(r => { ready = r; });
+  const p = await startPage({ manifest: ['LANGUAGES/ENGLISH_FRONTEND.BIN', 'LANGUAGES/FRENCH_FRONTEND.BIN'], manifestReady });
+  const play = p.page.prepareLanguage();
+  ready();
+  await play;
+  await settle();
+  assert.equal(p.select.options.length, 2);
+  assert.equal(p.prepared(), 1);
+});
+
+test('a window not played yet shows the main save\'s language and is copied from it only by Play', async () => {
+  const french = { [KEY]: { Language: { type: 1, data: 'French' }, SIZE: { type: 4, data: 100 } } };
+  const p = await startPage({ files: both, slot: 2, main: french });
+  assert.equal(p.select.value, 'FRENCH');
+  assert.equal(p.prepared(), 0);
+  assert.equal(p.saved(), undefined);
+  await p.page.prepareLanguage();
   assert.deepEqual(p.saved(), french);
 });
