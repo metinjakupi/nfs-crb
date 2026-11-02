@@ -32,7 +32,7 @@ function folder(tree = {}) {
   return dir;
 }
 
-async function startPage({ files = {}, registry, manifest, failWrites = false } = {}) {
+async function startPage({ files = {}, registry, manifest, failWrites = false, stall = false, hooks = {} } = {}) {
   const profile = {};
   if (registry !== undefined) profile['registry.json'] = typeof registry === 'string' ? registry : JSON.stringify(registry);
   const root = folder({ nfsc: { game: files, profile } });
@@ -43,6 +43,7 @@ async function startPage({ files = {}, registry, manifest, failWrites = false } 
   const note = { textContent: '' };
   const locks = [];
   const page = {
+    ...hooks,
     panel: id => id === 'language' ? host : null,
     gameFolder: async () => (await root.getDirectoryHandle('nfsc')).getDirectoryHandle('game'),
     async entry(dir, ...parts) {
@@ -55,11 +56,17 @@ async function startPage({ files = {}, registry, manifest, failWrites = false } 
     },
     prepareProfile: async () => 'profile',
   };
+  const controller = new AbortController();
   const scope = {
     window: { recompStartPage: page, recompGame: { id: 'nfsc', streamAssets: !!manifest, downloadManifest: manifest ? 'https://assets.example/manifest.json' : '' } },
     navigator: { storage: { getDirectory: async () => root }, locks: { request: async (name, fn) => { locks.push(name); return fn(); } } },
     document: { createElement: () => ({ set innerHTML(_) {}, querySelector: s => s === 'select' ? select : note }) },
-    fetch: async () => ({ ok: true, json: async () => ({ files: (manifest || []).map(path => ({ path, size: 1 })) }) }),
+    fetch: async (_, { signal } = {}) => {
+      // stalled: answers only when aborted, and never without a signal
+      if (stall) return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+      return { ok: true, json: async () => ({ files: (manifest || []).map(path => ({ path, size: 1 })) }) };
+    },
+    AbortSignal: { timeout: () => controller.signal },
     Option: class { constructor(label, value) { this.label = label; this.value = value; } },
     console: { warn() {} }, Error, JSON, Object, Array, Set, String, Promise,
   };
@@ -67,7 +74,8 @@ async function startPage({ files = {}, registry, manifest, failWrites = false } 
   await settle();
   const saved = () => { const f = profileDir.items.get('registry.json'); return f ? JSON.parse(f.text) : undefined; };
   const choose = async prefix => { select.value = prefix; for (const fn of select.listeners) fn(); await settle(); };
-  return { page, host, select, note, saved, choose, locks };
+  const replace = value => profileDir.items.set('registry.json', { kind: 'file', text: JSON.stringify(value) });
+  return { page, host, select, note, saved, choose, locks, replace, abort: () => controller.abort() };
 }
 
 const both = { LANGUAGES: { 'ENGLISH_FRONTEND.BIN': 'en', 'FRENCH_FRONTEND.BIN': 'fr', 'LABELS.BIN': 'x' } };
@@ -131,4 +139,44 @@ test('a choice that could not be saved stops Play', async () => {
   await p.choose('FRENCH');
   assert.match(p.note.textContent, /could not be saved/);
   await assert.rejects(p.page.prepareLanguage(), /disk full/);
+});
+
+test('a restored backup waits for the choice being written, then shows its own language; earlier restore hooks still run', async () => {
+  const calls = [];
+  const hooks = { beforeProfileRestore: async () => calls.push('before'), afterProfileRestore: async () => calls.push('after') };
+  const p = await startPage({ files: both, hooks });
+  p.select.value = 'FRENCH';
+  for (const fn of p.select.listeners) fn();
+  await p.page.beforeProfileRestore();
+  assert.equal(p.saved()[KEY].Language.data, 'French');
+  assert.equal(p.select.disabled, true);
+  p.replace({ [KEY]: { SIZE: { type: 4, data: 100 } } });
+  await p.page.afterProfileRestore();
+  assert.deepEqual(calls, ['before', 'after']);
+  assert.equal(p.select.value, 'ENGLISH');
+  assert.equal(p.select.disabled, false);
+  await p.page.prepareLanguage();
+  assert.deepEqual(p.saved(), { [KEY]: { SIZE: { type: 4, data: 100 } } });
+});
+
+test('a choice that could not be saved no longer stops Play once a backup is restored', async () => {
+  const p = await startPage({ files: both, failWrites: true });
+  await p.choose('FRENCH');
+  await p.page.beforeProfileRestore();
+  p.replace({ [KEY]: { SIZE: { type: 4, data: 100 } } });
+  await p.page.afterProfileRestore();
+  await assert.doesNotReject(p.page.prepareLanguage());
+  assert.doesNotMatch(p.note.textContent, /could not be saved/);
+});
+
+test('a hosted manifest that never answers gives up, and Play keeps the saved language', async () => {
+  const french = { [KEY]: { Language: { type: 1, data: 'French' } } };
+  const p = await startPage({ manifest: ['Carbon/LANGUAGES/ENGLISH_FRONTEND.BIN'], registry: french, stall: true });
+  let done = false;
+  const play = p.page.prepareLanguage().then(() => { done = true; });
+  await settle();
+  assert.equal(done, false);
+  p.abort();
+  await play;
+  assert.deepEqual(p.saved(), french);
 });

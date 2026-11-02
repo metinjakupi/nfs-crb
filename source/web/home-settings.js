@@ -86,14 +86,20 @@
       });
     }
     page.flushSettings = async () => { await pending; if (failed) throw failed; };
+    // language.js has restore hooks too: each add-on calls the one set before it.
+    const before = page.beforeProfileRestore, after = page.afterProfileRestore;
     page.beforeProfileRestore = async () => {
+      await before?.();
       restoring = true; renderValues();
       await pending;
     };
     page.afterProfileRestore = async () => {
-      try { await pending; values = await read(); failed = null; status.textContent = ""; }
-      catch (e) { failed = e; status.textContent = "Your saved settings could not be read. Reload to try again."; }
-      finally { restoring = false; renderValues(); }
+      try { await after?.(); }
+      finally {
+        try { await pending; values = await read(); failed = null; status.textContent = ""; }
+        catch (e) { failed = e; status.textContent = "Your saved settings could not be read. Reload to try again."; }
+        finally { restoring = false; renderValues(); }
+      }
     };
     body.replaceChildren();
     for (const [group, title] of [["game", "Game"], ["display", "Display & graphics"], ["controls", "Controller"]]) {

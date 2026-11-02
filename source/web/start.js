@@ -431,8 +431,9 @@
 
   // For the start page's add-ons (saves.js draws its panel into .cs-ext[data-for=saves]):
   // this window's save slot and the folder the player page will use for it.
-  // After online.js, so server() already has the internet server's key.
-  Promise.all([slotReady, serversReady]).then(() => {
+  // After online.js, so server() already has the internet server's key. Resolves when
+  // language.js has run (or failed): Play needs its prepareLanguage, even right after a reload.
+  const languageReady = Promise.all([slotReady, serversReady]).then(() => {
     window.recompStartPage = {
       slot, store, panel: (id) => root.querySelector(`.cs-ext[data-for="${id}"]`),
       profileFolder: slot > 1 ? `profile-${slot}` : "profile", server: () => SERVERS[serverEl.value],
@@ -447,15 +448,20 @@
     saves.src = "saves.js";
     saves.onerror = () => saves.remove();
     document.body.append(saves);
-    const language = document.createElement("script");
-    language.src = "language.js";
-    language.onerror = () => language.remove();
-    document.body.append(language);
+    const languageLoaded = new Promise(resolve => {
+      const language = document.createElement("script");
+      language.src = "language.js";
+      const timeout = setTimeout(resolve, 5000); // a stalled add-on must not hold up Play
+      language.onload = () => { clearTimeout(timeout); resolve(); };
+      language.onerror = () => { clearTimeout(timeout); language.remove(); resolve(); };
+      document.body.append(language);
+    });
     if (game.streamAssets) {
       const preferences = document.createElement("script");
       preferences.src = "home-settings.js";
       document.body.append(preferences);
     }
+    return languageLoaded;
   });
 
   // A name can be claimed with this save slot's cloud keyphrase. saves.js exposes only the
@@ -939,16 +945,24 @@
   let starting = false;
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
-    await slotReady;
-    await serversReady;
-    if (!slot || starting) return;
-    try { await window.recompStartPage?.flushSettings?.(); } catch { return; }
-    try { await window.recompStartPage?.prepareLanguage?.(); } catch { return; }
-    const name = nameEl.value.trim();
-    if (on.checked && !name) { ask(); return; }
+    // Taken before the first wait: a second click or Enter while the settings and the
+    // language are written must not start the game twice.
     starting = true;
-    const identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
-    if (!identity.ok) { starting = false; return; }
+    let identity, name;
+    try {
+      await slotReady;
+      await serversReady;
+      if (!slot) return;
+      await languageReady;
+      try { await window.recompStartPage?.flushSettings?.(); } catch { return; }
+      try { await window.recompStartPage?.prepareLanguage?.(); } catch { return; }
+      name = nameEl.value.trim();
+      if (on.checked && !name) { ask(); return; }
+      identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
+    } finally {
+      if (!identity?.ok) starting = false;
+    }
+    if (!identity.ok) return;
     if (!restoring && fullEl.checked && document.documentElement.requestFullscreen)
       document.documentElement.requestFullscreen({ keyboardLock: "browser" }).catch(() => {});
     const server = SERVERS[serverEl.value];

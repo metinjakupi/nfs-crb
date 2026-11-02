@@ -10,7 +10,8 @@
 // The registry lives in the slot's profile folder (OPFS <game id>/<profile>/
 // registry.json, see saves.js), and the runtime rewrites that file as a whole
 // while the game runs. This page changes it only from the start page, before
-// Play, under the Web Lock "<game id>:registry:<profile>".
+// Play, under the Web Lock "<game id>:registry:<profile>", and never while
+// saves.js restores a backup (its before/after restore hooks, below).
 //
 // Only languages whose _FRONTEND.BIN is in the game's files are offered: the
 // imported copy in OPFS, or the hosted manifest's file list. Before every Play
@@ -86,7 +87,8 @@
 
   async function gameFiles() {
     if (game.streamAssets && game.downloadManifest) {
-      const response = await fetch(game.downloadManifest, { cache: "no-cache" });
+      // A request that never answers must not hold up Play: no languages then, the saved one stays.
+      const response = await fetch(game.downloadManifest, { cache: "no-cache", signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw Error(`Game manifest: HTTP ${response.status}`);
       const { files } = await response.json();
       return Array.isArray(files) ? files.map(f => String(f?.path || "")) : [];
@@ -143,10 +145,14 @@
     await pending;
     if (failed) throw failed;
     const languages = await detected;
-    try { await update(registry => choose(registry, languages)); }
-    catch (error) { console.warn("[language] the saved language could not be checked:", error); }
+    // Queued like a choice, so a restore that starts meanwhile waits for this write.
+    pending = pending.then(() => update(registry => choose(registry, languages))).catch(error => {
+      console.warn("[language] the saved language could not be checked:", error);
+    });
+    await pending;
   };
 
+  const NOTE = "The game's own translation, from your game files. Applies the next time you press Play.";
   (async () => {
     const languages = await detected;
     if (languages.length < 2) return;
@@ -155,7 +161,7 @@
     const section = document.createElement("div");
     section.innerHTML = `<label class="cs-row" style="margin:14px 0 6px"><span class="cs-label">Game language</span>
       <select class="cs-language"></select></label>
-      <div class="cs-note cs-language-note" role="status" aria-live="polite">The game's own translation, from your game files. Applies the next time you press Play.</div>`;
+      <div class="cs-note cs-language-note" role="status" aria-live="polite">${NOTE}</div>`;
     const select = section.querySelector("select"), note = section.querySelector(".cs-language-note");
     for (const l of languages) select.append(new Option(l.label, l.prefix));
     // A language not offered here stays saved; the list shows English until one is picked.
@@ -172,5 +178,26 @@
       });
     });
     host.append(section);
+
+    // saves.js replaces registry.json when it restores a backup. No choice may be
+    // written meanwhile (it would put the replaced settings back), and the list
+    // then shows the restored language. home-settings.js has these hooks too, so
+    // each add-on calls the one set before it.
+    const before = page.beforeProfileRestore, after = page.afterProfileRestore;
+    page.beforeProfileRestore = async () => {
+      await before?.();
+      select.disabled = true;
+      await pending;
+    };
+    page.afterProfileRestore = async () => {
+      try { await after?.(); }
+      finally {
+        failed = null; // the restore replaced the choice that could not be saved
+        note.textContent = NOTE;
+        try { select.value = (choose(await readRegistry(dir), languages) || DEFAULT).prefix; }
+        catch (error) { console.warn("[language] the restored language could not be read:", error); }
+        select.disabled = false;
+      }
+    };
   })().catch(error => console.warn("[language]", error));
 })();
