@@ -231,6 +231,7 @@
           <div class="cs-actions" style="margin-top:12px">
             <a class="cs-btn cs-manage" href="${game.streamAssets ? "../manage.html" : "../"}"><span>${game.downloadManifest ? "Manage game files" : "Import or manage"}</span></a>
           </div>
+          <div class="cs-ext" data-for="language"></div>
         </section>
         <div class="cs-ext" data-for="saves"></div>
         <section class="cs-panel">
@@ -446,6 +447,10 @@
     saves.src = "saves.js";
     saves.onerror = () => saves.remove();
     document.body.append(saves);
+    const language = document.createElement("script");
+    language.src = "language.js";
+    language.onerror = () => language.remove();
+    document.body.append(language);
     if (game.streamAssets) {
       const preferences = document.createElement("script");
       preferences.src = "home-settings.js";
@@ -938,6 +943,7 @@
     await serversReady;
     if (!slot || starting) return;
     try { await window.recompStartPage?.flushSettings?.(); } catch { return; }
+    try { await window.recompStartPage?.prepareLanguage?.(); } catch { return; }
     const name = nameEl.value.trim();
     if (on.checked && !name) { ask(); return; }
     starting = true;
