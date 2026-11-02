@@ -290,10 +290,10 @@ if(TARGET recomp_gen)
     configure_file(${POP_ROOT}/web/player/lan.js ${POP_OUT}/lan.js COPYONLY)
     # A game's start page (web/start.js), which the player page shows before
     # the game, what the start page loads (web/menu.js, chat.js, radar.js,
-    # saves.js, and online.js: the internet server's address and key, written
+    # saves.js, language.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
+    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js language.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()
