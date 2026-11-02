@@ -439,16 +439,23 @@
   // The card: hosting hint, the host's lobby, an invite, or the race starting.
   function draw() {
     if (!root) return;
+    dispatchEvent(new Event("recomp-race-invitations"));
     card.replaceChildren();
     const inv = [...invites.values()].sort((a, b) => b.at - a.at)[0];
     const g = game();
     if (race?.cancelled) {
       card.append(el("h2", null, "Race cancelled"));
       card.append(el("p", null, "Not everyone was ready. No shared result will be recorded."));
-      card.append(el("div", "crc-note", race.launched
-        ? "Use F9 → Quit to the start page to leave this race."
-        : "Return to the game's menus before joining another race."));
-      if (!race.launched || g?.phase === PHASE.idle)
+      card.append(el("div", "crc-note", "Exit to the start page, then press Play to return to the game."));
+      // Loading may never reach a native menu that can accept Esc. Use the
+      // same exit path as F9 Quit, without depending on the game's readiness.
+      card.append(button("Exit to start page", () => {
+        dispatchEvent(new Event("recomp-quit"));
+        location.replace(location.pathname);
+      }, true));
+      // Hiding the panel must not clear cancellation while a queued launch or
+      // loading hold still owns the native session (including an unreadable block).
+      if (g?.flow === 3 && g.phase === PHASE.idle)
         card.append(button("Dismiss", () => { race = null; tellGame(); draw(); }));
     } else if (race && g?.waitingResult && g.session === race.race) {
       card.append(el("h2", null, "Waiting for race results"));
@@ -589,5 +596,7 @@
   if (window.recompOnline || window.recompOnlineState) wake();
   // For tests: the state, and the actions the buttons run.
   window.recompRace = { state: () => ({ me, hosting, lobby, invites: [...invites.values()], race, standings: [...standings], game: game() }),
-                        host, startLobby, cancelLobby, join: () => { const i = [...invites.values()].pop(); if (i) join(i); } };
+                        host, startLobby, cancelLobby,
+                        join: (raceId) => { const i = raceId == null ? [...invites.values()].pop() : invites.get(raceId); if (i) join(i); },
+                        leave: (raceId) => { const i = invites.get(raceId); if (i?.joined) leave(i); } };
 })();

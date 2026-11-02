@@ -211,7 +211,8 @@
       <div class="cs-col">
         <section class="cs-panel cs-play">
           <div class="cs-state"><span class="cs-dot"></span><span class="cs-state-text">Checking your game files…</span></div>
-          <div><button class="cs-btn big cs-go" disabled><span>Play<span class="cs-key">Enter</span></span></button></div>
+          <div class="cs-actions"><button class="cs-btn big cs-go" disabled><span>Play<span class="cs-key">Enter</span></span></button><button class="cs-btn cs-local"><span>Use local game folder</span></button></div>
+          <div class="cs-note cs-local-status" role="status"></div>
           <div class="cs-mode"></div>
           <div class="cs-note cs-slot"></div>
         </section>
@@ -230,6 +231,7 @@
             <dt>Esc</dt><dd>pause, menus back</dd>
             <dt>F9 or F10</dt><dd>the menu: settings, full screen, online, quit (fn+F9 on a Mac)</dd>
             <dt>Controller</dt><dd>PS5, PS4 or Xbox: press any button. The touchpad (or Create + Options) opens the menu</dd>
+            <dt>F8</dt><dd>online players, crew and invitations</dd>
             <dt>Y</dt><dd>type a message, when online</dd>
             <dt>H</dt><dd>horn, hold it, when online</dd>
           </dl>
@@ -649,7 +651,7 @@
       ready = true;
       stateEl.classList.add("ready");
       text.textContent = "Ready to play";
-      files.textContent = "Files load automatically.";
+      files.textContent = store.get("localGameFiles", false) ? "Using your imported local files. Import again if you deleted browser data." : "Files load automatically.";
       $(".cs-go").disabled = false;
       hostedLogo().catch(error => console.warn("[start] logo:", error));
       return;
@@ -809,6 +811,53 @@
     play();
   });
 
+  let localOnly = store.get("localGameFiles", false);
+  $(".cs-local").addEventListener("click", async () => {
+    if (starting || window.recompStartPage?.homeBusy) return;
+    const button = $(".cs-local"), status = $(".cs-local-status");
+    if (!window.showDirectoryPicker) {
+      status.textContent = "Folder selection needs desktop Chrome or Edge. You can also import files through Manage game files.";
+      return;
+    }
+    let handle;
+    try { handle = await window.showDirectoryPicker({ id: "game-" + game.id, mode: "read" }); }
+    catch (error) { if (error.name !== "AbortError") status.textContent = error.message; return; }
+    button.disabled = true;
+    $(".cs-go").disabled = true;
+    status.textContent = "Copying your game into browser storage. Keep this page open…";
+    let worker;
+    try {
+      const response = await fetch("../games.json");
+      if (!response.ok) throw Error("Could not read game requirements.");
+      const fullGame = (await response.json()).find(g => g.id === game.id);
+      if (!fullGame) throw Error("Game requirements were not found.");
+      worker = new Worker("../worker.js", { type: "module" });
+      const result = await new Promise((resolve, reject) => {
+        worker.onerror = () => reject(Error("The local import stopped. Please try again."));
+        worker.onmessage = ({data}) => {
+          if (data.progress) {
+            const p = data.progress;
+            status.textContent = `Copying local files: ${p.filesDone} / ${p.filesTotal} · ${p.current || ""}`;
+          } else if (data.id === "local-folder") {
+            if (data.error) reject(Error(data.error)); else resolve(data.result);
+          }
+        };
+        worker.postMessage({ id: "local-folder", cmd: "import", game: fullGame, kind: "handle", handle });
+      });
+      if (result.result !== "done") throw Error("The folder could not be imported (" + result.result + "). Select a complete, compatible Carbon installation.");
+      localOnly = true;
+      store.set("localGameFiles", true);
+      ready = true;
+      $(".cs-files").textContent = "Using your imported local files. No game-file streaming from R2.";
+      status.textContent = "Local files ready. Press Play. Your original folder was not changed.";
+    } catch (error) {
+      status.textContent = "Local import failed: " + error.message;
+    } finally {
+      worker?.terminate();
+      button.disabled = false;
+      $(".cs-go").disabled = !ready;
+    }
+  });
   let starting = false;
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
@@ -822,7 +871,7 @@
     const identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
     if (!identity.ok) { starting = false; return; }
     if (!restoring && fullEl.checked && document.documentElement.requestFullscreen)
-      document.documentElement.requestFullscreen().catch(() => {});
+      document.documentElement.requestFullscreen({ keyboardLock: "browser" }).catch(() => {});
     const server = SERVERS[serverEl.value];
     const room = roomEl.value.trim() || "lobby";
     const key = server.key ? `?key=${encodeURIComponent(server.key)}` : "";
@@ -833,10 +882,14 @@
     // Online gives both: free roam with others (net.js, the relay room) and the game's own
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).
     window.recompBoot({
+      localOnly,
       profile: slot > 1 ? String(slot) : null,
       online: on.checked ? { relay, name, room: roomEl.value.trim(), crew: crewEl.value.trim(), claim: identity.claim, legacy: identity.browser } : null,
       lan: on.checked ? { url: `${server.url}/lan${key}`, name, claim: identity.claim } : null,
     });
+    const hud = document.createElement("script");
+    hud.src = "custom-hud.js";
+    document.body.append(hud);
     for (const src of ["menu.js", "chat.js", "race.js", "worldmap.js", "report.js", "encounter.js"]) { // the in-game menu (F9), chat and horn, the radar, racing together, friends on the world map, Download log / Send report
       const script = document.createElement("script");
       script.src = src;

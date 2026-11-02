@@ -16,11 +16,50 @@
             text-align: center; padding: 0 16px; white-space: pre-line; pointer-events: none; }
   #status a { pointer-events: auto; color: #8cf; }
   #status[hidden] { display: none; }
+  #runtime-loader { position: fixed; inset: 0; z-index: 9; display: grid; place-items: center; padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); background: radial-gradient(ellipse at 50% 20%, #112b3e, #04080d 65%); overflow: auto; box-sizing: border-box; }
+  #runtime-loader[hidden] { display: none; }
+  .cl-panel { width: min(100%, 480px); padding: clamp(24px, 5vw, 40px); box-sizing: border-box; background: #09141ee8; border: 1px solid #263c4b; border-top: 2px solid #6adce6; box-shadow: 0 24px 100px #0007; color: #eaf6fb; text-align: left; }
+  .cl-kicker { margin: 0 0 20px; color: #7edfe8; letter-spacing: .18em; font-size: 11px; font-weight: 700; }
+  .cl-panel h1 { margin: 0 0 12px; font-size: clamp(25px, 5vw, 34px); line-height: 1.15; letter-spacing: -.03em; }
+  #cl-message { min-height: 3em; margin: 0 0 28px; color: #a6bbc9; font-size: 14px; line-height: 1.5; }
+  .cl-label { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; margin: 20px 0 9px; font-size: 13px; }
+  .cl-label span:last-child { color: #91aebb; text-align: right; font-variant-numeric: tabular-nums; }
+  .cl-panel progress { display: block; width: 100%; height: 5px; border: 0; border-radius: 0; appearance: none; background: #1b2d3b; color: #6adce6; overflow: hidden; }
+  .cl-panel progress::-webkit-progress-bar { background: #1b2d3b; }
+  .cl-panel progress::-webkit-progress-value { background: linear-gradient(90deg, #2281b4, #7ce8e4); }
+  .cl-panel progress::-moz-progress-bar { background: #6adce6; }
+  .cl-panel progress:indeterminate { background: linear-gradient(90deg, #1b2d3b 20%, #4fbdc9 50%, #1b2d3b 80%); background-size: 200% 100%; animation: cl-wait 2s linear infinite; }
+  .cl-panel progress:indeterminate::-webkit-progress-bar { background: transparent; }
+  .cl-prepare { display: flex; justify-content: space-between; gap: 14px; margin-top: 25px; padding-top: 18px; border-top: 1px solid #233642; color: #a6bbc9; font-size: 13px; }
+  .cl-footer { margin: 28px 0 0; color: #76909f; font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+  #cl-reload { min-height: 44px; margin-top: 18px; padding: 10px 18px; background: #173340; color: #eaf6fb; border: 1px solid #537987; font: inherit; cursor: pointer; }
+  #cl-reload[hidden] { display: none; }
+  #cl-reload:hover { background: #244956; } #cl-reload:active { background: #315b68; }
+  #cl-reload:focus-visible { outline: 2px solid #91f5ed; outline-offset: 4px; }
+  @keyframes cl-wait { to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .cl-panel progress:indeterminate { animation: none; } }
 </style>
 </head>
 <body>
 <canvas id="canvas" tabindex="-1"></canvas>
 <div id="status">Loading…</div>
+<section id="runtime-loader" hidden aria-labelledby="cl-title">
+  <div class="cl-panel">
+    <p class="cl-kicker">STARTING GAME</p>
+    <h1 id="cl-title">Loading your game</h1>
+    <p id="cl-message" role="status" aria-live="polite">Game data and game code load separately.</p>
+    <div class="cl-label"><span>Game data</span><span id="cl-data-text">Waiting…</span></div>
+    <progress id="cl-data" max="1" aria-label="Game data loading"></progress>
+    <div class="cl-label"><span>Game code</span><span id="cl-code-text">Waiting…</span></div>
+    <progress id="cl-code" max="1" aria-label="Game code loading"></progress>
+    <div class="cl-prepare"><span>Preparing game</span><span id="cl-prepare-text">Waiting</span></div>
+    <p class="cl-footer"><span id="cl-elapsed">0:00 elapsed</span><br>Your saves and settings are kept.</p>
+    <button id="cl-reload" type="button" hidden>Reload game</button>
+  </div>
+</section>
+
+<script>if (document.documentElement.dataset.gameId) window.recompSite = true;</script>
+<script src="report.js"></script>
 <script>
 "use strict";
 const canonicalRedirect = location.hostname.endsWith(".");
@@ -29,20 +68,25 @@ if (canonicalRedirect) {
   canonical.hostname = canonical.hostname.slice(0, -1);
   location.replace(canonical.href);
 }
+const graphicsRecovery = new URLSearchParams(location.search).get("graphicsRecovery") === "1";
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("canvas");
 let gameRunning = false;
 let statusFailed = false;
+let runtimeLoader = null;
 let startupPhase = "start page";
 window.recompStartupPhase = startupPhase;
 function startup(phase) {
   startupPhase = phase;
   window.recompStartupPhase = phase;
+  diagnostics.phases.push({ phase, at: new Date().toISOString() });
+  if (diagnostics.phases.length > 30) diagnostics.phases.shift();
 }
 function status(text, back, backText = "Back to game") {
   // Startup progress must not cover play or erase a fatal error.
   if (!back && (gameRunning || statusFailed)) return;
-  if (back) statusFailed = true;
+  if (back) { statusFailed = true; stopRuntimeLoader(); }
+  else if (runtimeLoader?.active) { renderRuntimeLoader(); return; }
   statusEl.textContent = text;
   if (back) {
     const a = document.createElement("a");
@@ -66,19 +110,34 @@ function offerReport() {
 const log = [];
 window.recompLog = log; // for tests
 
+// Keep early failures even when report.js has not loaded yet.
+const diagnostics = window.carbonDiagnostics = { phases: [], failures: [], adapterRequests: [], downloads: [] };
+function errorDetails(error) {
+  if (typeof error === "string") return { name: "String", message: error.slice(0, 2000), stack: "" };
+  let message;
+  try { message = error?.message || JSON.stringify(error); } catch {}
+  return { name: String(error?.name || typeof error), message: String(message || error || "Unknown error").slice(0, 2000),
+    stack: String(error?.stack || "").slice(0, 5000), cause: error?.cause ? String(error.cause?.message || error.cause).slice(0, 1000) : undefined };
+}
+function diagnosticUrl(value) {
+  try { const u = new URL(value, location.href); return u.origin + u.pathname; } catch { return ""; }
+}
+function noteDownload(record) {
+  diagnostics.downloads.push({ at: new Date().toISOString(), ...record });
+  if (diagnostics.downloads.length > 20) diagnostics.downloads.shift();
+}
 let reportingFailure = false;
-function reportFailure(kind, error) {
-  const message = String(error?.message || error || "Unknown startup error");
-  window.recompFailure ||= { kind, message: message.slice(0, 1000), stack: String(error?.stack || "").slice(0, 5000) };
-  status(`The game stopped: ${message}`, true, kind === "startup-storage" ? "Open game page" : "Back to game");
+function reportFailure(kind, error, extra = {}) {
+  const detail = { kind, ...errorDetails(error), ...extra, phase: startupPhase, at: new Date().toISOString() };
+  diagnostics.failures.push(detail);
+  if (diagnostics.failures.length > 20) diagnostics.failures.shift();
+  window.recompFailure ||= detail;
   if (reportingFailure) return;
   reportingFailure = true;
-  const record = {
-    kind, message: message.slice(0, 1000),
-    stack: String(error?.stack || [...log].reverse().find(t => String(t).includes("\n    at ")) || "").slice(0, 5000),
-    game: location.pathname, time: new Date().toISOString(), phase: startupPhase,
-    log: log.slice(-20).map(t => String(t).slice(0, 300)),
-  };
+  const message = detail.message;
+  status(`The game stopped: ${message}`, true, kind === "startup-storage" ? "Open game page" : "Back to game");
+  const record = { ...detail, game: location.pathname,
+    log: log.slice(-20).map(t => String(t).slice(0, 300)) };
   fetch("/_runtime-diagnostics", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(record), keepalive: true,
@@ -89,6 +148,68 @@ function humanBytes(bytes) {
   const units = ["B", "KiB", "MiB", "GiB"];
   while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
   return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+function stopRuntimeLoader() {
+  if (runtimeLoader) { runtimeLoader.active = false; clearInterval(runtimeLoader.timer); runtimeLoader.observer?.disconnect(); }
+  document.getElementById("runtime-loader").hidden = true;
+}
+function beginRuntimeLoader() {
+  const now = Date.now();
+  runtimeLoader = { active: true, started: now, data: {received: 0, total: Number(window.recompPageBuild?.dataBytes)||0, done: false},
+    code: {received: 0, total: 0, done: false, lastAt: now, prepared: false}, retry: "" };
+  document.getElementById("cl-reload").onclick = () => location.reload();
+  if (typeof PerformanceObserver !== "undefined") {
+    runtimeLoader.observer = new PerformanceObserver(list => {
+      const l = runtimeLoader;
+      if (!l?.active || !l.code.url) return;
+      for (const entry of list.getEntries()) {
+        if (entry.name !== l.code.url || entry.startTime < l.code.requestAt || !(entry.decodedBodySize > 0)) continue;
+        l.code.done = true; l.code.received = entry.decodedBodySize;
+        diagnostics.runtimeCodeProgress = {received:entry.decodedBodySize,total:l.code.total||null,downloadFinished:true,at:new Date().toISOString()};
+        renderRuntimeLoader();
+      }
+    });
+    try { runtimeLoader.observer.observe({type:"resource", buffered:true}); }
+    catch { runtimeLoader.observer.disconnect(); runtimeLoader.observer = null; }
+  }
+  runtimeLoader.timer = setInterval(renderRuntimeLoader, 1000);
+  renderRuntimeLoader();
+}
+function renderRuntimeLoader() {
+  const l = runtimeLoader;
+  if (!l?.active || statusFailed || gameRunning) return;
+  const now = Date.now(), stalled = !l.code.done && now - l.code.lastAt >= 45000;
+  const ready = l.data.done && l.code.done;
+  document.getElementById("runtime-loader").hidden = false;
+  statusEl.hidden = true;
+  document.getElementById("cl-title").textContent = ready ? "Preparing your game" : "Loading your game";
+  const message = stalled ? "Game code is still loading. Keep this tab open. You can reload if loading does not finish."
+    : l.retry || (ready ? "Downloads finished. The browser is preparing the game. First launch can take longer."
+      : l.data.done ? "Game data is ready. Game code is still loading." : "Game data and game code load separately.");
+  const messageEl = document.getElementById("cl-message");
+  if (messageEl.textContent !== message) messageEl.textContent = message;
+  for (const kind of ["data", "code"]) {
+    const item = l[kind], bar = document.getElementById("cl-"+kind);
+    const comparable = item.total > 0 && item.received <= item.total;
+    if (item.done || (comparable && kind !== "code")) { bar.max = item.total || Math.max(1,item.received); bar.value = item.received; }
+    else bar.removeAttribute("value");
+    document.getElementById("cl-"+kind+"-text").textContent = item.done ? "Ready"+(item.received ? " · "+humanBytes(item.received) : "")
+      : item.received ? humanBytes(item.received)+(comparable ? " / "+humanBytes(item.total) : " received") : item.started ? "Loading…" : "Waiting…";
+  }
+  document.getElementById("cl-prepare-text").textContent = l.code.prepared ? "Ready" : l.code.done ? "Preparing…" : "Waiting";
+  const seconds = Math.max(0, Math.floor((now-l.started)/1000));
+  document.getElementById("cl-elapsed").textContent = `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")} elapsed`;
+  document.getElementById("cl-reload").hidden = !stalled;
+  statusEl.textContent = message; // Text fallback; the visible panel owns progress.
+}
+function noteRuntimeResponse(response) {
+  if (!runtimeLoader?.active) return;
+  const code = runtimeLoader.code;
+  code.started = true; code.lastAt = Date.now(); runtimeLoader.retry = "";
+  const decoded = Number(window.recompPageBuild?.wasmBytes || window.recompRuntimeBuild?.wasmBytes);
+  const encoding = response.headers.get("Content-Encoding");
+  code.total = Number.isFinite(decoded) && decoded > 0 ? decoded : !encoding || encoding === "identity" ? Number(response.headers.get("Content-Length")) || 0 : 0;
+  renderRuntimeLoader();
 }
 function noSpaceError(result = {}) {
   const amounts = Number.isFinite(result.needed) && Number.isFinite(result.free)
@@ -122,7 +243,19 @@ function staleStorageError(error) {
   return error?.name === "InvalidStateError" ||
     /state cached in an interface object.*changed since it was read from disk/i.test(String(error?.message || error));
 }
-window.addEventListener("error", e => reportFailure("error", e.error || e.message));
+window.addEventListener("error", e => {
+  const extra = { source: diagnosticUrl(e.filename || e.target?.src || e.target?.href),
+    line: e.lineno || 0, column: e.colno || 0, masked: !e.error && e.message === "Script error." };
+  if (!e.error && !e.message) {
+    // Resource errors do not bubble. Record them in capture phase, but an
+    // optional image or script must not turn a running game into a fatal error.
+    diagnostics.failures.push({ kind: "resource", message: "Resource failed to load", ...extra,
+      phase: startupPhase, at: new Date().toISOString() });
+    if (diagnostics.failures.length > 20) diagnostics.failures.shift();
+    return;
+  }
+  reportFailure("error", e.error || e.message, extra);
+}, true);
 window.addEventListener("unhandledrejection", e => reportFailure("rejection", e.reason));
 
 // Temporary loading diagnostics: bounded to the first ten minutes of a run.
@@ -242,23 +375,33 @@ async function loadRuntime(imports) {
   const url = new URL("@APP@.wasm", document.baseURI).href;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      if (runtimeLoader?.active) Object.assign(runtimeLoader.code, {url, requestAt:performance.now(), received:0, done:false, prepared:false, started:false, lastAt:Date.now()});
       const response = await fetch(url, { credentials: "same-origin", cache: attempt ? "reload" : "default" });
+      noteDownload({ phase: "runtime", attempt: attempt + 1, url: diagnosticUrl(url), status: response.status,
+        contentType: response.headers.get("Content-Type"), contentLength: response.headers.get("Content-Length"),
+        contentEncoding: response.headers.get("Content-Encoding") });
       if (!response.ok) {
         await response.body?.cancel();
         const error = new Error(`Game runtime download returned HTTP ${response.status}.`);
         error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
         throw error;
       }
-      if (WebAssembly.instantiateStreaming && response.headers.get("Content-Type")?.split(";")[0].trim() === "application/wasm")
-        return await WebAssembly.instantiateStreaming(response, imports);
-      return await WebAssembly.instantiate(await response.arrayBuffer(), imports);
+      noteRuntimeResponse(response);
+      // Keep the original network Response: replacing it loses browser code-cache metadata.
+      const result = WebAssembly.instantiateStreaming && response.headers.get("Content-Type")?.split(";")[0].trim() === "application/wasm"
+        ? await WebAssembly.instantiateStreaming(response, imports)
+        : await WebAssembly.instantiate(await response.arrayBuffer(), imports);
+      if (runtimeLoader?.active) { runtimeLoader.code.prepared = runtimeLoader.code.done = true; runtimeLoader.code.received ||= runtimeLoader.code.total; renderRuntimeLoader(); }
+      return result;
     } catch (error) {
+      noteDownload({ phase: "runtime", attempt: attempt + 1, url: diagnosticUrl(url), error: errorDetails(error) });
       if (error instanceof WebAssembly.CompileError || error instanceof WebAssembly.LinkError)
         throw new Error(`Could not compile or link the game runtime: ${error.message}`);
       if (error.retryable === false) throw error;
       if (attempt === 2)
-        throw new Error("The game runtime could not be downloaded after three attempts. Check your connection and reload the page. Your saves are kept.");
+        throw new Error("The game runtime could not be downloaded after three attempts. Check your connection and reload the page. Your saves are kept.", { cause: error });
       console.warn(`[browser] runtime download attempt ${attempt + 1} failed: ${error.message}`);
+      if (runtimeLoader?.active) { runtimeLoader.retry = `Connection interrupted. Retrying game code (${attempt+2} of 3)…`; runtimeLoader.code.lastAt = Date.now(); }
       status(`Downloading game code… retry ${attempt + 2} of 3`);
       await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
     }
@@ -275,16 +418,30 @@ async function prepareStream(game) {
       return await new Promise((resolve, reject) => {
         worker.onerror = () => reject(new Error("Could not prepare game files. Try Play again."));
         worker.onmessage = ({ data }) => {
+          if (data.diagnostic) { noteDownload(data.diagnostic); return; }
           if (data.progress) {
             const p = data.progress;
+            diagnostics.startupProgress = { ...p, at: new Date().toISOString() };
             status(`Loading game… ${p.bytesTotal ? Math.floor(p.bytesDone / p.bytesTotal * 100) : 0}%`);
           } else if (data.error) {
             const error = new Error(data.error);
             if (data.name) error.name = data.name;
+            if (data.stack) error.stack = data.stack;
+            if (data.context) diagnostics.workerFailure = data.context;
             reject(error);
           } else if (data.result?.result === "done") resolve(data.result);
-          else if (data.result?.result === "noSpace") reject(noSpaceError(data.result));
-          else reject(new Error(`Startup download failed: ${data.result?.result}`));
+          else if (data.result?.result === "noSpace") {
+            diagnostics.workerFailure = data.result;
+            reject(noSpaceError(data.result));
+          }
+          else {
+            const failure = data.result || {};
+            diagnostics.workerFailure = failure;
+            const error = new Error(failure.error || `Startup download failed: ${failure.result}`);
+            if (failure.name) error.name = failure.name;
+            if (failure.stack) error.stack = failure.stack;
+            reject(error);
+          }
         };
         worker.postMessage({ id: 1, cmd: "streamSetup", game });
       });
@@ -340,6 +497,7 @@ async function start(options = {}) {
     const stamp = await (await (await dir.getFileHandle(".stamp")).getFile()).text();
     complete = stamp.trim() === game.sha256;
   } catch {}
+  if (!complete && options.localOnly) throw new Error("Local game files are incomplete. Import your game folder again. Game-file streaming is disabled for this launch.");
   if (!complete && game.streamAssets && game.downloadManifest) {
     startup("preparing game files");
     status("Loading game…");
@@ -349,6 +507,11 @@ async function start(options = {}) {
   if (!stream) {
     try { await dir.getDirectoryHandle("NIS"); window.carbonTestAssets.NIS = true; }
     catch { console.warn("[browser] NIS scene data is missing; resume Import Windows installation."); }
+  }
+  const customizationReady = id === "nfsc";
+  if (customizationReady) {
+    startup("preparing customization assets");
+    await (await import(new URL("./custom-install.js", document.baseURI).href)).prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"});
   }
   const streamChannel = new BroadcastChannel("recomp-stream");
   if (stream) {
@@ -386,21 +549,33 @@ async function start(options = {}) {
   startup("starting graphics adapter");
   let adapter;
   for (const options of [{ powerPreference: "high-performance" }, undefined]) {
-    try { adapter = await navigator.gpu.requestAdapter(options); }
-    catch (error) { console.warn("[browser] WebGPU adapter request failed", error?.message || String(error)); }
+    try {
+      adapter = await navigator.gpu.requestAdapter(options);
+      diagnostics.adapterRequests.push({ preference: options?.powerPreference || "default", available: !!adapter });
+    } catch (error) {
+      diagnostics.adapterRequests.push({ preference: options?.powerPreference || "default", error: errorDetails(error) });
+      console.warn("[browser] WebGPU adapter request failed", error?.message || String(error));
+    }
     if (adapter) break;
     if (options) console.warn("[browser] high-performance WebGPU adapter unavailable; trying the browser default");
   }
   if (!adapter) throw webGpuUnavailableError();
   const info = adapter.info || {};
   window.carbonGraphicsInfo = {
+    source: "active device adapter", preference: diagnostics.adapterRequests.at(-1)?.preference,
+    features: Array.from(adapter.features),
     vendor: info.vendor || "", architecture: info.architecture || "",
     device: info.device || "", description: info.description || "",
     fallback: adapter.isFallbackAdapter ?? info.isFallbackAdapter ?? null,
   };
+  if (window.carbonGraphicsInfo.fallback === true ||
+      /swiftshader/i.test([info.vendor, info.architecture, info.device, info.description].join(" "))) {
+    throw new Error("The browser selected a software renderer. This game needs a hardware graphics device. Turn on hardware acceleration in the browser settings, restart the browser, and try again. On Linux, check chrome://gpu for driver errors. Your saves are kept.");
+  }
   const wanted = ["texture-compression-bc", "depth32float-stencil8", "float32-filterable",
                   "unorm16-texture-formats", "rg11b10ufloat-renderable"];
-  const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
+  if (window.recompPerformance?.enabled) wanted.push("timestamp-query");
+  let requiredFeatures = wanted.filter((f) => adapter.features.has(f));
   const requiredLimits = {};
   for (const k of ["maxTextureDimension2D", "maxBufferSize", "maxStorageBufferBindingSize",
                    "maxUniformBufferBindingSize", "maxBindGroups", "maxSampledTexturesPerShaderStage",
@@ -409,10 +584,27 @@ async function start(options = {}) {
                    "maxVertexBuffers", "maxVertexAttributes", "maxColorAttachments",
                    "maxInterStageShaderVariables"])
     if (k in adapter.limits) requiredLimits[k] = adapter.limits[k];
+  diagnostics.requestedDevice = { features: requiredFeatures, limits: requiredLimits };
   startup("starting graphics device");
-  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
-  device.lost.then((info) => reportFailure("graphics-device-lost",
-    new Error(`The graphics device stopped: ${info.message}. Reload the page; your saves are kept.`)));
+  let device;
+  try { device = await adapter.requestDevice({ requiredFeatures, requiredLimits }); }
+  catch (error) {
+    // Optional diagnostics must not prevent a previously supported game from starting.
+    if (!requiredFeatures.includes("timestamp-query")) throw error;
+    requiredFeatures = requiredFeatures.filter(f => f !== "timestamp-query");
+    diagnostics.requestedDevice.features = requiredFeatures;
+    device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  }
+  device.lost.then((info) => {
+    reportFailure("graphics-device-lost",
+      new Error(`The graphics device stopped: ${info.message}. Your saves are kept.`));
+    // A lost GPUDevice cannot be repaired by recreating its swapchain. Unload
+    // this document, including its native threads and pending GPU callbacks.
+    // The recovery document never starts the runtime, so this cannot loop.
+    const recovery = new URL(location.href);
+    recovery.searchParams.set("graphicsRecovery", "1");
+    location.replace(recovery.href);
+  });
   device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
 
   startup("opening player profile");
@@ -447,6 +639,10 @@ async function start(options = {}) {
     canvas,
     preinitializedWebGPUDevice: device,
     noInitialRun: true,
+    getPreloadedPackage(_name, size) {
+      if (runtimeLoader?.active) { runtimeLoader.data.total = size; runtimeLoader.data.started = true; renderRuntimeLoader(); }
+      return null; // Let Emscripten fetch and install the archive as before.
+    },
     instantiateWasm(imports, receiveInstance) {
       loadRuntime(imports).then(({ instance, module }) => receiveInstance(instance, module))
         .catch(error => reportFailure("runtime-load", error));
@@ -454,7 +650,23 @@ async function start(options = {}) {
     },
     print: (t) => { log.push(t); console.log(t); },
     printErr: (t) => { log.push(t); console.warn(t); },
-    setStatus: (t) => status(t ? t : ""),
+    setStatus: (t) => {
+      const progress = /^(Downloading data\.{3})\s*\((\d+)\/(\d+)\)$/.exec(t || "");
+      if (progress) {
+        const received = Number(progress[2]), total = Number(progress[3]);
+        diagnostics.runtimeDataProgress = { received, advertisedTotal: total, at: new Date().toISOString(),
+          comparable: total > 0 && received <= total };
+        // Content-Length may describe compressed transfer bytes while the
+        // loader counts decompressed bytes. Do not show an impossible ratio.
+        if (runtimeLoader?.active) {
+          const data = runtimeLoader.data; data.received = received;
+          data.done = data.total > 0 && received >= data.total;
+          renderRuntimeLoader(); return;
+        }
+        return status(received > total || !total ? `Downloading data… ${humanBytes(received)} received` : t);
+      }
+      status(t || "");
+    },
     onAbort: (what) => reportFailure("abort", what),
     preRun: [() => {
       const m = Module;
@@ -470,10 +682,16 @@ async function start(options = {}) {
       if (lanUrl) m.ENV.RECOMP_LAN = "1";
       const extra = new URLSearchParams(location.search);
       for (const [k, v] of extra) if (k.startsWith("RECOMP_")) m.ENV[k] = v;
+      // An exhausted upload budget or opt-out must also disable native measurement.
+      m.ENV.RECOMP_PERF_REPORTS = window.recompPerformance?.enabled ? "1" : "0";
+      m.ENV.RECOMP_CUSTOMIZATION = customizationReady ? "1" : "0";
+      m.ENV.RECOMP_CUSTOM_COSMETICS_SHOP = customizationReady ? "1" : "0";
+      m.ENV.RECOMP_CUSTOM_VECTOR_RESOURCE_SHA256 = customizationReady ? globalThis.__carbonCustomVectorResourceSha256 : "";
     }],
     onRuntimeInitialized() {
       if (statusFailed) return;
       startup("starting game code");
+      stopRuntimeLoader();
       status("");
       gameRunning = true;
       canvas.focus();
@@ -483,6 +701,7 @@ async function start(options = {}) {
   };
   window.Module = Module;
   startup("loading game runtime");
+  beginRuntimeLoader();
   const script = document.createElement("script");
   script.src = "@APP@.js";
   script.onerror = () => reportFailure("runtime-script", new Error("The game's web build is missing."));
@@ -497,13 +716,17 @@ canvas.addEventListener("click", () => canvas.focus());
 // (?mp=, ?lan=, ?profile=, RECOMP_*) starts the game at once, as does a game without one.
 let booted = false;
 window.recompBoot = (options) => {
-  if (canonicalRedirect || booted) return;
+  if (canonicalRedirect || graphicsRecovery || booted) return;
   booted = true;
   status("Loading…");
   start(options).catch(reportStartupFailure);
 };
 (async () => {
   if (canonicalRedirect) return;
+  if (graphicsRecovery) {
+    reportFailure("graphics-device-lost", new Error("The graphics device stopped. The game has been stopped to prevent repeated graphics errors. Select Back to game to try again. If this repeats, restart the browser and check hardware acceleration and your graphics driver. Your saves are kept."));
+    return;
+  }
   const params = [...new URLSearchParams(location.search).keys()];
   if (params.some((k) => k === "mp" || k === "lan" || k === "profile" || k.startsWith("RECOMP_"))) return recompBoot();
   const id = await gameId();

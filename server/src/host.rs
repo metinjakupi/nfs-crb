@@ -68,6 +68,7 @@ const GM_HOST_HELLO: i8 = 2;
 const GM_ROSTER: i8 = 3;
 const GM_ROSTER_ACK: i8 = 4;
 const GM_JOIN: i8 = 5;
+const GM_LEAVE: i8 = 7;
 /// Player states as GameManager numbers them: 2 said hello, 6 in the game (0095a520).
 const PLAYER_HELLO: i8 = 2;
 const PLAYER_ACTIVE: i8 = 6;
@@ -354,6 +355,8 @@ struct Peer {
     stage: Stage,
     /// the player's place in the race (0..), and so its racer ids
     slot: u32,
+    /// Native starting-grid position, compacted independently of racer-id ownership.
+    grid_slot: u32,
     /// its car as it last described it (PlayerCarData), for players who join later
     car_data: Option<Vec<u8>>,
     /// it loaded the race and said Ready
@@ -391,6 +394,7 @@ impl Peer {
             who: None,
             stage: Stage::Linking,
             slot: 0,
+            grid_slot: 0,
             car_data: None,
             ready: false,
             results: None,
@@ -700,6 +704,7 @@ impl Host {
             }
             let which = if key == self.key { "the game's key" } else { "the inverted key (its second try)" };
             self.note(format!("{}:{}: tunnel from client {client:08x} with {which}", Ipv4Addr::from(peer.vip), peer.port));
+            self.leave(peer, 2, self.now());
             peer.key = key.clone();
             peer.recv = s;
             peer.send = Stream::new(&key);
@@ -712,14 +717,42 @@ impl Host {
         None
     }
 
+    /// Match the SDK host's player-left notification (0095b1a0 -> 009593d0).
+    /// Removing a peer only on the server leaves a ghost player in every native lobby.
+    fn leave(&mut self, peer: &mut Peer, reason: i8, now: u64) {
+        if peer.stage == Stage::Joined {
+            if let Some(who) = &peer.who {
+                let mut m = Enc::default();
+                m.i8(GM_LEAVE).u16(who.pid).i8(reason);
+                for other in self.peers.values_mut().filter(|p| p.stage == Stage::Joined) {
+                    other.gm_send(&m.0, now);
+                }
+                self.note(format!("{}: left; notified the room (reason {reason})", peer.label()));
+            }
+        }
+        peer.stage = Stage::Linking;
+        peer.car_data = None;
+        peer.ready = false;
+        peer.results = None;
+        peer.in_room = true;
+        peer.held.clear();
+        peer.clock = None;
+        peer.big.clear();
+        peer.game_msgs = 0;
+    }
+
     fn commudp(&mut self, peer: &mut Peer, p: &[u8], now: u64) {
+        let old_connection = (peer.cudp.open, peer.cudp.ident);
         let (packets, what) = peer.cudp.receive(p);
+        if old_connection.0 && peer.cudp.open && old_connection.1 != peer.cudp.ident {
+            self.leave(peer, 2, now);
+        }
         if let Some(what) = what {
             let line = format!("{}: {what}", peer.label());
             let _ = writeln!(self.log, "+{:.3} {line}", now as f64 / 1000.0);
             self.note(line);
             if !peer.cudp.open {
-                peer.stage = Stage::Linking;
+                self.leave(peer, 2, now);
             }
         }
         for pkt in packets {
@@ -746,7 +779,10 @@ impl Host {
                     self.game(peer, msg, now);
                 }
             }
-            2 => self.note(format!("{}: NetGameLink disconnect", peer.label())),
+            2 => {
+                self.note(format!("{}: NetGameLink disconnect", peer.label()));
+                self.leave(peer, 2, now);
+            }
             k => {
                 let _ = writeln!(self.log, "+{:.3} {} NetGameLink kind {k}: {} bytes", now as f64 / 1000.0, peer.label(), body.len());
             }
@@ -814,6 +850,14 @@ impl Host {
                 if m.len() >= 16 {
                     m[12..16].copy_from_slice(&peer.slot.to_be_bytes());
                 }
+                // A separate field controls the native starting grid: packer
+                // 00824790 writes it at byte 16 (c88). 0081dbc0 copies it to
+                // car+474, then 00828690 passes it to racer+13e0, which the
+                // spawn path reads (00655db0 -> 00645fc0). Clients start at -1.
+                // Give every player its own position, including its self echo.
+                if m.len() >= 20 {
+                    m[16..20].copy_from_slice(&peer.grid_slot.to_be_bytes());
+                }
                 peer.car_data = Some(m.clone());
                 self.race_to(peer, &m, true, now);
                 self.to_others(&m, true, now);
@@ -844,10 +888,14 @@ impl Host {
             // access out of bounds", runs r9 and r10, where the host passed on every player's),
             // so the host answers the first one by telling every player once, the sender too.
             olmsg::START_LOADING => {
-                if self.race == Race::Loading {
+                // A late room request must not load a second copy during clock
+                // synchronization or racing. Final results (or a new room timer
+                // after an abandoned load) return the host to Lobby.
+                if self.race != Race::Lobby {
                     return;
                 }
                 self.race = Race::Loading;
+                self.assign_starting_grid(peer, now);
                 self.finished.clear();
                 self.results_since = None;
                 self.fugitive = None;
@@ -933,11 +981,10 @@ impl Host {
             // A room timer the leader starts (its FE, 005b5620): everyone shows it, the leader
             // too, counted from the host time in it.
             olmsg::START_TIMER => {
-                // a race still marked loading when a new timer starts in the room was given
-                // up (a player left while loading): the next StartLoading starts a new one
-                if self.race == Race::Loading {
-                    self.race = Race::Lobby;
-                }
+                // The native room starts this timer (005b5620 -> 00830450).
+                // A fresh room countdown also permits another race after an
+                // abandoned load/start, without accepting late load requests.
+                self.race = Race::Lobby;
                 self.race_to(peer, msg, true, now);
                 self.to_others(msg, true, now);
             }
@@ -970,6 +1017,30 @@ impl Host {
                 }
             }
             _ => self.to_others(msg, true, now),
+        }
+    }
+
+    /// A room can have holes after departures. Racer-id slots stay stable,
+    /// but the current race needs positions 0..players-1, including Canyon duels.
+    fn assign_starting_grid(&mut self, current: &mut Peer, now: u64) {
+        let mut slots: Vec<u32> = self.peers.values().filter(|p| p.stage == Stage::Joined).map(|p| p.slot).collect();
+        slots.push(current.slot);
+        slots.sort_unstable();
+        let mut updates = Vec::new();
+        for p in self.peers.values_mut().filter(|p| p.stage == Stage::Joined).chain(std::iter::once(&mut *current)) {
+            p.grid_slot = slots.binary_search(&p.slot).expect("joined slot") as u32;
+            if let Some(car) = p.car_data.as_mut().filter(|c| c.len() >= 20) {
+                let grid = p.grid_slot.to_be_bytes();
+                if car[16..20] != grid {
+                    car[16..20].copy_from_slice(&grid);
+                    updates.push(car.clone());
+                }
+            }
+        }
+        // Reliable car updates precede StartLoading on every connection.
+        for car in updates {
+            self.race_to(current, &car, true, now);
+            self.to_others(&car, true, now);
         }
     }
 
@@ -1231,6 +1302,7 @@ impl Host {
                 // player its racer ids.
                 let used: Vec<u32> = self.peers.values().filter(|p| p.stage == Stage::Joined).map(|p| p.slot).collect();
                 peer.slot = (0..8).find(|s| !used.contains(s)).unwrap_or(0);
+                peer.grid_slot = peer.slot;
                 let base = 1 + RACERS_PER_PLAYER * peer.slot;
                 let init = olmsg::game_init_info(base, now as f32 / 1000.0, 0, 0);
                 peer.game_send(&init, true, now);
@@ -1249,7 +1321,7 @@ impl Host {
             }
             GM_GOODBYE => {
                 self.note(format!("{}: goodbye", peer.label()));
-                peer.stage = Stage::Linking;
+                self.leave(peer, 0, now);
             }
             k => self.note(format!("{}: GameManager message {k} ({} bytes), not handled yet", peer.label(), msg.len())),
         }
@@ -1338,7 +1410,8 @@ impl Host {
         let now = self.now();
         let gone: Vec<(u32, u16)> = self.peers.iter().filter(|(_, p)| now.saturating_sub(p.heard_at) > PEER_TIMEOUT_MS).map(|(k, _)| *k).collect();
         for k in gone {
-            if let Some(p) = self.peers.remove(&k) {
+            if let Some(mut p) = self.peers.remove(&k) {
+                self.leave(&mut p, 2, now);
                 self.note(format!("{}: silent for {} s; dropped", p.label(), PEER_TIMEOUT_MS / 1000));
             }
         }
@@ -1493,8 +1566,128 @@ mod tests {
         let mut p = Peer::new(vip, 1042, &tunnel::key_from_ekey(EKEY), 0);
         p.stage = Stage::Joined;
         p.slot = slot;
+        p.grid_slot = slot;
         p.who = Some(Expected { pid: slot as u16 + 2, user_id: 1, name: name.into(), ticket: String::new(), vip });
         p
+    }
+
+    #[test]
+    fn native_grid_positions_are_unique_and_echoed_to_the_sender() {
+        fn receive(g: &mut Game, out: &[Out]) -> Vec<u8> {
+            g.read(out);
+            let mut whole = Vec::new();
+            for m in &g.races {
+                let piece = olmsg::BigPiece::read(m).expect("native car data is fragmented");
+                whole.resize(piece.total, 0);
+                whole[piece.offset..piece.offset + piece.data.len()].copy_from_slice(&piece.data);
+            }
+            whole
+        }
+        // Native packer 00824790 puts room rank at byte 12 and starting
+        // grid position at byte 16. The captured clients initially send -1
+        // for grid position. A reconnect can also send an old position.
+        for (slot, racer_id) in [(0u32, 1u32), (1, 5), (3, 13), (7, 29)] {
+            for old_grid in [u32::MAX, 0, 7] {
+                let mut host = Host::new(100_001, 19_001, 354_668_344, EKEY);
+                let mut sender = joined(JOINER, slot, "Sender");
+                sender.cudp.reset(123);
+                let mut observer = joined(JOINER + 1, (slot + 1) % 8, "Observer");
+                observer.cudp.reset(456);
+                host.peers.insert((JOINER + 1, 1042), observer);
+                // Car customization is opaque to the host: its full body must survive.
+                let mut input = vec![0x5a; 1107];
+                input[0..4].copy_from_slice(&olmsg::PLAYER_CAR_DATA.to_be_bytes());
+                input[4..8].copy_from_slice(&racer_id.to_be_bytes());
+                input[8..12].copy_from_slice(&(slot + 2).to_be_bytes());
+                input[12..16].copy_from_slice(&9999u32.to_be_bytes());
+                input[16..20].copy_from_slice(&old_grid.to_be_bytes());
+                input[20..24].copy_from_slice(&olmsg::VERSION_HASH.to_be_bytes());
+                host.game(&mut sender, &input, 10);
+                let mine: Vec<Out> = sender.flush(host.my_client).into_iter().map(|d| (JOINER, 1042, d)).collect();
+                let mut expected = input;
+                expected[12..16].copy_from_slice(&slot.to_be_bytes());
+                expected[16..20].copy_from_slice(&slot.to_be_bytes());
+                assert_eq!(receive(&mut Game::new(), &mine), expected, "sender grid {slot}");
+                assert_eq!(receive(&mut Game::new(), &host.flush_all(None)), expected, "observer grid {slot}");
+                assert_eq!(sender.car_data.as_deref(), Some(expected.as_slice()), "late joiners must receive the same grid position");
+            }
+        }
+    }
+
+    #[test]
+    fn starting_grid_compacts_roster_gaps_before_loading_and_survives_late_car_data() {
+        let mut host = Host::new(100_001, 19_001, 354_668_344, EKEY);
+        let mut sender = joined(JOINER, 3, "Sender");
+        let mut observer = joined(JOINER + 1, 7, "Observer");
+        for (p, id) in [(&mut sender, 13u32), (&mut observer, 29)] {
+            p.cudp.reset(id);
+            let mut car = vec![0x5a; 1107];
+            car[0..4].copy_from_slice(&olmsg::PLAYER_CAR_DATA.to_be_bytes());
+            car[4..8].copy_from_slice(&id.to_be_bytes());
+            car[12..16].copy_from_slice(&p.slot.to_be_bytes());
+            car[16..20].copy_from_slice(&p.slot.to_be_bytes());
+            p.car_data = Some(car);
+        }
+        host.peers.insert((JOINER + 1, 1042), observer);
+        host.game(&mut sender, &olmsg::START_LOADING.to_be_bytes(), 10);
+        let mine: Vec<Out> = sender.flush(host.my_client).into_iter().map(|d| (JOINER, 1042, d)).collect();
+        let mut g = Game::new(); g.read(&mine);
+        let mut whole: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for m in &g.races {
+            if let Some(piece) = olmsg::BigPiece::read(m) {
+                let car = whole.entry(piece.seq).or_insert_with(|| vec![0; piece.total]);
+                car[piece.offset..piece.offset + piece.data.len()].copy_from_slice(&piece.data);
+            }
+        }
+        let mut grid: Vec<_> = whole.values().map(|c| (u32::from_be_bytes(c[4..8].try_into().unwrap()), u32::from_be_bytes(c[16..20].try_into().unwrap()))).collect();
+        grid.sort();
+        assert_eq!(grid, vec![(13, 0), (29, 1)], "remaining racers must use adjacent starting positions");
+        assert_eq!(olmsg::kind(g.races.last().unwrap()), Some(olmsg::START_LOADING), "grid updates must arrive before native placement");
+        // An in-flight lobby car update cannot restore the old sparse grid.
+        let old = whole.values().find(|c| c[4..8] == 13u32.to_be_bytes()).unwrap();
+        let mut late = old.clone();late[16..20].copy_from_slice(&3u32.to_be_bytes());
+        host.game(&mut sender, &late, 11);
+        assert_eq!(sender.car_data.as_ref().unwrap()[16..20], 0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn departures_remove_the_native_roster_entry_once() {
+        // Carbon's 009593d0 reads message 7, a u16 player id, then an i8 reason.
+        for path in ["goodbye", "disconnect", "timeout", "reconnect", "new_connection"] {
+            let mut host = Host::new(100_001, 19_001, 354_668_344, EKEY);
+            let mut leaving = joined(JOINER, 0, "Leaving");
+            leaving.cudp.reset(123);
+            let mut remaining = joined(JOINER + 1, 1, "Remaining");
+            remaining.cudp.reset(456);
+            host.peers.insert((JOINER + 1, 1042), remaining);
+            match path {
+                "goodbye" => host.gm(&mut leaving, &[0x81], 10),
+                "disconnect" => host.commudp(&mut leaving, &Cudp::packet(DISC, 123, &[]), 10),
+                "new_connection" => host.commudp(&mut leaving, &Cudp::packet(INIT, 789, &[]), 10),
+                "reconnect" => {
+                    let mut g = Game::new();
+                    let packet = g.datagram(Cudp::packet(INIT, 789, &[]));
+                    assert!(host.rekey(&mut leaving, &packet, true).is_some());
+                }
+                _ => {
+                    host.started = Instant::now() - std::time::Duration::from_millis(31_000);
+                    host.peers.get_mut(&(JOINER + 1, 1042)).unwrap().heard_at = 31_000;
+                    host.peers.insert((JOINER, 1042), leaving);
+                    let out = host.tick();
+                    let mut g = Game::new();
+                    let out: Vec<_> = out.into_iter().filter(|(vip, _, _)| *vip == JOINER + 1).collect();
+                    let (_, messages) = g.read(&out);
+                    assert_eq!(messages, vec![vec![0x87, 0, 2, 0x82]], "{path}");
+                    continue;
+                }
+            }
+            // A following DISC must not announce the same departure twice.
+            host.commudp(&mut leaving, &Cudp::packet(DISC, 123, &[]), 11);
+            let mut g = Game::new();
+            let (_, messages) = g.read(&host.flush_all(None));
+            let reason = if path == "goodbye" { 0x80 } else { 0x82 };
+            assert_eq!(messages, vec![vec![0x87, 0, 2, reason]], "{path}");
+        }
     }
 
     /// How many race messages a player was sent since the last call.
@@ -1510,6 +1703,59 @@ mod tests {
         m.extend_from_slice(&b.to_be_bytes());
         m.extend_from_slice(&[0; 8]);
         m
+    }
+
+    #[test]
+    fn delayed_load_requests_do_not_restart_an_active_race() {
+        fn loads(p: &mut Peer) -> usize {
+            let n = p.cudp.outbox.iter().filter(|packet| {
+                packet.get(8) == Some(&0)
+                    && packet.get(9..13) == Some(olmsg::START_LOADING.to_be_bytes().as_slice())
+            }).count();
+            p.cudp.outbox.clear();
+            n
+        }
+        for phase in [Race::Loading, Race::Syncing(100), Race::Racing] {
+            let mut host = Host::new(100_001, 19_001, 354_668_344, EKEY);
+            let mut metin = joined(JOINER, 0, "Metin");
+            let jan_key = (JOINER + 1, 1042);
+            host.peers.insert(jan_key, joined(JOINER + 1, 1, "Jan"));
+            let load = olmsg::START_LOADING.to_be_bytes();
+            host.game(&mut metin, &load, 0);
+            assert_eq!(loads(&mut metin), 1);
+            assert_eq!(loads(host.peers.get_mut(&jan_key).unwrap()), 1);
+            // The same room countdown request arrives after the first load,
+            // while loading, synchronizing clocks, or already racing.
+            host.race = phase;
+            host.game(&mut metin, &load, 200);
+            assert_eq!(loads(&mut metin), 0, "sender must not reload during {phase:?}");
+            assert_eq!(loads(host.peers.get_mut(&jan_key).unwrap()), 0, "opponent must not reload during {phase:?}");
+            assert_eq!(host.race, phase);
+            // Final results return the room to Lobby. A later race must load.
+            let mut results = olmsg::GAME_RESULTS.to_be_bytes().to_vec();
+            results.resize(olmsg::GAME_RESULTS_LEN, 0);
+            host.peers.get_mut(&jan_key).unwrap().results = Some(results.clone());
+            host.game(&mut metin, &results, 300);
+            assert_eq!(host.race, Race::Lobby);
+            metin.cudp.outbox.clear();
+            host.peers.get_mut(&jan_key).unwrap().cudp.outbox.clear();
+            host.game(&mut metin, &load, 400);
+            assert_eq!(loads(&mut metin), 1, "next race must load for the sender");
+            assert_eq!(loads(host.peers.get_mut(&jan_key).unwrap()), 1, "next race must load for the opponent");
+            // Returning to the native room after abandoning a race need not
+            // produce FinalGameResults. Its new countdown must still work.
+            host.race = phase;
+            let mut timer = olmsg::START_TIMER.to_be_bytes().to_vec();
+            timer.extend_from_slice(&2u32.to_be_bytes());
+            timer.extend_from_slice(&1.0f32.to_be_bytes());
+            timer.extend_from_slice(&30.0f32.to_be_bytes());
+            host.game(&mut metin, &timer, 500);
+            metin.cudp.outbox.clear();
+            host.peers.get_mut(&jan_key).unwrap().cudp.outbox.clear();
+            host.game(&mut metin, &load, 600);
+            assert_eq!(loads(&mut metin), 1, "room countdown must permit a new race after {phase:?}");
+            assert_eq!(loads(host.peers.get_mut(&jan_key).unwrap()), 1);
+        }
     }
 
     #[test]

@@ -2,6 +2,50 @@
 
 Game features, performance improvements, and bug fixes for NFS Carbon in the browser.
 
+## Unreleased
+
+- Reduce CPU overhead before interpreted audio callbacks by replacing repeated diagnostic byte formatting, preserving callback execution and sound.
+
+- Reduce browser CPU overhead when binding shader resources by using the typed-array WebGPU call, retaining the Firefox memory workaround.
+
+- Avoid repeated peer-value comparisons after changed numeric shader parameters while preserving shared values and texture references.
+- Pack compatible float shader constants directly, retaining matrix layout, numeric conversion and car-shine scaling.
+
+- Filter plate and wheel callbacks at their specific draw calls to avoid unnecessary CPU state copies.
+- Reduce audio sample-scaling bookkeeping while preserving sample order and floating-point results.
+
+- Fix an unsafe cross-thread read when host events reach the game scheduler.
+- Skip repeated mip-level scans for textures whose CPU contents have not changed.
+- Reduce audio thread handoffs by keeping mixer setup and timing serialized while the inner sample mix runs in parallel.
+
+## 2026-11-01
+
+- Reject software graphics adapters before starting the renderer. A lost graphics device now unloads the failed game and opens a recovery screen instead of retrying the dead device.
+- Notify native online rooms when players leave, disconnect, time out, or reconnect. Clear stale player session state to prevent ghost lobby entries.
+- Add bounded automatic performance summaries for sustained low FPS and a sample of normal sessions. Measure new gameplay frames, drawing work, thread waits and optional GPU render-pass timestamps without player-submitted logs.
+
+- Let AI racers consider undiscovered shortcuts while keeping the native difficulty and shortcut chance rules.
+- Enable the native reverse controller for police patrols.
+- Stop busted AI racers through native goal and brake inputs.
+
+## 2026-10-31
+
+- Reduce CPU work for repeated material and matrix updates, including shared effects, to improve rendering frame times.
+
+- Autosculpt editors reopen fitted parts with the selected car's saved slider settings and preserve pending shopping-cart edits.
+
+- Online players, crew tags and race invitations have a separate F8 panel, also opened from the online status button. F9 keeps an Online link. Player search, filters and 50-row batches support larger rosters.
+
+- Request fullscreen keyboard lock so short Esc presses remain available to the game on supported browsers; preserve browser emergency exit and permission-denied fallback.
+
+- Cancelled online Quick Races always offer Exit to start page, including during loading. Dismiss appears only after returning to native menus.
+
+- Hide racing players and their map markers from free-roam observers; show Racing in the player list.
+- Remove spectator copies of another player's AI race rivals.
+- Keep same-session multiplayer opponents visible to one another.
+- Restore free-roam cars only from a fresh position after a race; keep normal paused-car behavior.
+- Fix an opponent car disappearing when a Crew Challenge starts near a third free-roam player.
+
 ## 2026-10-30
 
 ### Controls

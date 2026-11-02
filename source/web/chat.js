@@ -31,9 +31,9 @@
 // four of a list bound, that feature has no key and the hint says which to
 // free. Keys are matched by position (KeyboardEvent.code), as the game binds
 // them, and hints name them by what the player's keyboard layout prints there
-// (Z on a German keyboard). They work only while the player is in a car (the
-// game's shared block says so), so the game's own name entry still gets every
-// letter, and never while the F9 menu is open. A window capture listener eats
+// (Z on a German keyboard). Chat works throughout the online session; the
+// horn works only while driving. Neither intercepts browser text fields
+// or keys while the F9 menu is open. A window capture listener eats
 // the presses it uses before the game sees them (SDL3 listens on the window in
 // the bubble phase); key-ups always pass, as in menu.js.
 "use strict";
@@ -126,6 +126,17 @@
   let root, feed, composer, messageInput, composeStatus;
   let composing = false;
   let recent, history;
+  let enabled = true;
+  try { enabled = localStorage.getItem("nfsc.chatEnabled") !== "false"; } catch {}
+  function setEnabled(on) {
+    enabled = !!on;
+    try { localStorage.setItem("nfsc.chatEnabled", String(enabled)); } catch {}
+    if (!enabled) closeComposer();
+    if (root) root.hidden = !enabled;
+  }
+  window.recompMenuToggles ||= [];
+  window.recompMenuToggles.push({ id: "chat", label: "Chat", get: () => enabled, set: setEnabled });
+  dispatchEvent(new Event("recomp-menu-toggles"));
   // What the player's keyboard prints on a key (Chrome tells; else US names).
   const printed = {};
   const label = (code) => printed[code] || code.slice(3);
@@ -136,6 +147,7 @@
     activeAt = performance.now();
     root = document.createElement("div");
     root.className = "cc";
+    root.hidden = !enabled;
     root.innerHTML = `
     <style>${css}</style>
     <div class="cc-recent" role="log" aria-live="polite" aria-label="Recent messages"></div>
@@ -144,7 +156,7 @@
       <h2>Online chat</h2>
       <div class="cc-history" role="log" aria-label="Session messages" tabindex="0"><p class="cc-empty">No messages yet. Messages stay here until you reload.</p></div>
       <label for="cc-message">Message · 120 characters maximum</label>
-      <input id="cc-message" maxlength="120" autocomplete="off" placeholder="Say something to nearby players…">
+      <input id="cc-message" maxlength="120" autocomplete="off" placeholder="Say something to players in this room…">
       <div class="cc-foot" role="status"></div>
       <div class="cc-compose-actions"><button type="submit">Send</button><button type="button">Cancel</button></div>
     </form>`;
@@ -309,8 +321,6 @@
     hinted = true;
     for (const out of unhint.splice(0)) out();
     const parts = [];
-    if (chatKey) parts.push(kbd(label(chatKey)), " Chat");
-    if (chatKey && hornKey) parts.push("  ·  ");
     if (hornKey) parts.push(kbd(label(hornKey)), " Horn (hold)");
     if (parts.length) unhint.push(line(parts, "note", 10000));
     const all = (codes) => `${codes.slice(0, -1).map(label).join(", ")} and ${label(codes.at(-1))}`;
@@ -337,6 +347,7 @@
   function heard(m) {
     if (!m || typeof m !== "object") return;
     if (m.t === "chat") {
+      if (!enabled) return;
       const text = cleanText(m.text);
       if (text) say(m.name, m.crew, text);
     } else if (m.t === "horn") {
@@ -345,13 +356,13 @@
   }
 
   function openComposer() {
-    if (!active || !driving() || menuOpen()) return;
+    if (!active || !enabled || !linkOpen() || menuOpen()) return;
     hornUp();
     composing = true;
     composer.hidden = false;
     root.classList.add("composing");
     globalThis.recompMenuOpen = true; // suppress controller driving while typing
-    composeStatus.textContent = "Enter sends · Esc cancels · Nearby players in this room";
+    composeStatus.textContent = "Enter sends · Esc cancels · Everyone in this room";
     history.scrollTop = history.scrollHeight;
     messageInput.focus();
   }
@@ -364,6 +375,7 @@
     if (!menuOpen()) document.getElementById("canvas")?.focus();
   }
   function sendTyped() {
+    if (!enabled) return;
     const text = cleanText(messageInput.value);
     if (!text) { composeStatus.textContent = "Type a message first."; return; }
     if (!linkOpen()) { composeStatus.textContent = "Not connected. Your message was not sent."; return; }
@@ -509,8 +521,9 @@
     addEventListener("keydown", (e) => {
       if (e.code === "F9" || e.code === "F10") { closeComposer(); return; } // the menu's key: it takes over
       if (menuOpen() || typing(e.target) || e.target?.closest?.(".cm")) return;
+      if (e.code === chatKey && !enabled) return;
       // chatKey / hornKey are null when every key of their list is the game's.
-      if ((e.code !== chatKey && e.code !== hornKey) || e.ctrlKey || e.metaKey || !driving()) return;
+      if ((e.code !== chatKey && e.code !== hornKey) || e.ctrlKey || e.metaKey || (e.code === hornKey && !driving())) return;
       if (e.code === hornKey && window.recompPoliceKey?.(e)) { eat(e); return; } // the police player's siren (net.js)
       eat(e);
       if (e.repeat) return;
@@ -519,7 +532,7 @@
     }, true);
     addEventListener("keypress", (e) => {
       if (composing) return;
-      if ((e.code === chatKey || e.code === hornKey) && !e.ctrlKey && !e.metaKey && driving() && !menuOpen()) eat(e);
+      if (((enabled && e.code === chatKey) || (e.code === hornKey && driving())) && !e.ctrlKey && !e.metaKey && !menuOpen()) eat(e);
     }, true);
     addEventListener("keyup", (e) => { if (e.code === mine?.code) hornUp(); }, true); // never stopped
     addEventListener("blur", hornUp);
@@ -529,8 +542,8 @@
   function tick() {
     if (pickKeys()) hinted = false; // show the new keys (once in a car)
     const inCar = driving(), menu = menuOpen();
-    if (inCar && !hinted) hint();
-    if (composing && (!inCar || menu)) closeComposer();
+    if (enabled && inCar && !hinted) hint();
+    if (composing && menu) closeComposer();
     if (mine && (!inCar || menu)) hornUp();
     for (const [id, h] of horns) {
       const { level, pan } = hearing(id, h.at);

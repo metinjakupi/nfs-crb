@@ -6,6 +6,7 @@
 #include "../host_d9.h"
 #include "../dds_volume.h"
 #include "../../runtime/memory.h"
+#include "../../runtime/mods_seam.h"
 #include "guest_abi.h"
 
 #include <array>
@@ -21,6 +22,21 @@
             fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                           \
         }                                                                                          \
     } while (0)
+
+// Existing mod-service seam: supply a controlled shine factor to the real
+// effect binder, including changes after an incremental bind was cached.
+static uint64_t test_scale_generation = 0;
+static bool test_scale_enabled = false;
+extern "C" uint64_t mods_fx_scale_generation(void) {
+    return test_scale_generation;
+}
+extern "C" bool mods_fx_scale_lookup(const char *, const char *param, float out[4]) {
+    if (!test_scale_enabled || strcmp(param, "Numeric"))
+        return false;
+    const float scale[4] = {2.0f, 0.5f, 0.0f, -1.0f};
+    memcpy(out, scale, sizeof scale);
+    return true;
+}
 
 static HostD9Draw captured;
 static void test_volume_dds() {
@@ -173,6 +189,20 @@ static void test_volume(uint32_t dev) {
     volume_uploads.clear();
     call_method(tex, 9);
     CHECK(volume_uploads.empty()); // no duplicate unchanged upload
+    // A later write to just one mip must invalidate the clean texture summary.
+    CHECK(call_method(tex, 19, {1, sc(0x660), 0, 0}) == 0);
+    wr32(rd32(sc(0x668)), 0x78563412);
+    CHECK(call_method(tex, 20, {1}) == 0);
+    call_method(tex, 9);
+    CHECK(volume_uploads.size() == 1);
+    if (volume_uploads.size() == 1) {
+        const auto &u = volume_uploads[0];
+        CHECK(u.id == id && u.level == 1 && u.slice == 0 && u.data.size() == 4);
+        CHECK(u.data.size() == 4 && u.data[0] == 0x12 && u.data[3] == 0x78);
+    }
+    volume_uploads.clear();
+    call_method(tex, 9);
+    CHECK(volume_uploads.empty());
     // A non-origin sub-box returns full pitches and an offset into the same mip.
     const uint32_t box[] = {1, 1, 2, 2, 1, 2};
     memcpy(gm_ptr(sc(0x700)), box, sizeof box);
@@ -484,7 +514,6 @@ static void test_state_getters_and_readback(uint32_t dev) {
     call_method(rt, 2);
 }
 
-
 // Test155: the four draw calls refuse a primitive count above the MaxPrimitiveCount this device reports in its caps
 // (and indexed draws a vertex count above MaxVertexIndex + 1) with D3DERR_INVALIDCALL, before any size arithmetic,
 // for every topology, and without growing the process. At the limit they are accepted.
@@ -497,14 +526,19 @@ static void test_draw_limits(uint32_t dev) {
     struct rusage before{}, after{};
     getrusage(RUSAGE_SELF, &before);
     for (uint32_t prim = 1; prim <= 6; ++prim) {
-        for (uint32_t count : {max_prims + 1, 0x7fffffffu, 0x80000000u, 0x80000000u + 350u, 0xffffffffu}) {
-            CHECK(call_method(dev, 83, {prim, count, sc(0x1000), 16}) == invalid);          // DrawPrimitiveUP
-            CHECK(call_method(dev, 84, {prim, 0, 3, count, sc(0x1000), 101, sc(0x1000), 16}) == invalid);
-            CHECK(call_method(dev, 81, {prim, 0, count}) == invalid);                        // DrawPrimitive
-            CHECK(call_method(dev, 82, {prim, 0, 0, 3, 0, count}) == invalid);              // DrawIndexedPrimitive
+        for (uint32_t count :
+             {max_prims + 1, 0x7fffffffu, 0x80000000u, 0x80000000u + 350u, 0xffffffffu}) {
+            CHECK(call_method(dev, 83, {prim, count, sc(0x1000), 16}) ==
+                  invalid); // DrawPrimitiveUP
+            CHECK(call_method(dev, 84, {prim, 0, 3, count, sc(0x1000), 101, sc(0x1000), 16}) ==
+                  invalid);
+            CHECK(call_method(dev, 81, {prim, 0, count}) == invalid); // DrawPrimitive
+            CHECK(call_method(dev, 82, {prim, 0, 0, 3, 0, count}) ==
+                  invalid); // DrawIndexedPrimitive
         }
         // vertex count over the index limit, primitive count fine
-        CHECK(call_method(dev, 84, {prim, 0, max_index + 2, 1, sc(0x1000), 101, sc(0x1000), 16}) == invalid);
+        CHECK(call_method(dev, 84, {prim, 0, max_index + 2, 1, sc(0x1000), 101, sc(0x1000), 16}) ==
+              invalid);
         CHECK(call_method(dev, 82, {prim, 0, 0, max_index + 2, 0, 1}) == invalid);
         // small valid draws are accepted
         CHECK(call_method(dev, 83, {prim, 1, sc(0x1000), 16}) == 0);
@@ -531,7 +565,8 @@ static void test_depth_stencil_get(uint32_t dev) {
         CHECK(call_method(dev, 40, {out}) == notfound);
         CHECK(rd32(out) == 0);
     }
-    CHECK(call_method(dev, 29, {16, 16, 75, 0, 0, 0, made, 0}) == 0); // CreateDepthStencilSurface D24S8
+    CHECK(call_method(dev, 29, {16, 16, 75, 0, 0, 0, made, 0}) ==
+          0); // CreateDepthStencilSurface D24S8
     const uint32_t surface = rd32(made);
     CHECK(surface != 0);
     CHECK(call_method(dev, 39, {surface}) == 0);
@@ -602,17 +637,18 @@ static void test_surface_container_refs(uint32_t dev) {
     const uint32_t texp = sc(0x980), surfp = sc(0x984), surf2p = sc(0x988);
     auto release = [](uint32_t o) { return call_method(o, 2); };
     for (int order = 0; order < 2; ++order) {
-        CHECK(call_method(dev, 23, {16, 16, 1, 1 /* RENDERTARGET */, 21, 0, texp, 0}) == 0); // CreateTexture
+        CHECK(call_method(dev, 23, {16, 16, 1, 1 /* RENDERTARGET */, 21, 0, texp, 0}) ==
+              0); // CreateTexture
         const uint32_t tex = rd32(texp), tex_id = com_this(tex)->id;
         CHECK(call_method(tex, 18, {0, surfp}) == 0); // GetSurfaceLevel
         const uint32_t surf = rd32(surfp), surf_id = com_this(surf)->id;
         if (order == 0) {
-            release(tex);                              // the app lets the texture go first...
-            CHECK(com_get(tex_id) != nullptr);         // ...the level keeps it alive
+            release(tex);                      // the app lets the texture go first...
+            CHECK(com_get(tex_id) != nullptr); // ...the level keeps it alive
             release(surf);
         } else {
             release(surf);
-            CHECK(com_get(tex_id) != nullptr);         // the app still holds the texture
+            CHECK(com_get(tex_id) != nullptr); // the app still holds the texture
             release(tex);
         }
         CHECK(com_get(tex_id) == nullptr && com_get(surf_id) == nullptr);
@@ -627,7 +663,8 @@ static void test_surface_container_refs(uint32_t dev) {
     CHECK(call_method(dev, 38, {0, surfp}) == 0); // GetRenderTarget(0)
     const uint32_t s3 = rd32(surfp);
     CHECK(call_method(dev, 38, {1, surfp}) != 0 || rd32(surfp) == 0); // nothing on slot 1
-    CHECK(call_method(dev, 18, {0, 0, 0, surf2p + 4}) == 0); // GetBackBuffer: put the back buffer back on slot 0
+    CHECK(call_method(dev, 18, {0, 0, 0, surf2p + 4}) ==
+          0); // GetBackBuffer: put the back buffer back on slot 0
     const uint32_t bb = rd32(surf2p + 4);
     CHECK(call_method(dev, 37, {0, bb}) == 0);
     release(bb);
@@ -677,8 +714,7 @@ static void test_device_booleans(uint32_t dev) {
     }
 }
 
-static void test_effect_booleans(uint32_t dev) {
-    const auto fx = effect();
+static uint32_t create_effect(uint32_t dev, const std::vector<uint8_t> &fx, uint32_t pool = 0) {
     // Minimal loaded PE resource directory. This exercises the same export
     // used by a game, with an allocated guest module instead of a disk image.
     const uint32_t module = heap_alloc(0x1000 + uint32_t(fx.size()), true, 16);
@@ -701,9 +737,15 @@ static void test_effect_booleans(uint32_t dev) {
     wr32(root + 0x64, uint32_t(fx.size()));
     memcpy(gm_ptr(module + 0x1000), fx.data(), fx.size());
     CHECK(call_shim(tramp("d3dx9_26.dll", "D3DXCreateEffectFromResourceA"),
-                    {dev, module, 1, 0, 0, 0, 0, sc(0), 0}) == 0);
+                    {dev, module, 1, 0, 0, 0, pool, sc(0), 0}) == 0);
     const uint32_t e = rd32(sc(0));
     CHECK(e != 0);
+    heap_free(module);
+    return e;
+}
+
+static void test_effect_booleans(uint32_t dev) {
+    const uint32_t e = create_effect(dev, effect());
     memcpy(gm_ptr(sc(0x200)), "Switch", 7);
     memcpy(gm_ptr(sc(0x220)), "Many", 5);
     const uint32_t s = call_method(e, 9, {0, sc(0x200)}), m = call_method(e, 9, {0, sc(0x220)});
@@ -816,6 +858,239 @@ static void test_effect_booleans(uint32_t dev) {
     call_method(declaration, 2);
 }
 
+// Two shared matrices exercise the public setters and pool propagation. All
+// bytes are synthetic, including values that a float-equality cache loses.
+static void test_effect_numeric_pool(uint32_t dev) {
+    Bytes b;
+    b.words({0});
+    const uint32_t name = b.text("Matrices"), small = b.text("Small");
+    const uint32_t type = b.words({3, 2, name, 0, 2, 4, 4});
+    const uint32_t small_type = b.words({2, 2, small, 0, 0, 3, 2});
+    const uint32_t value = b.raw(std::vector<uint8_t>(128));
+    const uint32_t small_value = b.raw(std::vector<uint8_t>(24));
+    const uint32_t start = b.words({2, 0, 0, 0});
+    b.words({type, value, 1, 0, small_type, small_value, 0, 0, 0, 0});
+    Bytes blob;
+    blob.words({0xfeff0901u, start});
+    blob.raw(b.data);
+    CHECK(call_shim(tramp("d3dx9_26.dll", "D3DXCreateEffectPool"), {sc(0)}) == 0);
+    const uint32_t pool = rd32(sc(0));
+    const uint32_t a = create_effect(dev, blob.data, pool);
+    const uint32_t z = create_effect(dev, blob.data, pool);
+    memcpy(gm_ptr(sc(0x200)), "Matrices", 9);
+    const uint32_t ap = call_method(a, 9, {0, sc(0x200)});
+    const uint32_t zp = call_method(z, 9, {0, sc(0x200)});
+    CHECK(ap != 0 && zp != 0);
+    uint32_t bits[32] = {};
+    bits[0] = 0x80000000u; // negative zero must not be treated as unchanged +0
+    bits[1] = 0x7fc01234u; // quiet NaN payload survives a repeated setter
+    for (unsigned i = 2; i < 32; ++i) {
+        const float f = float(i);
+        memcpy(&bits[i], &f, 4);
+    }
+    memcpy(gm_ptr(sc(0x300)), bits, sizeof bits);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        CHECK(call_method(a, 40, {ap, sc(0x300), 2}) == 0); // SetMatrixArray
+        CHECK(call_method(z, 41, {zp, sc(0x500), 2}) == 0); // GetMatrixArray
+        CHECK(memcmp(gm_ptr(sc(0x500)), bits, sizeof bits) == 0);
+    }
+    // A write through the other effect changes A's current value. Repeating
+    // A's earlier input must restore that value across the pool.
+    wr32(sc(0x300), 0x3f800000u);
+    CHECK(call_method(z, 38, {zp, sc(0x300)}) == 0);
+    CHECK(call_method(a, 39, {ap, sc(0x500)}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x3f800000u);
+    memcpy(gm_ptr(sc(0x300)), bits, sizeof bits);
+    CHECK(call_method(a, 38, {ap, sc(0x300)}) == 0);
+    CHECK(call_method(z, 41, {zp, sc(0x500), 2}) == 0);
+    CHECK(memcmp(gm_ptr(sc(0x500)), bits, sizeof bits) == 0);
+    // Raw writes use the same pool contract and must invalidate a later
+    // repeated typed write through another effect.
+    wr32(sc(0x300), 0x40000000u);
+    CHECK(call_method(z, 78, {zp, sc(0x300), 0, 4}) == 0); // SetRawValue
+    CHECK(call_method(a, 39, {ap, sc(0x500)}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x40000000u);
+    memcpy(gm_ptr(sc(0x300)), bits, sizeof bits);
+    CHECK(call_method(a, 38, {ap, sc(0x300)}) == 0);
+    CHECK(call_method(z, 41, {zp, sc(0x500), 2}) == 0);
+    CHECK(memcmp(gm_ptr(sc(0x500)), bits, sizeof bits) == 0);
+    // New peers inherit the latest value, including the untouched array tail.
+    const uint32_t joined = create_effect(dev, blob.data, pool);
+    const uint32_t jp = call_method(joined, 9, {0, sc(0x200)});
+    CHECK(call_method(joined, 41, {jp, sc(0x500), 2}) == 0);
+    CHECK(memcmp(gm_ptr(sc(0x500)), bits, sizeof bits) == 0);
+    CHECK(call_method(a, 46, {ap, sc(0x300), 2}) == 0); // SetMatrixTransposeArray
+    CHECK(call_method(z, 41, {zp, sc(0x500), 2}) == 0);
+    for (unsigned e = 0; e < 2; ++e)
+        for (unsigned row = 0; row < 4; ++row)
+            for (unsigned col = 0; col < 4; ++col)
+                CHECK(rd32(sc(0x500) + 4 * (e * 16 + row * 4 + col)) ==
+                      bits[e * 16 + col * 4 + row]);
+    // The fallback retains packing and float-to-int conversion for a 2x3 matrix.
+    memcpy(gm_ptr(sc(0x200)), "Small", 6);
+    const uint32_t sp = call_method(a, 9, {0, sc(0x200)});
+    float matrix[16];
+    for (unsigned i = 0; i < 16; ++i)
+        matrix[i] = float(i) + 0.5f;
+    memcpy(gm_ptr(sc(0x300)), matrix, sizeof matrix);
+    CHECK(call_method(a, 38, {sp, sc(0x300)}) == 0);
+    CHECK(call_method(a, 21, {sp, sc(0x500), 24}) == 0); // GetValue
+    for (unsigned row = 0; row < 2; ++row)
+        for (unsigned col = 0; col < 3; ++col)
+            CHECK(rd32(sc(0x500) + 4 * (row * 3 + col)) == row * 4 + col);
+    // Cached peer addresses must be rebuilt before a later setter can use
+    // a destroyed effect, and a replacement must inherit the current value.
+    call_method(z, 2);
+    wr32(sc(0x300), 0x40400000u);
+    CHECK(call_method(a, 78, {ap, sc(0x300), 0, 4}) == 0);
+    CHECK(call_method(joined, 21, {jp, sc(0x500), 4}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x40400000u);
+    const uint32_t replacement = create_effect(dev, blob.data, pool);
+    memcpy(gm_ptr(sc(0x200)), "Matrices", 9);
+    const uint32_t rp = call_method(replacement, 9, {0, sc(0x200)});
+    CHECK(call_method(replacement, 21, {rp, sc(0x500), 4}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x40400000u);
+    wr32(sc(0x300), 0x40800000u);
+    CHECK(call_method(joined, 78, {jp, sc(0x300), 0, 4}) == 0);
+    CHECK(call_method(a, 21, {ap, sc(0x500), 4}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x40800000u);
+    CHECK(call_method(replacement, 21, {rp, sc(0x500), 4}) == 0);
+    CHECK(rd32(sc(0x500)) == 0x40800000u);
+    call_method(replacement, 2);
+    call_method(joined, 2);
+
+    call_method(a, 2);
+    call_method(pool, 2);
+}
+
+// Synthetic numeric effects exercise the guest API and the registers consumed
+// by drawing. The expected values are independent row/column layout fixtures.
+static std::vector<uint8_t> numeric_effect(uint32_t cls, uint32_t rows, uint32_t cols,
+                                           uint32_t count, uint32_t index = 7, uint32_t type = 3) {
+    Bytes b;
+    b.words({0});
+    const uint32_t name = b.text("Numeric"), tn = b.text("Main"), pn = b.text("P0");
+    const uint32_t t = b.words({type, cls, name, 0, 2, cols, rows});
+    const uint32_t value = b.raw(std::vector<uint8_t>(2 * rows * cols * 4));
+    const uint32_t vt = b.words({16, 4, 0, 0, 0}), vi = b.words({1});
+    const uint32_t start = b.words({1, 1, 0, 1});
+    b.words({t, value, 1, 0});
+    b.words({tn, 0, 1, pn, 0, 1, 146, 0, vt, vi});
+    b.words({1, 0});
+    Bytes table;
+    table.words({28, 0, 0xfffe0200u, 1, 28, 0, 0});
+    table.words({64, 2u | index << 16, count, 48, 0});
+    table.words({cls | type << 16, rows | cols << 16, 2, 0});
+    table.raw(std::vector<uint8_t>{'N', 'u', 'm', 'e', 'r', 'i', 'c', 0});
+    Bytes code;
+    code.words({0xfffe0200u, 0xfffeu | uint32_t((table.data.size() + 4) / 4) << 16, 0x42415443u});
+    code.raw(table.data);
+    code.words(
+        {0x0200001fu, 0x80000000u, 0x900f0000u, 0x02000001u, 0xc00f0000u, 0x90e40000u, 0xffffu});
+    b.words({1, uint32_t(code.data.size())});
+    b.raw(code.data);
+    Bytes out;
+    out.words({0xfeff0901u, start});
+    out.raw(b.data);
+    return out.data;
+}
+
+static void test_numeric_binding(uint32_t dev) {
+    const std::array<float, 32> row_order = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
+                                             12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                                             23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
+    const std::array<float, 32> column_order = {1,  5,  9,  13, 2,  6,  10, 14, 3,  7,  11,
+                                                15, 4,  8,  12, 16, 17, 21, 25, 29, 18, 22,
+                                                26, 30, 19, 23, 27, 31, 20, 24, 28, 32};
+    struct Case {
+        uint32_t cls, rows, cols, count, index, type;
+        std::vector<float> expected;
+    };
+    const std::vector<Case> cases = {
+        {2, 4, 4, 8, 7, 3, {row_order.begin(), row_order.end()}},
+        {3, 4, 4, 8, 7, 3, {column_order.begin(), column_order.end()}},
+        {3, 4, 4, 3, 7, 3, {1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15}},
+        {2, 4, 4, 8, 253, 3, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}},
+        {1, 1, 4, 2, 7, 3, {1, 2, 3, 4, 5, 6, 7, 8}},
+        {1, 1, 4, 3, 7, 3, {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0}},
+        {1, 1, 3, 2, 7, 3, {1, 2, 3, 0, 4, 5, 6, 0}},
+        {2, 2, 3, 4, 7, 3, {1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0}},
+        {3, 2, 3, 6, 7, 3, {1, 4,  0, 0, 2, 5,  0, 0, 3, 6,  0, 0,
+                            7, 10, 0, 0, 8, 11, 0, 0, 9, 12, 0, 0}},
+        {1, 1, 4, 2, 7, 2, {1, 2, 3, 4, 5, 6, 7, 8}},
+    };
+    for (const auto &c : cases) {
+        const uint32_t e =
+            create_effect(dev, numeric_effect(c.cls, c.rows, c.cols, c.count, c.index, c.type));
+        memcpy(gm_ptr(sc(0x200)), "Numeric", 8);
+        const uint32_t p = call_method(e, 9, {0, sc(0x200)});
+        const unsigned slots = 2 * c.rows * c.cols;
+        for (unsigned i = 0; i < slots; ++i) {
+            if (c.type == 3)
+                memcpy(gm_ptr(sc(0x300) + 4 * i), &row_order[i], 4);
+            else
+                wr32(sc(0x300) + 4 * i, i + 1);
+        }
+        CHECK(call_method(e, 20, {p, sc(0x300), slots * 4}) == 0);
+        D9Pipeline &pl = d9_pipeline(com_this(dev)->id);
+        memset(pl.vconst, 0x42, sizeof pl.vconst);
+        CHECK(call_method(e, 63, {sc(0x20), 0}) == 0);
+        CHECK(call_method(e, 64, {0}) == 0);
+        CHECK(memcmp(pl.vconst[c.index], c.expected.data(), c.expected.size() * 4) == 0);
+        CHECK(reinterpret_cast<uint8_t *>(pl.vconst)[c.index * 16 - 1] == 0x42);
+        if (c.index + c.expected.size() / 4 < 256)
+            CHECK(reinterpret_cast<uint8_t *>(pl.vconst)[c.index * 16 + c.expected.size() * 4] ==
+                  0x42);
+        // An external device write must not survive the next effect commit.
+        memset(gm_ptr(sc(0x600)), 0, 16);
+        CHECK(call_method(dev, 94, {c.index, sc(0x600), 1}) == 0);
+        CHECK(call_method(e, 65) == 0);
+        CHECK(memcmp(pl.vconst[c.index], c.expected.data(), c.expected.size() * 4) == 0);
+        if (c.type == 3) {
+            // Byte-exact zeros and NaN payloads survive direct and transposed paths.
+            wr32(sc(0x300), 0x80000000u);
+            wr32(sc(0x304), 0x7fc01234u);
+            CHECK(call_method(e, 78, {p, sc(0x300), 0, 8}) == 0);
+            CHECK(call_method(e, 65) == 0);
+            uint32_t bits = 0;
+            memcpy(&bits, &pl.vconst[c.index][0], 4);
+            CHECK(bits == 0x80000000u);
+            memcpy(&bits, c.cls == 3 ? &pl.vconst[c.index + 1][0] : &pl.vconst[c.index][1], 4);
+            CHECK(bits == 0x7fc01234u);
+        }
+        call_method(e, 66);
+        call_method(e, 67);
+        call_method(e, 2);
+    }
+}
+
+static void test_numeric_scale(uint32_t dev) {
+    const uint32_t e = create_effect(dev, numeric_effect(1, 1, 4, 2));
+    memcpy(gm_ptr(sc(0x200)), "Numeric", 8);
+    const uint32_t p = call_method(e, 9, {0, sc(0x200)});
+    const float input[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const float scaled[8] = {2, 1, 0, -4, 10, 3, 0, -8};
+    memcpy(gm_ptr(sc(0x300)), input, sizeof input);
+    CHECK(call_method(e, 20, {p, sc(0x300), sizeof input}) == 0);
+    CHECK(call_method(e, 63, {sc(0x20), 0}) == 0);
+    CHECK(call_method(e, 64, {0}) == 0);
+    D9Pipeline &pl = d9_pipeline(com_this(dev)->id);
+    CHECK(memcmp(pl.vconst[7], input, sizeof input) == 0);
+    test_scale_enabled = true;
+    ++test_scale_generation;
+    CHECK(call_method(e, 65) == 0);
+    CHECK(memcmp(pl.vconst[7], scaled, sizeof scaled) == 0);
+    CHECK(call_method(e, 65) == 0);
+    CHECK(memcmp(pl.vconst[7], scaled, sizeof scaled) == 0);
+    test_scale_enabled = false;
+    ++test_scale_generation;
+    CHECK(call_method(e, 65) == 0);
+    CHECK(memcmp(pl.vconst[7], input, sizeof input) == 0);
+    call_method(e, 66);
+    call_method(e, 67);
+    call_method(e, 2);
+}
+
 int main() {
     test_volume_dds();
     mem_init();
@@ -834,6 +1109,7 @@ int main() {
     test_depth_stencil_get(dev);
     test_surface_container_refs(dev);
     test_effect_booleans(dev);
+    test_effect_numeric_pool(dev);
     test_volume(dev);
     test_state_getters_and_readback(dev);
     const uint32_t bound = make_volume(dev);
@@ -845,6 +1121,10 @@ int main() {
     CHECK(!com_get(bound_id) && !com_get(child_id));
     if (const uint32_t refs_dev = make_device()) // Test157c, on a device of its own (it Resets)
         test_depth_stencil_refs(refs_dev);
+    const uint32_t numeric_dev = make_device();
+    test_numeric_binding(numeric_dev);
+    test_numeric_scale(numeric_dev);
+    call_method(numeric_dev, 2);
     printf("d3d9 guest/effect: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

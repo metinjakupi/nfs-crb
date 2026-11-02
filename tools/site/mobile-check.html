@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Carbon mobile compatibility check</title>
+<style>
+body{margin:0;background:#070c16;color:#e9f6ff;font:16px/1.5 system-ui;padding:max(24px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left))}main{max-width:720px;margin:auto}h1{color:#5fe4f2}button{min-height:48px;padding:12px 20px;background:#5fe4f2;color:#070c16;border:0;font:inherit;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101b2b;padding:16px}li{margin:12px 0}
+</style>
+<main><h1>Carbon mobile check</h1>
+<p>Check this browser before loading the game. This does not open or change your career. Passing these checks does not guarantee that the full game will run.</p>
+<button id="run">Check this device</button> <button id="download" hidden>Download results</button>
+<ol id="steps" aria-live="polite"></ol><pre id="result" hidden></pre></main>
+<script>
+"use strict";
+const run = document.querySelector('#run'), download = document.querySelector('#download');
+let report;
+async function check(name, action) {
+  const item = document.createElement('li');
+  item.textContent = name + '…'; document.querySelector('#steps').append(item);
+  try { const details = await action(); report.checks.push({name, passed:true, details}); item.textContent = name + ': passed'; }
+  catch(error) { report.checks.push({name, passed:false, error:String(error.message || error)}); item.textContent = name + ': ' + String(error.message || error); }
+}
+run.onclick = async () => {
+  run.disabled = true; download.hidden = true; document.querySelector('#steps').replaceChildren();
+  report = {version:1, time:new Date().toISOString(), userAgent:navigator.userAgent, cores:navigator.hardwareConcurrency || null, screen:{width:screen.width,height:screen.height,dpr:devicePixelRatio,touches:navigator.maxTouchPoints}, checks:[]};
+  try {
+    await check('Secure browser and shared memory', async () => {
+      if (!isSecureContext || !crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') throw Error('Open this check on an HTTPS Carbon page with browser isolation enabled.');
+      return {isolated:crossOriginIsolated};
+    });
+    await check('WebAssembly shared memory and worker', async () => {
+      const memory = new WebAssembly.Memory({initial:1,maximum:2,shared:true});
+      const url = URL.createObjectURL(new Blob(['onmessage=e=>{Atomics.store(new Int32Array(e.data.buffer),0,42);postMessage(42)}'],{type:'text/javascript'}));
+      let worker;
+      try { worker = new Worker(url); await new Promise((resolve,reject) => {
+        const timer = setTimeout(() => reject(Error('Worker did not answer within 10 seconds.')),10000);
+        worker.onmessage = () => {clearTimeout(timer); Atomics.load(new Int32Array(memory.buffer),0) === 42 ? resolve() : reject(Error('Shared memory did not reach the worker.'));};
+        worker.onerror = () => {clearTimeout(timer);reject(Error('Worker could not start.'));}; worker.postMessage(memory);
+      }); return {sharedBytes:memory.buffer.byteLength}; }
+      finally {worker?.terminate();URL.revokeObjectURL(url);}
+    });
+    await check('WebGPU graphics device', async () => {
+      if (!navigator.gpu) throw Error('WebGPU is unavailable in this browser.');
+      const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw Error('No graphics adapter was available.');
+      const device = await adapter.requestDevice();
+      try {return {features:[...adapter.features],maxBufferSize:adapter.limits.maxBufferSize,maxTextureDimension2D:adapter.limits.maxTextureDimension2D};}
+      finally {device.destroy();}
+    });
+    await check('Browser game storage', async () => {
+      await navigator.storage.getDirectory(); const estimate = await navigator.storage.estimate();
+      return {quota:estimate.quota,usage:estimate.usage};
+    });
+  } finally {
+    run.disabled = false; download.hidden = false;
+    const output = document.querySelector('#result'); output.hidden = false; output.textContent = JSON.stringify(report,null,2);
+  }
+};
+download.onclick = () => { const url = URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'})); const a = document.createElement('a');a.href=url;a.download='carbon-mobile-check.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); };
+</script>
+</html>

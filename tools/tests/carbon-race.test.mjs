@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 
-const source = await readFile(new URL('../../source/web/race.js', import.meta.url), 'utf8');
+const source = await readFile(process.env.CARBON_RACE_SOURCE || new URL('../../source/web/race.js', import.meta.url), 'utf8');
 
 class Element {
   constructor(tag = 'div') {
@@ -12,10 +12,12 @@ class Element {
     this.hidden = false;
     this.textContent = '';
     this.className = '';
+    this.events = new Map();
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = [...children]; }
-  addEventListener() {}
+  addEventListener(type,fn) { this.events.set(type,fn); }
+  click() { this.events.get("click")?.({preventDefault(){}}); }
   setAttribute() {}
   get childElementCount() { return this.children.filter(value => value instanceof Element).length; }
 }
@@ -24,6 +26,7 @@ function harness() {
   const listeners = new Map();
   const intervals = [];
   const sent = [];
+  const navigation = [];
   let now = 1000;
   const buffer = new SharedArrayBuffer(4096);
   const u32 = new Uint32Array(buffer);
@@ -31,6 +34,7 @@ function harness() {
   u32[0x2cc / 4] = 3;
   const context = {
     console,
+    location: {pathname:"/play/nfsc/",replace:path=>navigation.push(path)},
     TextEncoder,
     Uint8Array,
     Uint32Array,
@@ -67,6 +71,7 @@ function harness() {
   return {
     context,
     sent,
+    navigation,
     tick,
     setNow(value) { now = value; },
     game(values) {
@@ -180,4 +185,38 @@ test('an invitation can join only with a loaded car in the frontend', () => {
   h.context.recompRace.join();
   assert.equal(h.sent.filter(m => m.k === 'join').length, 1);
   assert.equal(h.sent.find(m => m.k === 'join').car, 123);
+});
+
+const nodeText = node => typeof node === 'string' ? node : node.textContent + node.children.map(nodeText).join(' ');
+function findButton(node,label) {
+ if (!(node instanceof Element)) return null;
+ if (node.tagName==='BUTTON' && nodeText(node)===label) return node;
+ for (const child of node.children) { const match=findButton(child,label);if(match)return match; }
+ return null;
+}
+for(const busy of [false,true]) test(`cancelled loading provides a working exit while native state is unavailable: ${busy}`,()=>{
+ const h=harness();start(h);h.game({phase:0,flow:6,session:77,busy});
+ h.setNow(62000);h.tick();
+ const exit=findButton(h.context.document.body,'Exit to start page');
+ assert.ok(exit,'cancelled race must always offer exit');
+ assert.equal(findButton(h.context.document.body,'Dismiss'),null,'cannot dismiss into loading');
+ let quit=false;h.context.addEventListener('recomp-quit',()=>{quit=true;});
+ exit.click();assert.equal(quit,true);assert.deepEqual(h.navigation,['/play/nfsc/']);
+ assert.equal(h.sent.some(m=>m.k==='finish'),false);
+});
+test('a cancelled race can be dismissed only after the native game is back in its menus',()=>{
+ const h=harness();start(h);h.game({phase:3,flow:6,session:77});h.setNow(62000);h.tick();
+ assert.equal(findButton(h.context.document.body,'Dismiss'),null);
+ h.game({phase:0,flow:3});h.context.dispatchEvent({type:'recomp-online',detail:{me:1}});
+ const dismiss=findButton(h.context.document.body,'Dismiss');assert.ok(dismiss);dismiss.click();
+ assert.equal(h.context.recompRace.state().race,null);
+});
+
+test('Online panel joins and leaves the selected invitation rather than the newest one',()=>{
+ const h=harness();h.game({flow:3,car:123});
+ for(const [id,race] of [[2,78],[3,79]]) h.message({t:'race',k:'lobby',id,race,name:`Host ${id}`,key:0x8ef528ca,type:2,opts:'00'.repeat(40),roster:[{id,name:`Host ${id}`,car:1}]});
+ h.context.recompRace.join(78);
+ assert.equal(h.sent.at(-1).k,'join');assert.equal(h.sent.at(-1).race,78);
+ h.context.recompRace.leave(78);
+ assert.equal(h.sent.at(-1).k,'leave');assert.equal(h.sent.at(-1).race,78);
 });

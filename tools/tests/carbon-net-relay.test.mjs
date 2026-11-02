@@ -283,11 +283,11 @@ test("authentication and a room limit of eight (CARBON_ROOM_MAX) preserve room c
   const clients = [];
   for (let i = 0; i < 8; i++) clients.push(await connect(t, relay, "lobby", `Player ${i}`));
   const ninth = new WebSocket(relay.ws());
-  let admitted = false;
+  let admitted = false, rejected = false;
   ninth.addEventListener("open", () => { admitted = true; });
-  ninth.addEventListener("error", () => {});
+  ninth.addEventListener("error", () => { rejected = true; });
   t.after(() => ninth.close());
-  await until(() => ninth.readyState === WebSocket.CLOSED, "full room rejection");
+  await until(() => rejected || ninth.readyState === WebSocket.CLOSED, "full room rejection");
   assert.equal(admitted, false);
   assert.deepEqual(await relay.stats(), { players: 8, here: 8 });
   clients[7].ws.close();
@@ -961,9 +961,12 @@ test("rooms take far more than eight players by default", async (t) => {
   const limited = await start(t, { CARBON_ROOM_MAX: "12" });
   for (let i = 0; i < 12; i++) await join(t, limited, `Player ${i}`);
   const refused = new WebSocket(limited.ws());
-  refused.addEventListener("error", () => {});
+  let admitted = false, rejected = false;
+  refused.addEventListener("open", () => { admitted = true; });
+  refused.addEventListener("error", () => { rejected = true; });
   t.after(() => refused.close());
-  await until(() => refused.readyState === WebSocket.CLOSED, "the thirteenth refused");
+  await until(() => rejected || refused.readyState === WebSocket.CLOSED, "the thirteenth refused");
+  assert.equal(admitted, false);
   assert.deepEqual(await limited.stats(), { players: 12, here: 12 });
 });
 
@@ -1093,7 +1096,7 @@ test("the map feed: everyone driving, once a second, in whole metres and degrees
   assert.deepEqual(next, { t: "where", p: expected });
 });
 
-test("chat and the horn reach nearby players and the crew only; race messages the whole room", async (t) => {
+test("chat reaches the whole room without driving; the horn stays nearby or crew", async (t) => {
   const relay = await start(t, { CARBON_INTEREST_K: "1" });
   // In this order each one's first pick is already the nearest: Far's is Near, Near's and R's
   // each other, Mate's is Far.
@@ -1110,7 +1113,7 @@ test("chat and the horn reach nearby players and the crew only; race messages th
   assert.equal((await n.read("chat")).text, "Race me!");
   assert.equal((await m.read("chat")).text, "Race me!", "a crew-mate anywhere in the room");
   await sync(r, f);
-  assert.equal(f.messages.some((x) => x.t === "chat"), false, "a stranger far away does not");
+  assert.equal((await f.read("chat")).text, "Race me!", "a stranger far away receives room chat");
   r.send({ t: "horn", on: true });
   assert.deepEqual(await n.read("horn"), { t: "horn", id: r.welcome.id, on: true });
   await m.read("horn");
@@ -1125,7 +1128,12 @@ test("chat and the horn reach nearby players and the crew only; race messages th
   r.send({ t: "chat", text: "Where did you go?" });
   assert.equal((await q.read("chat")).text, "Where did you go?");
   await sync(r, n);
-  assert.equal(n.messages.some((x) => x.t === "chat"), false, "Near is out of reach now");
+  assert.equal((await n.read("chat")).text, "Where did you go?", "chat continues after driving away");
+  const garage = await join(t, relay, "Garage");
+  garage.send({ t: "chat", text: "Hello from the garage" });
+  assert.equal((await r.read("chat")).text, "Hello from the garage");
+  r.send({ t: "chat", text: "Hello garage" });
+  assert.equal((await garage.read("chat")).text, "Hello garage");
   r.send({ t: "horn", on: false });
   assert.deepEqual(await n.read("horn"), { t: "horn", id: r.welcome.id, on: false });
   assert.deepEqual(await q.read("horn"), { t: "horn", id: r.welcome.id, on: false });
@@ -1852,6 +1860,60 @@ test("street race workers transfer records, names and identity through shared me
 
 // Visual encounters have a separate transport: no career/race messages, spoofed owner,
 // cross-room delivery, or unbounded actor list. Existing player/cops tests do not cover it.
+test("race activity hides racers from free roam while preserving race peers and fresh return poses", async (t) => {
+  const relay = await start(t);
+  const alice = await gameLink(t, relay, "Alice"), bob = await gameLink(t, relay, "Bob"), carol = await gameLink(t, relay, "Carol");
+  function nativeActivity(link) {
+    const buffer = new SharedArrayBuffer(4096), u32 = new Uint32Array(buffer);
+    u32[0] = 0x31435243; u32[0x2cc / 4] = 0xc06;
+    link.post({t: "activity-block", memory: {buffer}, ptr: 0});
+    return (race, session = 0) => {
+      u32[0x260 / 4]++; u32[0x2cc / 4] = race ? 0x606 : 0xc06; u32[0x2bc / 4] = session; u32[0x260 / 4]++;
+    };
+  }
+  const a = nativeActivity(alice), b = nativeActivity(bob); nativeActivity(carol);
+  const spin = async () => { alice.tick(); bob.tick(); carol.tick(); await delay(50); };
+  alice.publish(1500); bob.publish(1500); carol.publish(1500); await spin();
+  await until(() => carol.slot(alice.id) >= 0, "Alice visible in free roam");
+  alice.post({t: "racers", ids: [bob.id]}); bob.post({t: "racers", ids: [alice.id]});
+  a(true, 701); b(true, 701); alice.publish(1600); bob.publish(1600); await spin();
+  alice.publish(1700); bob.publish(1700); await spin();
+  await until(() => alice.slot(bob.id) >= 0 && bob.slot(alice.id) >= 0, "race participants retain their opponent");
+  assert.equal(carol.slot(alice.id), -1, "free-roam observer loses racer car");
+  assert.equal(carol.slot(bob.id), -1, "free-roam observer loses second racer car");
+  const state = carol.posted.filter(m => m.t === "state").at(-1);
+  assert.equal(state.people.find(p => p.id === alice.id).activity, "race", "racer remains in player list");
+  await delay(1100); await spin();
+  assert.ok(carol.posted.some(m => m.t === "where"));
+  assert.ok(carol.posted.filter(m => m.t === "where").every(m => !m.p.some(p => p[0] === alice.id || p[0] === bob.id)), "race map points are filtered");
+  // A paused race still belongs to the race, never to the parked-car path.
+  alice.publish(1800, pose.s, 0); await spin();
+  assert.equal(carol.slot(alice.id), -1);
+  assert.ok(bob.slot(alice.id) >= 0);
+  const late = await gameLink(t, relay, "Late observer"); nativeActivity(late);
+  late.publish(1800); late.tick(); await delay(50);
+  assert.equal(late.slot(alice.id), -1, "late join does not briefly expose an unknown racing player");
+  alice.tick(1100); bob.tick(1100); carol.tick(1100); late.tick(1100); await delay(50);
+  assert.equal(late.posted.filter(m => m.t === "state").at(-1).people.find(p => p.id === alice.id).activity, "race");
+  assert.equal(late.slot(alice.id), -1);
+  late.close();
+  // Returning activity invalidates the final race pose, even if another is already queued.
+  a(false); alice.tick(); await delay(50);
+  assert.equal(carol.slot(alice.id), -1, "old race pose cannot restore car");
+  alice.publish(1800); await spin();
+  assert.equal(carol.slot(alice.id), -1, "equal-time pose remains stale");
+  const returnedPose = [...pose.s]; returnedPose[4] = 100; returnedPose[6] = 200;
+  alice.publish(1900, returnedPose); await spin();
+  await until(() => carol.slot(alice.id) >= 0, "fresh free-roam pose restores car");
+  await delay(1100); await spin();
+  const returnedMap = carol.posted.filter(m => m.t === "where").at(-1).p.find(p => p[0] === alice.id);
+  assert.deepEqual(Array.from(returnedMap).slice(1, 3), [100, 200], "map restores the fresh free-roam position");
+  // Different simultaneous sessions must never expose a reused opponent identity.
+  a(true, 702); b(true, 703); alice.publish(2000); bob.publish(2000); await spin();
+  assert.equal(alice.slot(bob.id), -1);
+  assert.equal(bob.slot(alice.id), -1);
+});
+
 test("rivals: owner identity, appearance, removal, validation and room isolation", async (t) => {
   const relay = await start(t), a = await connect(t, relay, "lobby", "Ana"), b = await connect(t, relay, "lobby", "Ben");
   const other = await connect(t, relay, "elsewhere", "Other"), silent = await connect(t, relay, "lobby");
@@ -1872,41 +1934,18 @@ test("rivals: owner identity, appearance, removal, validation and room isolation
   for (const p of [a, b, other, silent]) assert.equal(p.messages.filter(x => x.t === "rivals").length, 0);
 });
 
-test("rival workers preserve appearance and clear ended, stale and disconnected encounters", async (t) => {
-  const relay = await start(t), ana = await gameLink(t, relay, "Ana"), ben = await gameLink(t, relay, "Ben");
-  function block(link) {
-    const buffer = new SharedArrayBuffer(0x3be0), u32 = new Uint32Array(buffer), f32 = new Float32Array(buffer), u8 = new Uint8Array(buffer);
-    u32[0] = 0x31564952; u32[1] = 1;
-    link.post({t: "rival-block", memory: {buffer}, ptr: 0});
-    return {u32, f32, u8};
-  }
-  const a = block(ana), b = block(ben), slot = 0x1200 / 4;
-  ana.publish(1500); ben.publish(1500); ana.tick(); ben.tick();
-  await until(() => { ana.tick(100); ben.tick(100); return ana.slot(ben.id) >= 0; }, "players visible");
-  a.u32[4] = 1500; a.u32[5] = 1;
-  a.u32.set([12, pose.k, 0x434, 99], 8); a.f32.set(pose.s, 12);
-  a.u8.fill(7, 0x64, 0x64 + 0x434);
+test("current clients do not publish AI rival replicas even with an older native block", async (t) => {
+  const relay = await start(t), ana = await gameLink(t, relay, "Ana");
+  const legacy = await connect(t, relay, "lobby", "Legacy spectator", false, false, {rivals: 1});
+  const buffer = new SharedArrayBuffer(0x3be0), u32 = new Uint32Array(buffer), f32 = new Float32Array(buffer), u8 = new Uint8Array(buffer);
+  u32[0] = 0x31564952; u32[1] = 1;
+  ana.post({t: "rival-block", memory: {buffer}, ptr: 0});
+  ana.publish(1500); ana.tick();
+  u32[4] = 1500; u32[5] = 1;
+  u32.set([12, pose.k, 0x434, 99], 8); f32.set(pose.s, 12);
+  u8.fill(7, 0x64, 0x64 + 0x434);
   ana.tick(100);
-  await until(() => { ben.tick(10); return b.u32[slot] === ana.id; }, "rival reaches receiving game");
-  assert.deepEqual(Array.from(b.u32.subarray(slot + 2, slot + 4)), [pose.k, 1]);
-  assert.equal(b.u32[slot + 5], 12);
-  assert.equal(b.u32[slot + 64], 0x434);
-  assert.equal(b.u8[0x1200 + 0x108 + 1075], 7);
-  assert.deepEqual(Array.from(b.f32.subarray(slot + 9, slot + 22)), pose.s);
-  a.u32[4] = 1600; a.f32[16] = 14; ana.tick(100);
-  await until(() => { ben.tick(10); return b.u32[slot + 4] >= 2; }, "pose without repeated appearance");
-  assert.equal(b.u8[0x1200 + 0x108 + 1075], 7);
-  // An actor can change model while its physics clock is paused.
-  a.u32[9] = pose.k + 1; ana.tick(100);
-  await until(() => { ben.tick(10); return b.u32[slot + 2] === pose.k + 1; }, "replacement model at unchanged timestamp");
-  a.u32[5] = 0; ana.tick(100);
-  await until(() => { ben.tick(10); return b.u32[slot] === 0; }, "encounter ends");
-  a.u32[5] = 1; a.u32[4] = 1700; ana.tick(2100);
-  await until(() => { ben.tick(10); return b.u32[slot] === ana.id; }, "new encounter appears");
-  ben.tick(3100);
-  assert.equal(b.u32[slot], 0, "stale owner cannot leave cars behind");
-  a.u32[4] = 1800; ana.tick(2100);
-  await until(() => { ben.tick(10); return b.u32[slot] === ana.id; }, "fresh appearance restores copy");
-  ana.close();
-  await until(() => { ben.tick(10); return b.u32[slot] === 0; }, "disconnect clears copy");
+  await delay(100);
+  assert.equal(legacy.messages.some(m => m.t === "rivals"), false, "removed spectator feature sends no rival cars");
+  assert.equal(u32[2], 0, "old native rival scanning stays disabled");
 });

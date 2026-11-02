@@ -1894,6 +1894,9 @@ const uint32_t WAIT_TIMEOUT_ = 0x102;
 enum WaitKind : uint8_t { W_NONE, W_OBJECTS, W_CRITSEC };
 
 struct GuestThread {
+    std::condition_variable_any wake;
+    bool wake_registered = false;
+    GuestThread *wake_next = nullptr;
     size_t index = 0;
     uint32_t handle = 0; // 0 for the main thread: it has none
     uint32_t id = 1;     // GetCurrentThreadId
@@ -1950,8 +1953,31 @@ std::vector<GuestThread *> &threads() {
 }
 
 std::mutex g_sched_m;
-std::condition_variable_any g_sched_cv;
 size_t g_baton = 0; // index of the thread allowed to run
+// Each guest thread waits on its own condition variable. A normal baton handoff
+// wakes only its recipient; unrelated sleepers keep waiting on their own events.
+// Shared state changes and shutdown still broadcast. All calls hold g_sched_m.
+// Host signals may arrive while the baton holder creates a guest thread.
+// Keep the broadcast roster under the scheduler lock instead of reading the
+// guest-owned thread vector. Registered threads live until process exit.
+GuestThread *g_sched_wakes = nullptr;
+void sched_register_wake_locked(GuestThread *t) {
+    if (!t->wake_registered) {
+        t->wake_next = g_sched_wakes;
+        g_sched_wakes = t;
+        t->wake_registered = true;
+    }
+}
+void sched_notify_all_locked() {
+    for (GuestThread *t = g_sched_wakes; t; t = t->wake_next)
+        t->wake.notify_one();
+}
+void sched_notify_baton_locked() {
+    if (g_baton < threads().size())
+        threads()[g_baton]->wake.notify_one();
+    else
+        sched_notify_all_locked(); // nobody owns the baton: recheck deadlines
+}
 // Threads back from free run (sched_free_run_leave) waiting for the baton. The holder reads it at
 // its checkpoints without the lock, so it is atomic; it is changed under g_sched_m.
 std::atomic<int> g_baton_wanted{0};
@@ -2005,6 +2031,8 @@ bool g_thread_start_from_create = false;
 // queued here under the scheduler lock and applied by the next thread to enter
 // the scheduler, which by construction is the baton holder.
 std::vector<uint32_t> g_host_signals;
+// Checkpoints read only this flag without the lock, never the shared vector.
+std::atomic<bool> g_host_signals_pending{false};
 // ---------------------------------------------------------------------------
 // Idling on the run thread.
 //
@@ -2205,7 +2233,7 @@ bool sched_in_idle_slice() {
 // it so it re-evaluates. Signalling costs nothing when nobody is parked.
 void sched_input_arrived() {
     g_sched_m.lock();
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -2286,7 +2314,7 @@ void deadline_ticker_main() {
         t.armed_ns = 0;
         l.unlock();
         g_sched_m.lock();
-        g_sched_cv.notify_all();
+        sched_notify_all_locked();
         g_sched_m.unlock();
         if (g_idle_wake && g_in_idle_slice)
             g_idle_wake();
@@ -2316,6 +2344,7 @@ void sched_ticker_arm(double until) {
 // across a host slice, so the host may call back into the runtime - signalling
 // a guest event, most obviously - without deadlocking against the scheduler.
 void sched_wait_locked(size_t me, double until, double max_slice) {
+    sched_register_wake_locked(threads()[me]);
     double now = sched_now();
     if (until && until <= now)
         return;
@@ -2334,7 +2363,7 @@ void sched_wait_locked(size_t me, double until, double max_slice) {
         // anything the guest would see - input delivery, and mod callbacks
         // above all - until it holds the baton itself.
         g_in_idle_slice = true;
-        // AppKit's event wait cannot hear g_sched_cv. Sleeping there for each
+        // AppKit's event wait cannot hear this condition variable. Sleeping there for each
         // handoff makes short mouse/keyboard workers cost a full 2 ms slice,
         // many times per rendered frame while the pointer moves. Poll events
         // first, then wait on the notification the returning worker signals.
@@ -2354,7 +2383,7 @@ void sched_wait_locked(size_t me, double until, double max_slice) {
         return;
     if (wait > 1.0)
         wait = 1.0;
-    g_sched_cv.wait_for(g_sched_m, std::chrono::duration<double>(wait));
+    threads()[me]->wake.wait_for(g_sched_m, std::chrono::duration<double>(wait));
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,6 +2639,7 @@ void apply_host_signals_locked() {
             o->signalled = true;
     }
     g_host_signals.clear();
+    g_host_signals_pending.store(false, std::memory_order_release);
 }
 
 void sched_expire_locked() {
@@ -2754,7 +2784,7 @@ void sched_run_others_locked(size_t me, const char *why) {
         if (next != NO_THREAD) {
             g_baton = next;
             record_handoff_locked(me, next, why);
-            g_sched_cv.notify_all();
+            sched_notify_baton_locked();
             // Wait for the baton, then loop: holding it is not the same as
             // being runnable, and a thread that ends hands the baton on
             // without knowing who is eligible. The run thread services the
@@ -2841,7 +2871,7 @@ void sched_handoff_on_exit_locked(size_t me, const char *why) {
         next = 0;
     g_baton = next;
     record_handoff_locked(me, next, why);
-    g_sched_cv.notify_all();
+    sched_notify_baton_locked();
 }
 
 // Blocks the calling thread until its wait completes or its deadline passes.
@@ -2963,7 +2993,7 @@ bool guest_yield() {
         const double away = me->last_yield;
         g_baton = next;
         record_handoff_locked(me->index, next, "yield");
-        g_sched_cv.notify_all();
+        sched_notify_baton_locked();
         wait_baton_locked(me->index);
         if (me->is_main) {
             const uint64_t ns = sched_seconds_ns(sched_now() - away);
@@ -3045,7 +3075,8 @@ void guest_event_signal_from_host(uint32_t handle) {
         return;
     g_sched_m.lock();
     g_host_signals.push_back(handle);
-    g_sched_cv.notify_all();
+    g_host_signals_pending.store(true, std::memory_order_release);
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -3115,7 +3146,7 @@ int64_t read_file_yielding(int fd, uint32_t buffer, uint32_t length) {
     const size_t next = sched_next_runnable_locked(me->index);
     g_baton = next;
     record_handoff_locked(me->index, next, "file read");
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 
     const int64_t count = os_fd_read(pinned, staging, length);
@@ -3144,10 +3175,9 @@ int64_t read_file_yielding(int fd, uint32_t buffer, uint32_t length) {
 } // namespace
 
 // ---- Free run (win32.h) ----
-// 2026-10-25, NFS Carbon in the browser: the sound mixer's per-block DSP (0x008a721d) was a
-// third of a core in a crowded race and, run under the baton, every millisecond of it was a
-// millisecond the game thread waited. It touches nothing but its own voices, so it runs
-// beside the game thread, as it did on the original's second core.
+// A game's configured compute-only functions can run beside the baton holder. The game
+// must protect their shared state with its own locks; imports regain the baton before
+// entering the runtime (see win32.h and imports.cpp).
 __thread bool t_free_run = false;
 __thread uint32_t t_free_run_esp = 0; // the free-run function's ESP at entry
 
@@ -3173,7 +3203,7 @@ bool sched_free_run_enter(uint32_t esp) {
     const size_t next = sched_next_runnable_locked(me->index);
     g_baton = next;
     record_handoff_locked(me->index, next, "free run");
-    g_sched_cv.notify_all();
+    sched_notify_baton_locked();
     g_sched_m.unlock();
     t_free_run = true;
     t_free_run_esp = esp;
@@ -3274,7 +3304,7 @@ void sched_checkpoint() {
     // Drain first and unconditionally: a guest with no worker threads never
     // reaches the scheduler proper, and a signal it never applied is a wait
     // that never ends.
-    if (!g_host_signals.empty()) {
+    if (g_host_signals_pending.load(std::memory_order_acquire)) {
         g_sched_m.lock();
         apply_host_signals_locked();
         g_sched_m.unlock();
@@ -3326,7 +3356,7 @@ namespace {
 // whole timeout.
 void sched_wake_all() {
     g_sched_m.lock();
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -3512,7 +3542,11 @@ void sched_leave_critsec(uint32_t cs) {
     wr32(cs + CS_OFF_LOCK_COUNT, rec ? rec - 1 : 0xffffffffu);
     if (!rec) {
         wr32(cs + CS_OFF_OWNER, 0);
-        g_sched_cv.notify_all();
+        // The caller still holds the baton. A waiter cannot enter guest code
+        // until a handoff, which rechecks this lock and wakes its recipient.
+        // Broadcasting here only wakes peers to make them wait again.
+        if (g_baton != me->index)
+            sched_notify_all_locked();
     }
     g_sched_m.unlock();
 }
@@ -3562,8 +3596,9 @@ void *thread_host_main(void *arg) {
     LOGW("sched: guest thread %u runs on a host thread of class %s", t->id, os_thread_class_name());
 
     g_sched_m.lock();
+    sched_register_wake_locked(t);
     while (g_baton != t->index && !g_exit_requested)
-        g_sched_cv.wait(g_sched_m);
+        t->wake.wait(g_sched_m);
     bool exiting = g_exit_requested;
     g_sched_m.unlock();
     // Created before the exit, first scheduled after it: Windows would never
@@ -3662,7 +3697,7 @@ void publish_process_exit(uint32_t code) {
     g_sched_m.lock();
     g_exit_requested = true;
     g_exit_requested_code = code;
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
 }
 
@@ -3674,7 +3709,7 @@ bool request_process_exit(uint32_t code) {
     g_exit_requested_code = code;
     // Wake anything parked: the main thread may be inside an indefinite wait,
     // and it is the only thread that can perform the exit.
-    g_sched_cv.notify_all();
+    sched_notify_all_locked();
     g_sched_m.unlock();
     thread_finish_exit_process();
     return true;
@@ -3912,7 +3947,7 @@ void k_ResumeThread(X86 *c) {
             --t->suspend_count;
         o->thread_suspended = t->suspend_count > 0;
         if (!t->suspend_count)
-            g_sched_cv.notify_all();
+            sched_notify_all_locked();
         g_sched_m.unlock();
         set_eax(c, (uint32_t)was);
         return;
@@ -4766,7 +4801,7 @@ void sched_drive_release(void) {
             } else {
                 g_baton = NO_THREAD;
             }
-            g_sched_cv.notify_all();
+            sched_notify_all_locked();
         }
     }
     g_sched_m.unlock();

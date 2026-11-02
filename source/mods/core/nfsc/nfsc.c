@@ -139,13 +139,17 @@ static void log_line(const char *text) {
 #include "resume.h" /* recover a free-roam session after refresh */
 #include "lights.h" /* turn signals (blinkers) and a headlight flash */
 #include "headlight_road.h" /* your own headlights light the road, as other cars' do */
+#include "customization/candidate/full-customization.h"
 #include "rewards.h" /* missed boss cars: the game's own pink-slip award, local only */
 #include "bmw.h" /* local custom BMW boost */
 #include "pursuit.h" /* one police chase shared by friends in free roam (plans/shared-pursuit.md) */
 #include "police.h" /* be the police in free roam (plans/shared-pursuit.md) */
-#include "rivals.h"
 #include "streetrace.h" /* flash a friend to race to a common GPS finish */
 #include "encounter.h" /* native Crew Challenge with online opponents */
+#include "ai_fixes.h"
+#include "photo_zoom.h"
+#include "autosculpt.h" /* balance native model buffer locks */
+#include "custom_hud.h" /* local World HUD; original gauges remain the default */
 
 /* ---- the resolution list --------------------------------------------------
  * The host scales the frame smoothly to the window, aspect kept (game.toml
@@ -604,13 +608,17 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     resume_install();
     lights_install();
     headlight_road_install(); /* after lights_install: its BEFORE hook on 007cbc40 runs first */
+    customization_install();
     rewards_install();
     bmw_install();
     pursuit_install();
     police_install();
-    rivals_install();
     streetrace_install();
     encounter_install();
+    sculpt_install();
+    custom_hud_install();
+    ai_fixes_install();
+    photo_zoom_install();
     /* Match the effect-render caller patched by XenonEffectFix.ixx, rather
      * than changing blending for every use of this shared setup routine. */
     if (setting("xenon_effects", 1) && api->hook_install_at_callsite &&
@@ -650,6 +658,10 @@ PopModStatus pop_mod_init(const PopModApi *api) {
 }
 
 PopModStatus pop_mod_exit(void) {
+    custom_hud_shutdown();
+    ai_fixes_shutdown();
+    photo_zoom_shutdown();
+    customization_shutdown();
     impact_feedback_stop(g_api);
     for (unsigned i = 0; i < sizeof g_hooks / sizeof g_hooks[0]; ++i)
         if (g_hooks[i]) {

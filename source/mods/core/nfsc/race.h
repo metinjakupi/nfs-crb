@@ -1020,7 +1020,18 @@ static void race_publish(RaceShared *sh, uint32_t rs, uint32_t player) {
     const int mine = player ? race_row_of(rs, player + 0x24) : -1;
     __atomic_fetch_add(&sh->game_seq, 1u, __ATOMIC_SEQ_CST);
     sh->phase = g_race_phase;
-    sh->flow_flags = get_u32(RACE_FLOW) | (g_race_result_activity ? 0x100u : 0);
+    const uint32_t flow = get_u32(RACE_FLOW);
+    const int roam = flow == 6 && rs && player && !get_u32(rs + 0x6a14) &&
+                     !get_u32(rs + 0x6a1c) && !mp_online_game();
+    int racing = (rs && (get_u32(rs + 0x6a14) == 1 || get_u32(rs + 0x6a1c))) ||
+                 (g_race_session && g_race_phase >= RACE_LAUNCHED) || mp_online_game();
+    /* Keep race privacy through loading/results gaps until native free roam is
+     * confirmed. 0x400 advertises these activity flags to new pages. A free-roam
+     * player entering the front end retains the existing parked-car behavior. */
+    if (!racing && !roam && (sh->flow_flags & 0x200u)) racing = 1;
+    const int parked = flow == 3 && (sh->flow_flags & 0x800u);
+    sh->flow_flags = flow | (g_race_result_activity ? 0x100u : 0) | 0x400u |
+                     (racing ? 0x200u : 0) | ((roam || parked) && !racing ? 0x800u : 0);
     sh->session = g_race_session;
     sh->car = player ? mp_model_key(player) : race_menu_ready() ? g_race_car_key : 0;
     sh->loaded = g_race_loaded_at > 0;

@@ -14,6 +14,7 @@
 //   pipelines, as the Metal renderer does.
 // - Alpha-only textures are stored as red and swizzled in the shader.
 #include "webgpu_device.h"
+#include "performance_timing.h"
 
 #include "../../../dx/d3d9_shader.h"
 #include "../../../dx/d3d9_wgsl.h"
@@ -295,6 +296,8 @@ struct Buf {
 };
 
 class WebGpuRenderer final : public D9Backend {
+    WebGpuPerformanceTiming performance_timing_;
+
   public:
     const char *name() const override {
         return "WebGPU";
@@ -1061,6 +1064,7 @@ class WebGpuRenderer final : public D9Backend {
         }
         base_rows_ = t->desc.height;
         submit();
+        performance_timing_.presented(dev_);
         if (t->info.format == WGPUTextureFormat_BGRA8Unorm) {
             if (!t->imported) {
                 WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
@@ -1619,6 +1623,8 @@ class WebGpuRenderer final : public D9Backend {
         rp.colorAttachments = colors;
         rp.depthStencilAttachment = pass_depth_view_ ? &depth : nullptr;
         rp.occlusionQuerySet = query_set_;
+        WGPUPassTimestampWrites timing = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        performance_timing_.pass(rp, timing);
         pass_ = wgpuCommandEncoderBeginRenderPass(encoder_, &rp);
         ++fs_.passes;
         pass_slot_ = -1;

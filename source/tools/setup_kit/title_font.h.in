@@ -1,0 +1,90 @@
+/* Private missing TITLE font recovery. Include after get_u32/log_line helpers.
+ * Original GLOBAL/GlobalMemoryFile.bin +0x8b5810, chunk 0x30201, 2936 bytes.
+ * SHA256 b124929eeeb7b3b1ef9db9ad220de848f963217bf5425e24c21ad21db77e185c.
+ * Vanilla InGameB.bun HUD_SingleRace.fng speed digits use TITLE resource 2.
+ * Live failure: TITLE texture loaded but TITLE FFN absent from font list;
+ * 005a17a0 therefore returns before creating the text cache.
+ * Native 00591e50 owns font allocation/registration and texture binding.
+ * Retain the guest source chunk for process lifetime: native font metrics and
+ * names point into it. Native unload remains untouched. At most eight native
+ * registration attempts cover later unloads without a per-frame failure loop.
+ */
+#ifndef CUST_MISSING_TITLE_FONT_H
+#define CUST_MISSING_TITLE_FONT_H
+static const unsigned char cust_title_ffn_original[2936] = {
+@TITLE_FONT_BYTES@
+};
+static uint32_t g_cust_title_ffn_guest;
+static unsigned g_cust_title_ffn_busy, g_cust_title_ffn_attempts;
+static unsigned g_cust_title_ffn_success_logged, g_cust_title_ffn_failure_logged;
+static uint32_t g_cust_title_ffn_hook;
+static uint32_t cust_title_ffn_find(void) {
+    const uint32_t sentinel = 0x00a97cd0u;
+    uint32_t node = get_u32(sentinel);
+    for (unsigned i = 0; node && node != sentinel && i < 128u; ++i) {
+        if (get_u32(node + 0x20u) == 0x2bd9f6bdu) return node;
+        const uint32_t next = get_u32(node);
+        if (next == node) break;
+        node = next;
+    }
+    return 0u;
+}
+static void cust_title_ffn_service(const PopModApi *api, pop_cpu_v1 *cpu,
+                                   PopHookInvocation *inv, void *user) {
+    (void)cpu; (void)inv; (void)user;
+    /* Only recover the driving HUD after world initialization (flow 6). */
+    if (get_u32(0x00a99bbcu) != 6u) return;
+    if (g_cust_title_ffn_busy || g_cust_title_ffn_attempts >= 8u || cust_title_ffn_find()) return;
+    g_cust_title_ffn_busy = 1u;
+    const uint32_t texture_args[3] = {0x2bd9f6bdu, 0u, 0u};
+    uint32_t texture = 0u;
+    if (api->guest_call(api, 0x0055cfd0u, 0u, texture_args, 3u, &texture) != POP_OK ||
+        !texture || get_u32(texture + 0x0cu) != 0x2bd9f6bdu) goto done;
+    if (!g_cust_title_ffn_guest) {
+        void *destination = NULL;
+        ++g_cust_title_ffn_attempts;
+        uint32_t allocated = 0u;
+        if (api->guest_alloc(api, sizeof(cust_title_ffn_original), &allocated) != POP_OK || !allocated)
+            goto failed;
+        if (api->guest_ptr(api, allocated, sizeof(cust_title_ffn_original), &destination) != POP_OK || !destination) {
+            api->guest_free(api, allocated);
+            goto failed;
+        }
+        memcpy(destination, cust_title_ffn_original, sizeof(cust_title_ffn_original));
+        g_cust_title_ffn_guest = allocated;
+        /* Allocation attempt also accounts for this first registration. */
+    } else {
+        ++g_cust_title_ffn_attempts;
+    }
+    /* Recheck after guest work before adding a native list entry. */
+    if (cust_title_ffn_find()) goto done;
+    {
+        log_line("customization HUD: registering original TITLE font for active driving HUD");
+        const uint32_t args[1] = {g_cust_title_ffn_guest};
+        uint32_t result = 0u;
+        if (api->guest_call(api, 0x00591e50u, 0u, args, 1u, &result) != POP_OK || !result)
+            goto failed;
+        const uint32_t font = cust_title_ffn_find();
+        if (!font || get_u32(font + 0x14u) != texture ||
+            get_u32(font + 0x18u) != g_cust_title_ffn_guest + 0x208u)
+            goto failed;
+    }
+    if (!g_cust_title_ffn_success_logged) {
+        log_line("customization HUD: restored missing original TITLE font definition using native registration");
+        g_cust_title_ffn_success_logged = 1u;
+    }
+    goto done;
+failed:
+    if (!g_cust_title_ffn_failure_logged) {
+        log_line("customization HUD: original TITLE font registration failed; native fallback retained, attempts capped at 8");
+        g_cust_title_ffn_failure_logged = 1u;
+    }
+done:
+    g_cust_title_ffn_busy = 0u;
+}
+static void cust_title_ffn_install(void) {
+    if (g_api->hook_install(g_api, 0x00600c90u, cust_title_ffn_service, POP_HOOK_BEFORE,
+                            NULL, &g_cust_title_ffn_hook) != POP_OK)
+        log_line("customization HUD: missing TITLE font recovery hook unavailable");
+}
+#endif

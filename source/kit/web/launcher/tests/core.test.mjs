@@ -296,6 +296,9 @@ test("source-open failure closes the destination and permits retry", async () =>
   source.stream = async () => { throw new Error("connection lost before response"); };
   const result = await importGame(game, source, store);
   assert.equal(result.result, "failed");
+  assert.equal(result.name, "Error");
+  assert.match(result.stack, /connection lost before response/);
+  assert.equal(result.file, "game.exe");
   assert.equal(open, 0);
   assert.ok(!store.files.has(STAMP));
   assert.equal((await importGame(game, memorySource(install()), store)).result, "done");

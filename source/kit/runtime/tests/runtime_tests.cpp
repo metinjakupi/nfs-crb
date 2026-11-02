@@ -27,6 +27,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 static int g_checks = 0, g_failures = 0, g_skips = 0;
@@ -2886,6 +2887,24 @@ static void creation_polling_wndproc(X86 *c) {
     set_eax(c, 1);
 }
 
+// A mixer runs independently, then must regain the baton before touching
+// shared game state. Exercise both a runnable main thread and a blocked one.
+static std::atomic<bool> g_free_run_started{false};
+static unsigned g_free_run_returns = 0;
+static void fake_free_run_thread(X86 *c) {
+    const uint32_t esp = c->r[R_ESP];
+    for (unsigned i = 0; i < 8; ++i) {
+        if (!sched_free_run_enter(esp))
+            break;
+        g_free_run_started.store(true, std::memory_order_release);
+        os_sleep_us(2000);
+        const uint32_t entry = sched_free_run_leave();
+        if (entry == esp && sched_holds_baton() && !sched_free_running())
+            ++g_free_run_returns;
+    }
+    set_eax(c, 0x1234);
+}
+
 static void test_scheduling(X86 *c) {
     section("cooperative scheduling contracts");
     uint32_t pcode = scratch_block(4);
@@ -3261,6 +3280,24 @@ static void test_scheduling(X86 *c) {
             check(g_idle_calls > 0, "the run thread went through the host waiter (%u calls)",
                   g_idle_calls);
         host_set_idle_waiter(nullptr);
+    }
+
+    // --- free-running audio returns to both runnable and blocked callers ---
+    {
+        g_free_run_started.store(false, std::memory_order_relaxed);
+        g_free_run_returns = 0;
+        uint32_t fn = imports_alloc_trampoline("test", "free_run_thread", fake_free_run_thread, 1);
+        uint32_t worker = call_import(c, "KERNEL32.dll", "CreateThread", {0, 0, fn, 0, 0, 0});
+        const double started = wall_seconds();
+        while (!g_free_run_started.load(std::memory_order_acquire) &&
+               wall_seconds() - started < 2.0)
+            call_import(c, "KERNEL32.dll", "GetTickCount", {});
+        check(g_free_run_started.load(std::memory_order_acquire),
+              "the audio worker ran independently while the main thread was runnable");
+        uint32_t result = call_import(c, "KERNEL32.dll", "WaitForSingleObject", {worker, 2000});
+        check(result == 0 && g_free_run_returns == 8,
+              "all eight audio returns regained the baton, including while the main thread waited");
+        call_import(c, "KERNEL32.dll", "CloseHandle", {worker});
     }
 
     // --- a worker's ExitProcess reaches a main thread blocked indefinitely --

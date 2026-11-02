@@ -781,27 +781,33 @@ static uint32_t param_slots(const FxParam &p) {
     return p.t.numeric() ? (uint32_t)(p.value.size() / 4) : 0;
 }
 
+// Preserve the stored bits (including signed zero and NaN payloads). Repeating
+// a value must not invalidate shader constants and preshader results.
+static void param_put_bits(FxParam &p, uint32_t i, const void *bits) {
+    if (memcmp(&p.value[4 * i], bits, 4) == 0)
+        return;
+    memcpy(&p.value[4 * i], bits, 4);
+    param_touched(p);
+}
 static void param_put_float(FxParam &p, uint32_t i, float f) {
     if (i >= param_slots(p))
         return;
-    param_touched(p);
     if (p.t.type == FXT_FLOAT) {
-        memcpy(&p.value[4 * i], &f, 4);
+        param_put_bits(p, i, &f);
     } else {
         int32_t v = p.t.type == FXT_BOOL ? (f != 0.0f) : (int32_t)f;
-        memcpy(&p.value[4 * i], &v, 4);
+        param_put_bits(p, i, &v);
     }
 }
 static void param_put_int(FxParam &p, uint32_t i, int32_t n) {
     if (i >= param_slots(p))
         return;
-    param_touched(p);
     if (p.t.type == FXT_FLOAT) {
         float f = (float)n;
-        memcpy(&p.value[4 * i], &f, 4);
+        param_put_bits(p, i, &f);
     } else {
         int32_t v = p.t.type == FXT_BOOL ? (n != 0) : n;
-        memcpy(&p.value[4 * i], &v, 4);
+        param_put_bits(p, i, &v);
     }
 }
 static float param_get_float(const FxParam &p, uint32_t i) {
@@ -833,6 +839,15 @@ static int32_t param_get_int(const FxParam &p, uint32_t i) {
 // the top-left R by C of it, element after element.
 static void param_put_matrix(FxParam &p, uint32_t element, const float m[16]) {
     uint32_t r = p.t.rows, cn = p.t.cols;
+    if (p.t.type == FXT_FLOAT && r == 4 && cn == 4 &&
+        (uint64_t)element * 64 + 64 <= p.value.size()) {
+        uint8_t *dst = p.value.data() + (size_t)element * 64;
+        if (memcmp(dst, m, 64) != 0) {
+            memcpy(dst, m, 64);
+            param_touched(p);
+        }
+        return;
+    }
     for (uint32_t i = 0; i < r && i < 4; ++i)
         for (uint32_t k = 0; k < cn && k < 4; ++k)
             param_put_float(p, element * r * cn + i * cn + k, m[i * 4 + k]);
@@ -1113,6 +1128,33 @@ static uint32_t bind_constants_impl(FxEffect &fx, const std::vector<uint8_t> &co
             continue;
         }
         ++bound;
+        // Float4 vectors and 4x4 matrices already use shader-sized rows. Copy
+        // those bytes directly, retaining the generic packing/conversion path
+        // for partial values, smaller types and mod-scaled vectors.
+        if (p->t.type == FXT_FLOAT && c.index < limit) {
+            const uint32_t rows = std::min<uint32_t>(c.count, limit - c.index);
+            const bool matrix = c.cls == FXC_MATRIX_ROWS || c.cls == FXC_MATRIX_COLUMNS;
+            const bool matrix4 =
+                matrix && p->t.rows == 4 && p->t.cols == 4 && c.rows == 4 && c.cols == 4;
+            const bool vector4 = !matrix && !p->scaled &&
+                                 (p->t.rows ? p->t.rows : 1) * (p->t.cols ? p->t.cols : 1) == 4;
+            const size_t bytes = size_t(rows) * 16;
+            if ((matrix4 || vector4) && p->value.size() >= bytes) {
+                if (c.cls != FXC_MATRIX_COLUMNS) {
+                    memcpy(reg[c.index], p->value.data(), bytes);
+                    continue;
+                }
+                // A partial final column still reads all four source rows.
+                if (p->value.size() >= size_t((rows + 3) / 4) * 64) {
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        const uint8_t *src = p->value.data() + size_t(row / 4) * 64 + (row % 4) * 4;
+                        for (uint32_t k = 0; k < 4; ++k)
+                            memcpy(&reg[c.index + row][k], src + k * 16, 4);
+                    }
+                    continue;
+                }
+            }
+        }
         if (c.cls == FXC_MATRIX_ROWS || c.cls == FXC_MATRIX_COLUMNS) {
             uint32_t pr = p->t.rows ? p->t.rows : 1, pc = p->t.cols ? p->t.cols : 1;
             for (uint32_t r = 0; r < c.count && c.index + r < limit; ++r) {
@@ -2075,11 +2117,9 @@ static void fx_destroy(ComObj *o) {
 // A parameter marked shared has one value across every effect created with
 // the same pool: the game sets COLORWRITEMODE or BLENDSTATE through whichever
 // effect is at hand and every other effect's passes read it.
-static void share_parameter(uint32_t from_effect, uint32_t index) {
-    auto src = effects().find(from_effect);
-    if (src == effects().end() || !src->second.pool || index >= src->second.params.size())
+static void share_parameter(FxEffect &fx, uint32_t index, bool numeric_changed) {
+    if (!fx.pool)
         return;
-    FxEffect &fx = src->second;
     const FxParam &value = fx.params[index];
     if (!value.shared)
         return;
@@ -2094,7 +2134,7 @@ static void share_parameter(uint32_t from_effect, uint32_t index) {
     if (found == fx.peers.end()) {
         std::vector<FxParam *> list;
         for (auto &kv : effects()) {
-            if (kv.first == from_effect || kv.second.pool != fx.pool)
+            if (kv.first == fx.self || kv.second.pool != fx.pool)
                 continue;
             int32_t j = param_index_of(kv.second, value.t.name);
             if (j >= 0 && kv.second.params[(size_t)j].shared &&
@@ -2104,8 +2144,12 @@ static void share_parameter(uint32_t from_effect, uint32_t index) {
         found = fx.peers.emplace(index, std::move(list)).first;
     }
     const size_t n = value.value.size();
+    // Typed numeric setters stamp only an actual byte change. The pool copies
+    // must receive those bytes; comparing every peer first adds a second read
+    // of the same matrix. Raw/object setters still need the equality check.
+    const bool copy_numeric = numeric_changed && value.t.numeric();
     for (FxParam *other : found->second) {
-        if (other->texture == value.texture &&
+        if (!copy_numeric && other->texture == value.texture &&
             (n == 0 || memcmp(other->value.data(), value.value.data(), n) == 0))
             continue;
         if (n)
@@ -2141,17 +2185,22 @@ static void join_pool(uint32_t effect_id) {
 }
 // Wraps a setter: after it runs, a shared parameter's new value reaches the pool.
 template <void (*F)(X86 *)> void shared_setter(X86 *c) {
-    ComObj *o = com_this_arg(c);
-    uint32_t id = o ? o->id : 0;
-    uint32_t handle = arg(c, 1);
-    int64_t index = -1;
-    if (FxEffect *fx = this_fx(c))
-        if (FxParam *p = param_of(*fx, handle);
-            p && p->shared && p >= fx->params.data() && p < fx->params.data() + fx->params.size())
-            index = p - fx->params.data();
+    FxEffect *fx = this_fx(c);
+    FxParam *shared = nullptr;
+    uint64_t before = 0;
+    if (fx)
+        if (FxParam *p = param_of(*fx, arg(c, 1));
+            p && p->shared && p >= fx->params.data() && p < fx->params.data() + fx->params.size()) {
+            shared = p;
+            before = p->stamp;
+        }
     F(c);
-    if (index >= 0)
-        share_parameter(id, (uint32_t)index);
+    // SetValue, SetRawValue and SetTexture can stamp an unchanged value.
+    // The typed numeric setters stamp only when their stored bytes differ.
+    constexpr bool numeric_changed =
+        F != Fx_SetValue && F != Fx_SetRawValue && F != Fx_SetTexture && F != Fx_SetString;
+    if (shared && shared->stamp != before)
+        share_parameter(*fx, uint32_t(shared - fx->params.data()), numeric_changed);
 }
 
 static const ComMethod g_effect_pool[] = {

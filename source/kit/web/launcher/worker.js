@@ -119,12 +119,34 @@ async function zipSource(file) {
   return { list: async () => zip.entries(), stream: (e) => zip.stream(e) };
 }
 
+// Retry transient connection/server failures before opening an import writer.
+// A failed response body still aborts the import and is resumed on the next Play.
+async function downloadResponse(url, options) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+      const error = new Error(`Download returned HTTP ${response.status}.`);
+      error.status = response.status;
+      error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      await response.body?.cancel();
+      throw error;
+    } catch (error) {
+      const context = { url: url.origin + url.pathname, attempt, status: error.status ?? null };
+      error.context = context;
+      postMessage({ diagnostic: { phase: "download", ...context, name: error.name, message: error.message } });
+      if (options.signal?.aborted || error.name === "AbortError" || error.retryable === false || attempt === 3) throw error;
+      await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+    }
+  }
+}
+
 // A private development server can expose an installed copy beside the launcher.
 async function installedSource(manifest, signal, remote = false) {
   const url = new URL(manifest, self.location.href);
   if (!remote && url.origin !== self.location.origin) throw new Error("Installed game must use this server");
   if (remote && url.protocol !== "https:") throw new Error("Game downloads require HTTPS");
-  const response = await fetch(url, { signal, redirect: "error", cache: "no-cache" });
+  const response = await downloadResponse(url, { signal, redirect: "error", cache: "no-cache" });
   if (!response.ok) throw new Error(`Game manifest: HTTP ${response.status}`);
   const { files, base, stream } = await response.json();
   const prefix = new URL(base, url);
@@ -138,7 +160,7 @@ async function installedSource(manifest, signal, remote = false) {
   });
   return { base: prefix.href.replace(/\/$/, ""), streamManifest: streamManifest?.href || "", list: async () => entries, stream: async e => {
     const file = new URL(e.path.split("/").map(encodeURIComponent).join("/"), prefix);
-    const response = await fetch(file, { signal, redirect: "error" });
+    const response = await downloadResponse(file, { signal, redirect: "error" });
     if (!response.ok) throw new Error(`${e.path}: HTTP ${response.status}`);
     let received = 0;
     return response.body.pipeThrough(new TransformStream({
@@ -278,6 +300,7 @@ onmessage = async ({ data }) => {
     if (cmd === "import") controller = null;
     postMessage(cancelled
       ? { id, result: { result: "cancelled", copied: 0, skipped: 0 } }
-      : { id, error: String((e && e.message) || e) });
+      : { id, error: String((e && e.message) || e), name: String(e?.name || "Error"),
+          stack: String(e?.stack || "").slice(0, 5000), context: { command: cmd, ...e?.context } });
   }
 };

@@ -21,6 +21,7 @@
 #include "../../platform/os.h"
 #include "../../platform/ab_phase.h"
 #include "../d3d_render.h"
+#include "../web_performance.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -92,7 +93,7 @@ std::atomic<D9Backend *> g_web_backend{nullptr};
 // RECOMP_D3D9_STATS: per-frame timing for the frame-rate harness.
 bool d3d9_stats_on() {
     static const bool on = recomp_env("D3D9_STATS") != nullptr;
-    return on;
+    return on || host_performance_reports_enabled();
 }
 
 D9Backend *backend() {
@@ -360,9 +361,9 @@ class RenderThread {
     size_t backlog() const {
         return backlog_.load(std::memory_order_relaxed);
     }
-    // Pumped mode: a present joins the queue like a draw, so the game records
-    // its next frame while the main thread encodes this one. It waits only
-    // once it is kFramesAhead presents ahead of the main thread.
+    // The caller seals its immutable frame immediately after present returns.
+    // Finish encoding its image copy before that seal can release the writer.
+    // Draw batches and GPU completion remain asynchronous.
     void present_queued(uint32_t backbuffer, uint32_t width, uint32_t height) {
         Command c{Op::Present};
         c.a = backbuffer;
@@ -373,7 +374,7 @@ class RenderThread {
         hand_over();
         const uint64_t t0 = d3d9_stats_on() ? os_monotonic_ns() : 0;
         std::unique_lock<std::mutex> lock(m_);
-        idle_cv_.wait(lock, [this] { return presents_queued_.load() < kFramesAhead; });
+        idle_cv_.wait(lock, [this] { return presents_queued_.load() == 0; });
         if (t0)
             game_wait_ns_.fetch_add(os_monotonic_ns() - t0, std::memory_order_relaxed);
     }
@@ -690,9 +691,14 @@ class RenderThread {
                 if (pumped_ && d3d9_stats_on()) {
                     const double now = emscripten_get_now();
                     const uint64_t waited = game_wait_ns_.exchange(0, std::memory_order_relaxed);
-                    d3d9_stats_frame(now, pump_ms_ + (now - exec_started_), waited * 1e-6,
-                                     defer_ms_, (int)frame_draws_,
-                                     recomp_ab::old_phase.load(std::memory_order_relaxed));
+                    if (host_performance_reports_enabled())
+                        host_performance_render(now, pump_ms_ + (now - exec_started_),
+                                                waited * 1e-6, defer_ms_);
+                    static const bool detailed = recomp_env("D3D9_STATS") != nullptr;
+                    if (detailed)
+                        d3d9_stats_frame(now, pump_ms_ + (now - exec_started_), waited * 1e-6,
+                                         defer_ms_, (int)frame_draws_,
+                                         recomp_ab::old_phase.load(std::memory_order_relaxed));
                     pump_ms_ = 0;
                     exec_started_ = now;
                     defer_ms_ = 0;
@@ -710,7 +716,6 @@ class RenderThread {
 
   private:
     static constexpr size_t kSpareBytes = 4u << 20;
-    static constexpr int kFramesAhead = 2;
     D9Backend *r_;
     bool threaded_ = false;
     bool pumped_ = false;
@@ -1086,9 +1091,8 @@ void host_d9_present(uint32_t backbuffer, uint32_t width, uint32_t height) {
     RenderThread *t = render_thread();
     if (!t)
         return;
-    // On the web nothing comes back from a present, so the game need not wait
-    // for the main thread to encode the frame before it starts the next one.
-    // Admission accounting snapshots the game's totals, so it stays in step.
+    // Queue behind earlier draws, then finish encoding the copy before the
+    // caller seals the frame. This does not wait for GPU completion.
     if (t->pumped() && !host_d9_admission_enabled()) {
         t->present_queued(backbuffer, width, height);
         return;

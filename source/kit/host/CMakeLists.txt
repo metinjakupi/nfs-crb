@@ -293,22 +293,34 @@ if(TARGET recomp_gen)
     # saves.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js)
+    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()
     endforeach()
+    if(EXISTS ${RECOMP_GAME_DIR}/web/custom-assets/manifest.json)
+      file(COPY ${RECOMP_GAME_DIR}/web/custom-assets DESTINATION ${POP_OUT})
+    endif()
     # Browser downloads keep release code without the native DWARF payload.
     # The link needs its own -O: without one Emscripten links at -O0, which
     # keeps its JS assertions, builds the WebGPU bindings unoptimised and
     # skips wasm-opt, and every draw goes through those bindings. The symbol
     # map (CarbonRecomp.js.symbols, not published) names the wasm functions
     # in browser profiles.
+    set(web_pool 24)
+    set(web_initial_memory 1073741824)
+    set(web_worker_stack 16777216)
+    if(RECOMP_WEB_MOBILE)
+      set(web_pool 4)
+      set(web_initial_memory 536870912)
+      # Bound spare capacity on each growth instead of the desktop geometric reserve.
+      target_link_options(recomp_app PRIVATE -sMEMORY_GROWTH_LINEAR_STEP=16777216)
+    endif()
     target_link_options(recomp_app PRIVATE
       $<$<CONFIG:Release>:-g0 -O2 --emit-symbol-map>
-      -pthread -sPTHREAD_POOL_SIZE=24 -sWASMFS
-      -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
-      -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=16777216
+      -pthread -sPTHREAD_POOL_SIZE=${web_pool} -sWASMFS
+      -sINITIAL_MEMORY=${web_initial_memory} -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
+      -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=${web_worker_stack}
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0
       -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS
       "SHELL:--js-library ${POP_ROOT}/web/player/stream-fetch.js"

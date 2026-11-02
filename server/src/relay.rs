@@ -960,8 +960,10 @@ impl Relay {
                     let text = js_slice(js_trim(&cleaned), 120);
                     if !text.is_empty() && r.members[i].allow(Limit::Chat, now) {
                         let msg = text_frame(format!(r#"{{"t":"chat","id":{id},"text":{}}}"#, json_str(text)));
-                        for j in hearers(r, i) {
-                            r.members[j].out.push(0, msg.clone());
+                        for p in &r.members {
+                            if p.id != id && p.named && p.out.is_open() {
+                                p.out.push(0, msg.clone());
+                            }
                         }
                     }
                 }

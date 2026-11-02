@@ -31,7 +31,7 @@ def stamp(page, runtime):
     assert 'CarbonRecomp.js' in inputs and 'CarbonRecomp.wasm' in inputs and 'report.js' in inputs
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in inputs.items()}
     build = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
-    info = {'id': build, 'wasm': hashes['CarbonRecomp.wasm']}
+    info = {'id': build, 'wasm': hashes['CarbonRecomp.wasm'], 'wasmBytes': len(inputs['CarbonRecomp.wasm']), 'dataBytes': len(inputs.get('CarbonRecomp.data', b''))}
     encoded = json.dumps(info, separators=(',', ':'))
     page.write_bytes(page_data.replace(b'<head>', ('<head>\n' + START + '\n<script>window.recompPageBuild = Object.freeze(' + encoded + ');</script>\n' + END).encode(), 1))
     for name, variable in [('CarbonRecomp.js', 'recompRuntimeBuild'), ('report.js', 'recompReportBuild')]:

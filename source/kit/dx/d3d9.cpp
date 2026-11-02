@@ -982,6 +982,7 @@ static const uint32_t USAGE_RENDERTARGET = 1, USAGE_DEPTHSTENCIL = 2;
 
 struct GpuMirror {
     bool defined = false;
+    bool cpu_dirty_pending = false;     // conservative summary of the texture slots
     std::vector<uint8_t> cpu_dirty;      // by slot
     std::vector<uint8_t> gpu_newer;      // by slot
     uint32_t dirty_lo = 0, dirty_hi = 0; // buffers: the changed byte range
@@ -1150,6 +1151,7 @@ static GpuMirror &gpu_define(ComObj *o) {
     // A target's first contents are whatever is drawn; a texture's are what
     // the game wrote, so every slot starts out needing an upload.
     m.cpu_dirty.assign(n, d.usage ? 0 : 1);
+    m.cpu_dirty_pending = !d.usage && n != 0;
     m.gpu_newer.assign(n, 0);
     return m;
 }
@@ -1159,6 +1161,9 @@ static void gpu_sync(ComObj *o) {
     if (!o)
         return;
     GpuMirror &m = gpu_define(o);
+    if (!m.cpu_dirty_pending)
+        return;
+    m.cpu_dirty_pending = false;
     for (uint32_t slot = 0; slot < m.cpu_dirty.size(); ++slot) {
         if (!m.cpu_dirty[slot])
             continue;
@@ -1215,8 +1220,10 @@ static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi) {
     auto it = gpu_mirrors().find(id);
     if (it == gpu_mirrors().end())
         return; // not mirrored yet: its first use uploads everything
-    if (slot < it->second.cpu_dirty.size())
+    if (slot < it->second.cpu_dirty.size()) {
         it->second.cpu_dirty[slot] = 1;
+        it->second.cpu_dirty_pending = true;
+    }
 }
 static void gpu_drawn_into(ComObj *s) {
     if (!s)
@@ -3121,24 +3128,44 @@ static void rgba_to_surface(const std::vector<uint8_t> &in, ComObj *d, uint8_t *
                         hi[c] = std::max(hi[c], px[k][c]);
                     }
                 }
+                // BC1's three-colour mode reserves selector 3 for binary alpha.
+                const bool transparent = block == 8 && lo[3] < 128;
+                if (transparent) {
+                    for (int c = 0; c < 3; ++c) { lo[c] = 255; hi[c] = 0; }
+                    bool opaque = false;
+                    for (uint32_t k = 0; k < 16; ++k) {
+                        if (px[k][3] < 128) continue;
+                        opaque = true;
+                        for (int c = 0; c < 3; ++c) {
+                            lo[c] = std::min(lo[c], px[k][c]);
+                            hi[c] = std::max(hi[c], px[k][c]);
+                        }
+                    }
+                    if (!opaque) for (int c = 0; c < 3; ++c) lo[c] = hi[c] = 0;
+                }
                 uint8_t *b = dst + size_t(by) * d->pitch + size_t(bx) * block;
                 uint8_t *cb = block == 8 ? b : b + 8;
                 uint16_t c0, c1;
                 dxt_color_565(hi, c0);
                 dxt_color_565(lo, c1);
-                if (c0 < c1)
+                if (transparent ? c0 > c1 : c0 < c1)
                     std::swap(c0, c1);
                 uint8_t pal[4][4];
                 unpack_565(c0, pal[0]);
                 unpack_565(c1, pal[1]);
                 for (int c = 0; c < 3; ++c) {
-                    pal[2][c] = uint8_t((2 * pal[0][c] + pal[1][c]) / 3);
-                    pal[3][c] = uint8_t((pal[0][c] + 2 * pal[1][c]) / 3);
+                    pal[2][c] = uint8_t(transparent ? (pal[0][c] + pal[1][c]) / 2
+                                                   : (2 * pal[0][c] + pal[1][c]) / 3);
+                    pal[3][c] = uint8_t(transparent ? 0 : (pal[0][c] + 2 * pal[1][c]) / 3);
                 }
                 uint32_t bits = 0;
                 for (uint32_t k = 0; k < 16; ++k) {
+                    if (transparent && px[k][3] < 128) {
+                        bits |= 3u << (2 * k);
+                        continue;
+                    }
                     int best = 0, bestd = 1 << 30;
-                    for (int i = 0; i < 4; ++i) {
+                    for (int i = 0; i < (transparent ? 3 : 4); ++i) {
                         int dd = 0;
                         for (int c = 0; c < 3; ++c)
                             dd += (px[k][c] - pal[i][c]) * (px[k][c] - pal[i][c]);
@@ -3351,8 +3378,10 @@ static void VolTex_AddDirtyBox(X86 *c) {
         return;
     }
     auto it = gpu_mirrors().find(o->id);
-    if (it != gpu_mirrors().end())
+    if (it != gpu_mirrors().end()) {
         std::fill(it->second.cpu_dirty.begin(), it->second.cpu_dirty.end(), 1);
+        it->second.cpu_dirty_pending = !it->second.cpu_dirty.empty();
+    }
     com_ret(c, D3D_OK9);
 }
 static void Vol_Unavailable(X86 *c) {

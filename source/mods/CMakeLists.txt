@@ -8,3 +8,16 @@ add_custom_target(core_mods
   VERBATIM)
 
 add_custom_target(plugins DEPENDS core_mods)
+
+# Compare the native audio fast path with the original translated routine.
+if(POP_REAL_GEN AND RECOMP_NATIVE_HEADER AND NOT EMSCRIPTEN AND NOT IOS AND NOT ANDROID)
+  add_executable(nfsc_audio_scale_tests
+    ${RECOMP_GAME_DIR}/tests/audio_scale_tests.cpp
+    ${POP_ROOT}/tools/recomp/tests/harness.c)
+  target_include_directories(nfsc_audio_scale_tests PRIVATE ${POP_ROOT} ${POP_ROOT}/runtime ${POP_GEN_DIR})
+  pop_link_gen(nfsc_audio_scale_tests)
+  pop_optimize(nfsc_audio_scale_tests 2)
+  pop_test_binary(nfsc_audio_scale_tests)
+  add_test(NAME nfsc_audio_scale_tests COMMAND nfsc_audio_scale_tests WORKING_DIRECTORY ${POP_ROOT})
+  set_tests_properties(nfsc_audio_scale_tests PROPERTIES LABELS game)
+endif()

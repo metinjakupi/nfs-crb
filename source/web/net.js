@@ -84,6 +84,8 @@
     const slotAt = new Array(SLOTS).fill(-Infinity); // when each slot last changed hands
     let self = null;          // this car: {at, vel} from its newest pose
     let racers = new Set();   // relay ids racing with this player (race.js, through the page)
+    let activityBlock = null, localActivity = "unknown", localSession = 0, activitySent = "", activityAt = -Infinity;
+    let mapPoints = [];
     let followSent = "[]";    // the racers the relay was last told
     // Car looks (mods/core/nfsc/look.h LookShared, a block of its own): this car's look goes to
     // the room when it changes, at most one per LOOK_MS (the newest waits), and again on each new
@@ -105,109 +107,6 @@
     const copSlots = new Array(COP_SLOTS).fill(null); // {owner, c} each slot holds
     const copHeard = new Map(); // owner id -> when its last cops frame came
 
-    // Rival encounters: owner simulation only, eight visible copies, four per sender.
-    const RV_MAGIC = 0x31564952, RV_OUT = 0x478, RV_SLOT = 0x53c, RV_RX = 0x1200;
-    let rivals = null, rivalOk = false, rivalSent = false;
-    const rivalFrames = new Map(), rivalLooksSent = new Map();
-    const rivalSlots = new Array(8).fill(null);
-    function rivalMem() {
-      const buf = rivals.memory.buffer;
-      return {u32: new Uint32Array(buf), i32: new Int32Array(buf), f32: new Float32Array(buf), u8: new Uint8Array(buf)};
-    }
-    function rivalWrite(i, item) {
-      if (!rivals) return;
-      const {u32, i32, f32, u8} = rivalMem(), base = rivals.ptr + RV_RX + i * RV_SLOT, b = base >> 2;
-      Atomics.add(i32, b + 1, 1);
-      if (!item) { u32[b] = 0; u32[b + 4] = 0; }
-      else {
-        const {owner, x, ts} = item;
-        const previous = rivalSlots[i];
-        if (!previous || previous.owner !== owner || previous.c !== x.c || previous.k !== x.k || previous.stamp !== x.stamp) u32[b + 4] = 0;
-        const count = u32[b + 4], at = b + 8 + (count % 4) * 14;
-        u32[b] = owner; u32[b + 2] = x.k; u32[b + 3] = 1; u32[b + 5] = x.c;
-        u32[at] = ts; f32.set(x.s, at + 1); u32[b + 4] = count + 1;
-        u32[b + 64] = x.bytes.length; u32[b + 65] = x.stamp;
-        u8.set(x.bytes, base + 0x108);
-      }
-      Atomics.add(i32, b + 1, 1);
-      rivalSlots[i] = item ? {owner: item.owner, c: item.x.c, k: item.x.k, stamp: item.x.stamp, ts: item.ts} : null;
-    }
-    function rivalArrange() {
-      if (!rivals) return;
-      const now = performance.now(), items = [];
-      for (const [owner, frame] of rivalFrames) {
-        if (!players.has(owner) || now - frame.at > 3000) { rivalFrames.delete(owner); continue; }
-        for (const x of frame.cars) if (x.bytes && self) {
-          const d = x.s.slice(4, 7).reduce((sum, p, k) => sum + (p - self.at[k]) ** 2, 0);
-          if (d <= 500 ** 2) items.push({owner, x, ts: frame.ts, d});
-        }
-      }
-      items.sort((a, b) => a.d - b.d || a.owner - b.owner || a.x.c - b.x.c);
-      const chosen = items.slice(0, 8);
-      for (let i = 0; i < 8; i++) {
-        const prev = rivalSlots[i];
-        if (prev && !chosen.some(e => e.owner === prev.owner && e.x.c === prev.c)) rivalWrite(i, null);
-      }
-      for (const e of chosen) {
-        let i = rivalSlots.findIndex(p => p && p.owner === e.owner && p.c === e.x.c);
-        if (i < 0) i = rivalSlots.indexOf(null);
-        if (i >= 0 && (!rivalSlots[i] || rivalSlots[i].ts !== e.ts || rivalSlots[i].k !== e.x.k || rivalSlots[i].stamp !== e.x.stamp)) rivalWrite(i, e);
-      }
-    }
-    function rivalDrop(owner) {
-      if (owner === undefined) { rivalFrames.clear(); rivalLooksSent.clear(); rivalSent = false; }
-      else rivalFrames.delete(owner);
-      rivalArrange();
-    }
-    function rivalsFrom(m) {
-      if (!rivalOk || m.id === me || !players.has(m.id) || !Array.isArray(m.cars) || m.cars.length > 4) return;
-      const old = rivalFrames.get(m.id), cars = [];
-      for (const x of m.cars) {
-        if (!Number.isInteger(x.c) || !Number.isInteger(x.k) || !Number.isInteger(x.stamp) ||
-            !Array.isArray(x.s) || x.s.length !== 13 || !x.s.every(Number.isFinite)) return;
-        let bytes = old?.cars.find(p => p.c === x.c && p.k === x.k && p.stamp === x.stamp)?.bytes;
-        if (typeof x.look === "string") {
-          try { bytes = Uint8Array.from(atob(x.look), c => c.charCodeAt(0)); } catch { return; }
-          if (bytes.length !== 0 && bytes.length !== 0x434) return;
-        }
-        cars.push({...x, bytes});
-      }
-      rivalFrames.set(m.id, {ts: m.ts, at: performance.now(), cars});
-      rivalArrange();
-    }
-    setInterval(() => {
-      if (!rivals) return;
-      const {u32, i32, f32, u8} = rivalMem(), b = rivals.ptr >> 2;
-      const live = !!me && rivalOk && ws?.readyState === WebSocket.OPEN;
-      Atomics.store(i32, b + 2, live ? 1 : 0);
-      rivalArrange();
-      if (!live) return;
-      const before = Atomics.load(i32, b + 3);
-      if (before & 1) return;
-      const cars = [], now = performance.now();
-      let appearance = null;
-      for (let i = 0; i < Math.min(u32[b + 5], 4); i++) {
-        const base = rivals.ptr + 0x20 + i * RV_OUT, at = base >> 2;
-        const x = {c: u32[at], k: u32[at + 1], stamp: u32[at + 3], s: Array.from(f32.subarray(at + 4, at + 17))};
-        const key = `${x.c}:${x.k}:${x.stamp}`, sent = rivalLooksSent.get(key) ?? -Infinity;
-        // One appearance per frame keeps the existing 4096-byte relay limit.
-        if (!appearance && now - sent >= 2000) {
-          const size = u32[at + 2];
-          if (size !== 0 && size !== 0x434) return;
-          x.look = btoa(String.fromCharCode(...u8.subarray(base + 0x44, base + 0x44 + size)));
-          appearance = key;
-        }
-        cars.push(x);
-      }
-      const ts = u32[b + 4];
-      if (Atomics.load(i32, b + 3) !== before) return;
-      if (!cars.length && !rivalSent) return;
-      ws.send(JSON.stringify({t: "rivals", ts, cars}));
-      if (appearance) rivalLooksSent.set(appearance, now);
-      const keys = new Set(cars.map(x => `${x.c}:${x.k}:${x.stamp}`));
-      for (const key of rivalLooksSent.keys()) if (!keys.has(key)) rivalLooksSent.delete(key);
-      rivalSent = cars.length > 0;
-    }, 100);
 
     // Shared police chases (mods/core/nfsc/pursuit.h PuShared, a block of its own): magic, version,
     // me (+0x08: our relay id, 0 unlinked), spare, tx head/tail and rx head/tail (+0x10..+0x1c),
@@ -294,7 +193,7 @@
       const state = {
         open: !!ws && ws.readyState === WebSocket.OPEN,
         names: [...players.values()].filter((p) => p.name).map((p) => p.name),
-        people: [...players].filter(([, p]) => p.name).map(([id, p]) => ({ id, name: p.name, crew: p.crew })),
+        people: [...players].filter(([, p]) => p.name).map(([id, p]) => ({ id, name: p.name, crew: p.crew, activity: p.activity || "unknown" })),
         slots: owners.map((id) => (id ? players.get(id)?.name || "Player" : "")),
         slotIds: owners.slice(),
         slotModes: owners.map((id) => (id ? players.get(id)?.mode ?? 0 : -1)),
@@ -350,7 +249,7 @@
     function player(id) {
       let p = players.get(id);
       if (!p) players.set(id, (p = { id, name: "", crew: "", key: 0, mode: 0, heard: 0, slot: -1, at: null, physics: false,
-                                     pos: null, vel: null, last: null, applied: -Infinity, pending: 0 }));
+                                     pos: null, vel: null, last: null, applied: -Infinity, pending: 0, discovered: performance.now() }));
       return p;
     }
 
@@ -382,6 +281,7 @@
 
     // p's newest pose into its slot.
     function put(p, now = performance.now()) {
+      if (!visible(p)) { park(p); return; }
       const l = p.last;
       writeSlot(p.slot, p.id, p.key, p.mode, l.ms, l.s, l.contacts, l.ack, l.drive);
       p.applied = now;
@@ -416,8 +316,9 @@
     // the place of the holder that counts least.
     function arrange(now) {
       if (!memory || !me) return;
+      for (const p of players.values()) if (!visible(p)) park(p);
       const waiting = [];
-      for (const p of players.values()) if (p.slot < 0 && p.last && p.heard && now - p.heard <= FRESH) waiting.push(rank(p, now));
+      for (const p of players.values()) if (visible(p) && p.slot < 0 && p.last && p.heard && now - p.heard <= FRESH) waiting.push(rank(p, now));
       if (!waiting.length) return;
       waiting.sort(order);
       let changed = false;
@@ -453,12 +354,61 @@
 
     // A player's car goes; the player stays known (with their name) until they leave.
     function park(p) {
-      if (p.slot < 0) return;
       if (p.pending) { clearTimeout(p.pending); p.pending = 0; }
+      if (p.slot < 0) return;
       owners[p.slot] = 0;
       if (memory) writeSlot(p.slot, 0, 0, 0, 0, null);
       p.slot = -1;
       p.heard = 0;
+    }
+
+    // Activity is separate from pose mode: a race pause is never a parked free-roam car.
+    function visible(p) {
+      // Give current clients time to answer a join with their activity. Older pages
+      // have no presence message and retain their legacy behavior after this grace.
+      if (localActivity !== "unknown" && !p.activity && performance.now() - p.discovered < 1500) return false;
+      if (p.activity === "away" || p.resumeAfter !== undefined) return false;
+      if (p.activity !== "race") return localActivity !== "race" || racers.has(p.id);
+      return localActivity === "race" && localSession && p.session === localSession && racers.has(p.id);
+    }
+    function mapTell() {
+      postMessage({t: "where", p: mapPoints.filter(e => {
+        const p = players.get(e[0]);
+        return p && visible(p) && p.activity !== "race";
+      }).map(e => {
+        const p = players.get(e[0]);
+        return p.activity && p.at && p.heard && performance.now() - p.heard <= FRESH
+          ? [e[0], Math.round(p.at[0]), Math.round(p.at[2]), e[3]] : e;
+      })});
+    }
+    function refreshVisibility() {
+      for (const p of players.values()) {
+        if (!visible(p)) park(p);
+        if (p.activity === "race" || localActivity === "race") copDrop(p.id);
+      }
+      arrange(performance.now()); mapTell(); tell();
+    }
+    function activityOut(force = false) {
+      if (!me || ws?.readyState !== WebSocket.OPEN || localActivity === "unknown") return;
+      const now = performance.now(), value = `${localActivity}:${localSession}`;
+      if (force && value === activitySent && now - activityAt < 100) return;
+      if (!force && value === activitySent && now - activityAt < 1000) return;
+      activitySent = value; activityAt = now;
+      ws.send(JSON.stringify({t: "race", k: "presence", v: 1, a: localActivity, s: localSession, ts: latest?.ms || 0}));
+    }
+    function activityRead() {
+      if (!activityBlock) return;
+      const {memory: am, ptr: ap} = activityBlock, u32 = new Uint32Array(am.buffer), i32 = new Int32Array(am.buffer);
+      const b = ap >> 2, seq = Atomics.load(i32, b + 0x260 / 4);
+      if (seq & 1) return;
+      const flags = u32[b + 0x2cc / 4], session = u32[b + 0x2bc / 4];
+      if (!(flags & 0x400) || Atomics.load(i32, b + 0x260 / 4) !== seq) return;
+      const activity = flags & 0x200 ? "race" : flags & 0x800 ? "roam" : "away";
+      if (activity !== localActivity || session !== localSession) {
+        localActivity = activity; localSession = session;
+        refreshVisibility();
+      }
+      activityOut();
     }
 
     function drop(id) {
@@ -671,7 +621,6 @@
         me = m.id;
         serverPhysics = m.physics === 1;
         bin = m.bin === 1 ? 1 : 0; // a relay from before compact poses says nothing: JSON
-        rivalOk = m.rivals === 1;
         copsOk = bin === 1 && m.cops === 1; // nor does one from before police chases
         driveOk = bin === 1 && m.drive === 1; // nor one from before driving
         driveLinked();
@@ -681,8 +630,10 @@
         lookSentAt = -Infinity;
         followSent = "[]"; // nor whom this player races with
         follow();
+        activitySent = ""; activityAt = -Infinity; activityOut(true);
       } else if (m.t === "join") {
         Object.assign(player(m.id), { name: m.name, crew: m.crew || "", physics: m.physics === 1 });
+        activityOut(true);
       } else if (m.t === "physics") {
         if (m.id !== me) player(m.id).physics = m.on === true;
       } else if (m.t === "impact") {
@@ -698,9 +649,9 @@
         Atomics.store(i32, c + 2, (head + 1) | 0);
         return;
       } else if (m.t === "rivals") {
-        rivalsFrom(m);
+        return; // Race spectators' AI replicas have been removed.
       } else if (m.t === "cops") {
-        if (m.id !== me) copsFrom(m.id, m.ts, m.list);
+        if (m.id !== me && localActivity !== "race" && players.get(m.id)?.activity !== "race") copsFrom(m.id, m.ts, m.list);
         return;
       } else if (m.t === "cophit") {
         // Another player's car hit one of the cops chasing this one (cops.h applies it to the real cop).
@@ -716,6 +667,23 @@
         Atomics.store(i32, q + 2, (head + 1) | 0);
         return;
       } else if (m.t === "race") {
+        if (m.k === "presence") {
+          if (m.id === me || !players.has(m.id) || m.v !== 1 ||
+              !["roam", "race", "away"].includes(m.a) || !Number.isInteger(m.s) || m.s < 0 || m.s > 0xffffffff ||
+              !Number.isInteger(m.ts) || m.ts < 0 || m.ts > 0xffffffff) return;
+          const p = players.get(m.id), previous = p.activity, previousSession = p.session;
+          p.activity = m.a; p.session = m.s;
+          const changed = previous !== m.a || previousSession !== m.s;
+          if (changed) {
+            // Invalidate every cached race pose. Only a newer owner pose restores free roam.
+            park(p); p.last = null; p.pos = p.vel = null; p.at = null;
+            mapPoints = mapPoints.filter(e => e[0] !== m.id);
+            if (previous) p.resumeAfter = m.ts;
+            else delete p.resumeAfter;
+          }
+          if (changed) refreshVisibility();
+          return;
+        }
         // Racing together (race.js): the relay sends these to everyone, the sender too.
         const p = m.id === me ? null : players.get(m.id);
         postMessage({ t: "msg", m: { ...m, name: m.id === me ? name : p?.name || "Player", crew: m.id === me ? crew : p?.crew || "" } });
@@ -753,6 +721,7 @@
         else lightsOf.delete(m.id);
         return;
       } else if (m.t === "pursuit" && m.id !== me) {
+        if (localActivity === "race" || players.get(m.id)?.activity === "race") return;
         pursuitPut(m);
         return;
       } else if (m.t === "street" && m.id !== me) {
@@ -771,15 +740,22 @@
       } else if (m.t === "left") {
         drop(m.id);
         copDrop(m.id);
-        rivalDrop(m.id);
+        mapPoints = mapPoints.filter(e => e[0] !== m.id); mapTell();
       } else if (m.t === "pose" && m.id !== me) {
         const p = player(m.id), now = performance.now();
+        let resumed = false;
+        if (p.resumeAfter !== undefined) {
+          if (((m.ts - p.resumeAfter) | 0) <= 0) return;
+          delete p.resumeAfter;
+          resumed = true;
+        }
         const recovered = p.heard > 0 && now - p.heard > POSE_RECOVER_MS;
         p.key = m.k >>> 0;
         p.mode = m.m | 0;
         p.physics = m.physics === 1;
         p.heard = now;
         p.at = [m.s[4], m.s[5], m.s[6]];
+        if (resumed) mapTell();
         if (p.mode === 1) {
           p.pos = p.at;
           p.vel = capped(m.s[7], m.s[8], m.s[9]);
@@ -788,7 +764,7 @@
         p.last = { ms: Number.isFinite(m.ts) ? m.ts : 0, s: m.s, contacts: p.physics && !m.ghost ? 1 : 0,
                    ack: Number.isInteger(ack) ? ack : 0,
                    drive: driveOk && m.drive instanceof Uint8Array && m.drive.length === DRIVE_BYTES ? m.drive : null };
-        if (!memory || !me) return;
+        if (!memory || !me || !visible(p)) return;
         if (p.slot >= 0) { queuePut(p, now, recovered); return; } // nothing the page shows has changed
         // A free slot goes at once to a player among the best of those waiting for one; the
         // rest wait for arrange(). (The relay sends a joiner its cars nearest first.)
@@ -797,7 +773,7 @@
         const mine = rank(p, now);
         let ahead = 0;
         for (const q of players.values())
-          if (q !== p && q.slot < 0 && q.last && q.heard && now - q.heard <= FRESH && order(rank(q, now), mine) < 0) ahead++;
+          if (q !== p && visible(q) && q.slot < 0 && q.last && q.heard && now - q.heard <= FRESH && order(rank(q, now), mine) < 0) ahead++;
         if (ahead >= free) return;
         take(p, owners.indexOf(0), now);
       } else if (m.t === "where" && Array.isArray(m.p)) {
@@ -810,7 +786,7 @@
           const p = players.get(e[0]);
           if (p && !(p.heard && now - p.heard <= FRESH)) p.at = [e[1], p.at ? p.at[1] : self ? self.at[1] : 0, e[2]];
         }
-        postMessage({ t: "where", p: list });
+        mapPoints = list; mapTell();
         return;
       }
       tell();
@@ -819,7 +795,7 @@
     function connect() {
       ws = new WebSocket(relay);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1, rivals: 1 })); tell(); };
+      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1 })); tell(); };
       ws.onmessage = (e) => {
         try {
           const m = typeof e.data === "string" ? JSON.parse(e.data) : unpack(e.data);
@@ -834,7 +810,7 @@
         driveOk = false;
         driveLinked();
         copDrop();
-        rivalOk = false; rivalDrop();
+        mapPoints = []; mapTell(); activitySent = "";
         linked();
         if (physics) {
           const { i32 } = mem(), c = (ptr + CONTACTS) >> 2;
@@ -877,6 +853,7 @@
         // From the page: whom this player races with now (race.js's race, read from race.h's block).
         racers = new Set(m.ids.filter((id) => Number.isInteger(id) && id > 0).slice(0, 8));
         follow();
+        refreshVisibility();
       } else if (m.t === "ghost") {
         ghost = !!m.on;
         linked();
@@ -888,9 +865,9 @@
         physics = mem().u32[(ptr >> 2) + 1] >= 2;
         linked();
         if (me && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "physics", on: physics }));
-      } else if (m.t === "rival-block" && !rivals) {
-        if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== RV_MAGIC) return;
-        rivals = {memory: m.memory, ptr: m.ptr};
+      } else if (m.t === "activity-block" && !activityBlock) {
+        if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== 0x31435243) return;
+        activityBlock = {memory: m.memory, ptr: m.ptr};
       } else if (m.t === "cop-block" && !cops) {
         if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== COP_MAGIC) { console.warn("[online] the game's police block is not there"); return; }
         cops = { memory: m.memory, ptr: m.ptr };
@@ -1131,6 +1108,7 @@
         const s = o.s;
         self = { at: [s[4], s[5], s[6]], vel: o.state === 1 ? capped(s[7], s[8], s[9]) : [0, 0, 0] };
       }
+      activityRead();
       // Impacts are ordered reliable events. Poses may be coalesced by the
       // relay, but cannot erase a hit before the owner acknowledges it.
       if (physics) {
@@ -1181,7 +1159,7 @@
       if (!cops) return;
       const now = performance.now();
       for (const [owner, at] of copHeard) if (now - at > COP_STALE) copDrop(owner);
-      const live = !!me && copsOk && ws?.readyState === WebSocket.OPEN;
+      const live = !!me && copsOk && ws?.readyState === WebSocket.OPEN && localActivity !== "race";
       Atomics.store(copMem().i32, (cops.ptr >> 2) + 2, live ? 1 : 0); // the game lists its chase only then
       if (!live) { copsSentCount = 0; return; }
       const o = copsOwn();
@@ -1346,14 +1324,14 @@
   }
   addEventListener("carbon-look", () => attachLook(globalThis.carbonLookBlock));
   attachLook(globalThis.carbonLookBlock);
-  let rivalBlock = null;
-  function attachRivals(b) {
-    if (!b || rivalBlock) return;
-    rivalBlock = b;
-    worker.postMessage({t: "rival-block", memory: b.memory, ptr: b.ptr});
+  let activityBlock = null;
+  function attachActivity(b) {
+    if (!b || activityBlock) return;
+    activityBlock = b;
+    worker.postMessage({t: "activity-block", memory: b.memory, ptr: b.ptr});
   }
-  addEventListener("carbon-rivals", () => attachRivals(globalThis.carbonRivalBlock));
-  attachRivals(globalThis.carbonRivalBlock);
+  addEventListener("carbon-race", () => attachActivity(globalThis.carbonRaceBlock));
+  attachActivity(globalThis.carbonRaceBlock);
 
   // And the police chases' block (cops.h).
   let copBlock = null;
@@ -1533,12 +1511,17 @@
 
   // The status badge, in the game's menu style: cyan dot when linked, then
   // your name and your crew as a chip in its colour.
-  const badge = document.createElement("div");
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.setAttribute("aria-label", "Online players (F8)");
+  badge.title = "Online players (F8)";
+  badge.addEventListener("click", () => dispatchEvent(new Event("recomp-open-online")));
   // Left of it, the in-game menu's button (menu.js).
-  badge.style.cssText = "position:fixed;left:64px;top:12px;z-index:5;pointer-events:none;display:flex;align-items:center;gap:8px;" +
+  badge.style.cssText = "position:fixed;left:64px;top:12px;z-index:5;pointer-events:auto;cursor:pointer;display:flex;align-items:center;gap:8px;" +
     "font:italic 700 12px/1 'Avenir Next Condensed','DIN Condensed','Bahnschrift',system-ui,sans-serif;letter-spacing:.12em;" +
     "text-transform:uppercase;color:#e9f6ff;background:rgba(6,12,22,.62);border:1px solid rgba(95,228,242,.25);" +
     "padding:6px 12px;transform:skewX(-12deg)";
+  badge.style.minHeight = matchMedia("(pointer: coarse)").matches ? "44px" : "32px";
   const dot = document.createElement("span");
   dot.style.cssText = "width:7px;height:7px;border-radius:50%;flex:none;transform:skewX(12deg)";
   const label = document.createElement("span");

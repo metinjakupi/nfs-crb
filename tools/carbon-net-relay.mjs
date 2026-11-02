@@ -210,6 +210,13 @@
 //   They add nothing to the limits: they only travel inside poses.
 //
 // Racing together (source/web/race.js; the game side is mods/core/nfsc/race.h):
+// Activity uses the existing bounded race channel: {t:"race", k:"presence", v:1,
+// a:"roam"|"race"|"away", s:uint32 session, ts:uint32 owner physics time}.
+// Clients publish changes and one heartbeat per second, and answer joins (at
+// most once per 100 ms). Both relays already replace id and forward race fields.
+// New clients filter car slots/map points and retain same-session participants;
+// they never interpret pose mode 0 alone as Racing. Old clients ignore this kind.
+// No new message type, persistence, authority over race results, or server restart.
 //   browser -> relay: {t:"race", k, ...}
 //   relay -> the whole room, the sender too: {t:"race", id, k, ...}
 //   k is what it is about, a lowercase word of 1-12 letters (race.js uses lobby,
@@ -885,7 +892,7 @@ function handle(peer, text) {
     const text = m.text.replace(/\p{Cc}/gu, " ").trim().slice(0, 120);
     if (text && allow(peer, "chat")) {
       const bytes = frame(JSON.stringify({ t: "chat", id: peer.id, text }));
-      for (const p of hearers(peer)) write(p, bytes);
+      for (const p of rooms.get(peer.room) ?? []) if (p !== peer && p.named && !p.closed) write(p, bytes);
     }
   } else if (m.t === "crew" && peer.named && typeof m.crew === "string" && allow(peer, "crew")) {
     // A player changing crew while driving; everyone else, and the sender, learn the cleaned name.

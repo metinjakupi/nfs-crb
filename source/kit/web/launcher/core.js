@@ -484,7 +484,9 @@ export async function importGame(game, source, store, { onProgress, signal, free
       await store.writeText(MANIFEST, JSON.stringify(manifest));
       if (signal && signal.aborted) return { result: "cancelled", copied, skipped };
       const full = e && (e.name === "QuotaExceededError" || /quota/i.test(String(e.message)));
-      return { result: full ? "noSpace" : "failed", error: String(e && e.message || e) };
+      return { result: full ? "noSpace" : "failed", error: String(e && e.message || e),
+        name: String(e?.name || "Error"), stack: String(e?.stack || "").slice(0, 5000),
+        file: f.relative, bytesDone: progress.bytesDone, bytesTotal: progress.bytesTotal };
     }
     await writer.close();
     manifest.files[f.relative] = { size: f.size, mtime: f.mtime };

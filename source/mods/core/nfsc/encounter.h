@@ -302,8 +302,11 @@ static void cc_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
                 else {
                     cc_hide_prompt();race_forget("native crew challenge starts");g_race_encounter=1;
                     g_race_session=g_cc.session;g_race_phase=RACE_LAUNCHED;g_race_no_ai=1;g_race_base=0;
-                    for(int i=0;i<MP_SLOTS;i++)if(g_mp_remote[i].id==g_cc.peer&&g_mp_remote[i].simable) {
-                        if(g_mp_friend_car)g_mp_friend_car(i,g_cc.peer,0);
+                    /* Retire every free-roam replica before InitRacers can reuse its
+                     * memory. A spectator's stale handle can otherwise kill the new
+                     * opponent when the page removes that spectator after launch. */
+                    for(int i=0;i<MP_SLOTS;i++)if(g_mp_remote[i].simable) {
+                        if(g_mp_friend_car)g_mp_friend_car(i,g_mp_remote[i].id,0);
                         mp_drop_friend(&g_mp_remote[i],"native encounter starts");memset(&g_mp_remote[i],0,sizeof g_mp_remote[i]);
                     }
                     g_cc.replaying=1;g_cc.phase=CC_RUNNING;g_cc.began=mp_now();

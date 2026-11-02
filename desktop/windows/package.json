@@ -1,0 +1,49 @@
+{
+  "name": "carbon-local-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop launcher for Carbon Browser using a local game installation",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "prepare-runtime": "node prepare-runtime.cjs",
+    "dist:win": "electron-builder --win zip --x64",
+    "dist:mac": "electron-builder --mac zip --arm64 --x64"
+  },
+  "build": {
+    "appId": "xyz.nfscrb.launcher",
+    "productName": "Carbon Local Launcher",
+    "asar": true,
+    "files": [
+      "*.cjs",
+      "ui/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "zip",
+      "artifactName": "Carbon-Local-Launcher-${version}-Windows-x64.zip"
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "target": "zip",
+      "category": "public.app-category.games",
+      "artifactName": "Carbon-Local-Launcher-${version}-macOS-${arch}.zip"
+    }
+  },
+  "devDependencies": {
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0"
+  }
+}

@@ -12,6 +12,7 @@ addToLibrary({
     }
     const first = offsetsPtr >>> 2;
     const offsets = HEAPU32.slice(first, first + count);
-    pass.setBindGroup(groupIndex, group, offsets);
+    // Select the typed-array overload; avoid converting offsets as a sequence.
+    pass.setBindGroup(groupIndex, group, offsets, 0, count);
   },
 });

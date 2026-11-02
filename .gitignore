@@ -27,3 +27,13 @@ __pycache__/
 /tools/carbon-site-deploy.sh
 /tools/carbon-relay-deploy.sh
 /tools/carbon-reports.sh
+
+# Local customization game assets and generated font data
+/source/web/custom-assets/
+/source/mods/core/nfsc/customization/candidate/missing-title-font.h
+
+# Local experiments, generated analysis and browser screenshots
+/build/
+/output/
+/scratchpad/
+/funcs.json

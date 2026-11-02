@@ -27,6 +27,8 @@ heap_extra_base = 0x10100000
 heap_extra_size = 0x6feff000
 
 [translate]
+# Keep the original routine available for unsupported audio scaling inputs.
+native = { header = "native/audio_scale.h", sources = ["native/audio_scale.cpp"] }
 listings = "analysis/decompiled/NFSC.exe"
 globals = "globals.toml"
 animation_counter = 0x00c2bf00  # sentinel
@@ -42,7 +44,7 @@ volatile_reads = []
 # career / Audio options, run 2026-10-10 02:41.
 # 00868cc0: vtable +0x1c called from 00589093 (like 0059d6d0) after the first
 # Cross chase cutscene; returning 0 hung the career (run 2026-10-10 18:37).
-entry_points = [0x004c5450, 0x0089122d, 0x0089f604, 0x0089f07c, 0x0089f494, 0x008999ee,
+entry_points = [0x0085b020, 0x00842da0, 0x00868390, 0x00842670, 0x00843270, 0x008432f0, 0x00846f20, 0x00577e40, 0x004c5450, 0x0089122d, 0x0089f604, 0x0089f07c, 0x0089f494, 0x008999ee,
                 0x0054bac0, 0x0088510e, 0x00884a1d, 0x0059d6d0, 0x0089777e, 0x008ab884,
                 0x00555450, 0x005507a0, 0x005a69b0, 0x00868cc0,
                 0x00583d70,  # FEng object callback (vtable 009d0680) core.nfsc hooks
@@ -255,12 +257,13 @@ mouse_device_ptr = 0x00c2bf44
 mouse_device_right = 0x00c2bf48
 camera = 0x00c2bf50
 sprites = []
-# Guest functions a thread runs without the scheduler's baton, beside the thread that holds
-# it (kit runtime/win32.h sched_free_run_enter). 008a721d mixes one 256-sample block of
-# the EA sound engine's voices on the audio thread (called from its loop 008a7de6): pure
-# DSP over the mixer's own voice state, which commands from the game thread reach only
-# through 008993fa under the audio critical section. A third of a core in a crowded race.
-free_run = [0x008a721d]
+# Parallelize only the inner 256-sample voice mix (008afde7), called once from
+# 008a721d at 008a72a9. The outer wrapper's clock read (008b0184) and buffer
+# bookkeeping keep the guest baton, avoiding a release/reacquire around timeGetTime.
+# Mixing instructions are unchanged. Commands still reach the mixer's private
+# voice state through 008993fa under the audio critical section; imports and mod
+# hooks keep the runtime's serialized fallback (kit runtime/win32.h).
+free_run = [0x008afde7]
 
 [mods]
 builtin = "none"

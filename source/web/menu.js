@@ -3,7 +3,7 @@
 // controller's settings chord opens it. It holds back to the game, full screen,
 // other scripts' switches (window.recompMenuToggles, e.g. radar.js's radar) and
 // buttons (window.recompMenuActions, e.g. race.js's race together), who is
-// online and your crew (changed here while driving), the settings, and quit to
+// a link to Online (F8), the settings, and quit to
 // the start page. The start page (start.js) loads it when the player presses
 // Play; the game's own Esc menu is untouched.
 //
@@ -86,22 +86,6 @@
   .cm-go .cm-hint { margin-left: auto; }
   .cm-who { font-size: 13px; color: var(--dim); margin: 0 0 8px; }
   .cm-who b { color: var(--ink); font-weight: 600; }
-  .cm-crews { display: grid; gap: 6px; margin: 0 0 10px; max-height: max(120px, calc(100vh - 430px)); overflow-y: auto; padding-left: 4px; }
-  .cm-crews.more { -webkit-mask-image: linear-gradient(#000 calc(100% - 26px), transparent); mask-image: linear-gradient(#000 calc(100% - 26px), transparent); }
-  .cm-crew { --c: var(--dim); padding: 7px 12px 8px; background: rgba(255, 255, 255, .035); border-left: 3px solid var(--c);
-        transform: skewX(-8deg); }
-  .cm-crew > * { transform: skewX(8deg); }
-  .cm-crew.mine { background: color-mix(in srgb, var(--c) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 45%, transparent); }
-  .cm-crew-head { display: flex; align-items: center; gap: 8px; color: var(--c);
-        font: italic 800 13px/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .14em; text-transform: uppercase; }
-  .cm-crew-head::before { content: ""; width: 8px; height: 8px; flex: none; background: var(--c); transform: skewX(-12deg); }
-  .cm-crew.none .cm-crew-head { font-weight: 700; }
-  .cm-crew.none .cm-crew-head::before { background: transparent; border: 1px solid var(--c); }
-  .cm-crew-tag { font: 700 10px/1 system-ui, sans-serif; letter-spacing: .08em; padding: 3px 6px; color: #04101a; background: var(--c); }
-  .cm-crew-n { margin-left: auto; font: 600 12px/1 system-ui, sans-serif; letter-spacing: .04em; color: var(--dim); }
-  .cm-crew-names { margin-top: 5px; font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }
-  .cm-crew-names b { color: var(--c); font-weight: 600; }
-  .cm-crew.none .cm-crew-names b { color: var(--ink); }
   .cm-crew-now { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .cm-chip { --c: var(--dim); padding: 3px 7px; border: 1px solid var(--c); color: var(--c); white-space: nowrap;
         background: color-mix(in srgb, var(--c) 14%, transparent); letter-spacing: .1em; text-transform: uppercase;
@@ -162,6 +146,43 @@
         border: 1px solid var(--line); background: rgba(255, 255, 255, .03); transform: skewX(-8deg); }
   .cm-pad-key.on { color: #04101a; background: var(--cyan); border-color: var(--cyan); }
   .cm-pad-axes { margin: 0 0 10px; font: 13px/1.6 ui-monospace, Menlo, Consolas, monospace; color: var(--ink); white-space: pre; overflow-x: auto; }
+
+  .cm-panel.cm-panel-online { width:min(880px,100%);clip-path:none;padding:26px;max-height:calc(100dvh - 32px); }
+  .cm-online-header { display:flex;align-items:center;justify-content:space-between;gap:20px; }
+  .cm-online-eyebrow { color:var(--cyan);font:700 10px/1.2 system-ui,sans-serif;letter-spacing:.2em;margin:0 0 8px; }
+  .cm-online-header h2 { margin:0;font-size:26px; }
+  .cm-online-close,.cm-online-tabs button,.cm-online-more { cursor:pointer;color:var(--ink);background:#10202d;border:1px solid var(--line);padding:10px 14px;min-height:44px;font:600 13px/1.3 system-ui,sans-serif; }
+  .cm-online-close span { color:var(--dim);margin-inline-start:12px;font-size:11px; }
+  .cm-online-tabs { display:flex;gap:6px;margin:20px 0; }
+  .cm-online-tabs button { flex:1;font:italic 700 15px/1.3 "Avenir Next Condensed",system-ui,sans-serif;letter-spacing:.06em; }
+  .cm-online-tabs button[aria-pressed=true] { background:var(--cyan);border-color:var(--cyan);color:#04101a; }
+  .cm-online-tools { display:grid;grid-template-columns:1fr 160px;gap:16px; }
+  .cm-online-tools label { display:grid;gap:6px;color:var(--dim);font-size:12px;min-width:0; }
+  .cm-online-tools input,.cm-online-tools select { width:100%;min-width:0;min-height:44px;padding:10px 12px;background:#08121d;border:1px solid var(--line);color:var(--ink);font:500 14px/1.4 system-ui,sans-serif;border-radius:0; }
+  .cm-online-count { color:var(--dim);font-size:12px;margin:14px 0 8px; }
+  .cm-online-list { overflow-y:auto;max-height:min(46dvh,440px);scrollbar-color:var(--dim) #08121d;overscroll-behavior:contain; }
+  .cm-online-player { width:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.7fr) auto;gap:12px;align-items:center;text-align:start;min-height:54px;padding:10px 14px;background:rgba(95,228,242,.025);border:0;border-bottom:1px solid rgba(95,228,242,.12);color:var(--ink);cursor:pointer;font:500 14px/1.4 system-ui,sans-serif; }
+  .cm-online-player strong { overflow-wrap:anywhere;font-weight:650; }
+  .cm-online-player .crew { color:var(--dim);overflow-wrap:anywhere;font-size:12px; }
+  .cm-online-player .activity { color:var(--cyan);font-size:11px;white-space:nowrap; }
+  .cm-online-player[aria-pressed=true],.cm-online-player:hover { background:rgba(95,228,242,.12); }
+  .cm-online-more { width:100%;margin-top:8px; }
+  .cm-online-detail { padding:14px;margin-top:12px;background:#0c1e2b;border-inline-start:2px solid var(--cyan);overflow-wrap:anywhere; }
+  .cm-online-detail p { margin:6px 0 0;color:var(--dim);font-size:13px; }
+  .cm-online-empty { margin:0;padding:28px 14px;color:var(--dim);text-align:center;font-size:14px; }
+  .cm-online-invite { padding:14px;background:#0c1e2b;margin-top:8px; }
+  .cm-online-invite p { margin:0 0 10px;overflow-wrap:anywhere; }
+  .cm-online-close:hover,.cm-online-more:hover { border-color:var(--cyan); }
+  .cm-online-view :is(button,input,select):focus-visible { outline:2px solid var(--cyan);outline-offset:2px; }
+  @media(max-width:560px) {
+    .cm-panel.cm-panel-online { padding:16px; }
+    .cm-online-header { gap:10px; }.cm-online-header h2 { font-size:22px; }
+    .cm-online-close { font-size:12px;padding:8px; }.cm-online-close span { display:none; }
+    .cm-online-tabs { margin:16px 0; }.cm-online-tabs button { padding:10px 6px;font-size:14px; }
+    .cm-online-tools { grid-template-columns:minmax(0,1fr) 110px;gap:10px; }
+    .cm-online-player { padding:10px 8px;gap:8px;grid-template-columns:minmax(0,1fr) auto; }
+    .cm-online-player .crew { grid-column:1; }.cm-online-player .activity { grid-column:2;grid-row:1 / span 2; }
+  }
   .cm [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) { .cm-open, .cm-item { transition: none; } }
   `;
@@ -178,20 +199,7 @@
         <button class="cm-item cm-back" type="button"><span>Back to the game</span><span class="cm-hint">F9 · F10 · Esc</span></button>
         <button class="cm-item cm-full" type="button"><span>Full screen</span><span class="cm-val"></span></button>
         <div class="cm-toggles"></div>
-        <section class="cm-online" hidden>
-          <h3>Online</h3>
-          <div class="cm-who"></div>
-          <div class="cm-crews"></div>
-          <button class="cm-item cm-crew-edit" type="button"><span>Your crew</span><span class="cm-crew-now"></span></button>
-          <div class="cm-crew-form" hidden>
-            <p>Players who type the same crew name are one crew. Leave it empty for no crew.</p>
-            <div class="cm-row">
-              <input class="cm-crew-in" type="text" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Crew name" aria-label="Crew name">
-              <button class="cm-item cm-crew-ok" type="button"><span>Set</span></button>
-            </div>
-            <p class="cm-crew-note" role="status" hidden></p>
-          </div>
-        </section>
+        <button class="cm-item cm-online-go" type="button"><span>Online</span><span class="cm-hint">F8 · Players &amp; invitations</span></button>
         <div class="cm-extra"></div>
         <h3>Settings</h3>
         <button class="cm-item cm-go" type="button" data-page="display"><span>Display &amp; graphics</span><span class="cm-hint restart"></span></button>
@@ -207,6 +215,37 @@
         </div>
         <div class="cm-foot">The game's own menu (pause, options) is on Esc while you drive.</div>
       </div>
+      <section class="cm-online cm-online-view" hidden aria-label="Online">
+        <header class="cm-online-header"><div><p class="cm-online-eyebrow">CARBON · ONLINE</p><h2>Online</h2></div><button class="cm-online-close" type="button" aria-label="Back to game — close Online">Back to game <span>Esc</span></button></header>
+        <p class="cm-who" role="status"></p>
+        <div class="cm-online-tabs" aria-label="Online views">
+          <button type="button" data-online-tab="players" aria-pressed="true">Players</button>
+          <button type="button" data-online-tab="crew" aria-pressed="false">My crew</button>
+          <button type="button" data-online-tab="invites" aria-pressed="false">Invitations</button>
+        </div>
+        <div class="cm-online-players">
+          <div class="cm-online-tools"><label>Find a player<input class="cm-online-search" type="search" autocomplete="off" maxlength="64" placeholder="Search player or crew"></label><label>Show<select class="cm-online-filter"><option value="nearby">Nearby</option><option value="crew">My crew</option><option value="all">All online</option></select></label></div>
+          <p class="cm-online-count" role="status"></p>
+          <div class="cm-online-list" aria-label="Players"></div>
+          <button class="cm-online-more" type="button" hidden>Show more players</button>
+          <div class="cm-online-detail" hidden></div>
+        </div>
+        <div class="cm-online-crew" hidden>
+          <button class="cm-item cm-crew-edit" type="button"><span>Your crew</span><span class="cm-crew-now"></span></button>
+          <div class="cm-crew-form" hidden>
+            <p>Players who type the same crew name are one crew. Leave it empty for no crew.</p>
+            <div class="cm-row">
+              <input class="cm-crew-in" type="text" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Crew name" aria-label="Crew name">
+              <button class="cm-item cm-crew-ok" type="button"><span>Set</span></button>
+            </div>
+            <p class="cm-crew-note" role="status" hidden></p>
+          </div>
+          <p class="cm-note">Players using your crew name appear here.</p>
+          <div class="cm-online-members cm-online-list" aria-label="Crew members"></div>
+          <button class="cm-online-more cm-online-crew-more" type="button" hidden>Show more members</button>
+        </div>
+        <div class="cm-online-invites" hidden><div class="cm-online-actions"></div><div class="cm-online-invitations"></div></div>
+      </section>
       <div class="cm-set" hidden>
         <h2><button class="cm-up" type="button" aria-label="Back to the menu" title="Back (Esc)"><span>‹</span></button><span class="cm-set-title"></span></h2>
         <p class="cm-note cm-set-note" hidden></p>
@@ -239,6 +278,9 @@
   const shade = $(".cm-shade"), openBtn = $(".cm-open"), canvas = document.getElementById("canvas");
   const mainPage = $(".cm-main"), setPage = $(".cm-set"), checkPage = $(".cm-check");
 
+  const onlinePage = $(".cm-online-view");
+  let onlineOpen = false, onlineTab = "players", playerLimit = 50, selectedPlayer = null, onlineSignature = "", onlineReturn = null;
+
   // ---- Values ----
   function setVal(btn, on) {
     const v = btn.querySelector(".cm-val");
@@ -258,108 +300,163 @@
     quitHint.textContent = waiting ? "Restarts with your new settings" : "";
     quitHint.classList.toggle("restart", !!waiting);
     if (!setPage.hidden) update();
-    const s = window.recompOnlineState, online = window.recompOnline;
-    $(".cm-online").hidden = !online;
-    if (!online) return;
-    const who = $(".cm-who"), list = $(".cm-crews");
-    who.replaceChildren();
-    list.replaceChildren();
-    list.classList.remove("more");
-    if (shade.hidden) requestAnimationFrame(() => { list.scrollTop = 0; }); // opening: start at the top
-    const me = document.createElement("b");
-    me.textContent = online.name;
-    who.append("You are ", me, online.room ? ` in room "${online.room}"` : " with everyone on the server", ". ");
-    if (!s || !s.open) who.append("Connecting…");
-    else {
-      const people = s.people || s.names.map((n) => ({ name: n, crew: "" }));
-      if (!people.length) who.append("Nobody else is here yet.");
-      crewList(list, people, online.name, crewNow());
-    }
+    $(".cm-online-go").hidden = !window.recompOnline && !window.recompOnlineState;
     crewDone();
     showCrew();
-    fit();
-  }
-  // Who is here, one block per crew in the crew's colour: your own crew first and
-  // marked, then the others (biggest first), then those in no crew. net.js says
-  // which names are one crew and what colour each crew has. A crew typed in two
-  // ways ("Speed", "speed") shows the way you typed it, else the way the player
-  // who has been here longest did (people come in the order they arrived).
-  function crewList(list, people, myName, myCrew) {
-    const key = window.recompCrewKey || ((c) => String(c || "").toLowerCase().replace(/\s+/g, ""));
-    const color = window.recompCrewColor || (() => "");
-    const mine = key(myCrew), groups = new Map(); // crew key -> {crew, people: [{name, me}]}
-    if (!mine && !people.length) return; // alone and in no crew: nothing to list
-    const add = (crew, name, me) => {
-      const k = key(crew);
-      if (!groups.has(k)) groups.set(k, { crew: String(crew || "").trim(), people: [] });
-      groups.get(k).people.push({ name, me });
-    };
-    add(myCrew, myName, true);
-    for (const p of people) add(p.crew, p.name, false);
-    for (const g of groups.values()) g.people.sort((a, b) => b.me - a.me || a.name.localeCompare(b.name));
-    const rank = (k) => (k && k === mine ? 0 : k ? 1 : 2);
-    const order = [...groups].sort(([a, x], [b, y]) =>
-      rank(a) - rank(b) || y.people.length - x.people.length || x.crew.localeCompare(y.crew));
-    // A big room (a hundred players or more) lists names only for your own crew;
-    // other crews show their size, the biggest twelve, then one line for the rest.
-    const big = people.length > 20, shown = big ? order.slice(0, 13) : order;
-    const rest = order.slice(shown.length).reduce((n, [, g]) => n + g.people.length, 0);
-    for (const [k, g] of shown) {
-      const el = document.createElement("div"), head = document.createElement("div"), names = document.createElement("div");
-      el.className = "cm-crew" + (!k ? " none" : k === mine ? " mine" : "");
-      if (k && color(g.crew)) el.style.setProperty("--c", color(g.crew));
-      head.className = "cm-crew-head";
-      const title = document.createElement("span");
-      title.textContent = k ? g.crew : "No crew";
-      head.append(title);
-      if (k && k === mine) {
-        const tag = document.createElement("span");
-        tag.className = "cm-crew-tag";
-        tag.textContent = "Your crew";
-        head.append(tag);
-      }
-      const n = document.createElement("span");
-      n.className = "cm-crew-n";
-      n.textContent = g.people.length === 1 ? "1 player" : `${g.people.length} players`;
-      head.append(n);
-      names.className = "cm-crew-names";
-      if (big && k !== mine) { el.append(head); list.append(el); continue; }
-      g.people.forEach((p, i) => {
-        if (i) names.append(", ");
-        if (!p.me) { names.append(p.name); return; }
-        const b = document.createElement("b");
-        b.textContent = `${p.name} (you)`;
-        names.append(b);
-      });
-      el.append(head, names);
-      list.append(el);
-    }
-    if (rest) {
-      const el = document.createElement("div");
-      el.className = "cm-crew none";
-      el.textContent = `and ${rest} more ${rest === 1 ? "player" : "players"} in other crews`;
-      list.append(el);
-    }
-    list.onscroll = more;
-  }
-  // A full room on a short screen scrolls: the list takes the height the rest
-  // of the menu leaves on screen (at least 120 px), and a faded edge says there
-  // is more below. Measured while the menu shows. Only when even that is too
-  // tall (the crew field open on a short screen) does the whole menu scroll.
-  function more() {
-    const list = $(".cm-crews");
-    list.classList.toggle("more", list.scrollTop + list.clientHeight < list.scrollHeight - 1);
-  }
-  function fit() {
-    if (shade.hidden || mainPage.hidden || $(".cm-online").hidden) return;
-    const list = $(".cm-crews"), panel = $(".cm-panel");
-    const spare = innerHeight - 32 - (panel.scrollHeight + panel.offsetHeight - panel.clientHeight);
-    list.style.maxHeight = `${Math.max(120, list.clientHeight + spare)}px`;
-    more();
+    if (onlineOpen) renderOnline();
   }
   addEventListener("recomp-online", () => { if (!shade.hidden) refresh(); });
-  addEventListener("resize", fit);
-  document.addEventListener("fullscreenchange", () => { if (!shade.hidden) refresh(); });
+
+  // Escape belongs to the game's pause menu while fullscreen. The browser
+  // retains its emergency exit and may deny keyboard lock.
+  async function fullscreenKeys() {
+    if (!document.fullscreenElement) {
+      navigator.keyboard?.unlock?.();
+      return;
+    }
+    try { await navigator.keyboard?.lock?.(["Escape"]); }
+    catch (error) { console.warn("[controls] fullscreen keyboard lock unavailable:", error?.message || String(error)); }
+    if (!document.fullscreenElement) navigator.keyboard?.unlock?.();
+  }
+  document.addEventListener("fullscreenchange", () => {
+    void fullscreenKeys();
+    if (!shade.hidden) refresh();
+  });
+  if (document.fullscreenElement) void fullscreenKeys();
+  addEventListener("keydown", e => {
+    if (document.fullscreenElement && e.code === "Escape") e.preventDefault();
+  }, true);
+
+
+  function openOnline() {
+    onlineReturn = shade.hidden ? document.activeElement : null;
+    if (shade.hidden) open();
+    onlineOpen = true;
+    mainPage.hidden = setPage.hidden = checkPage.hidden = true;
+    checking = false;
+    onlinePage.hidden = false;
+    $(".cm-panel").classList.add("cm-panel-online");
+    $(".cm-panel").setAttribute("aria-label", "Online");
+    onlineSignature = "";
+    renderOnline();
+    $(".cm-online-close").focus();
+  }
+  function chooseOnlineTab(tab) {
+    onlineTab = tab;
+    playerLimit = 50;
+    onlineSignature = "";
+    renderOnline();
+  }
+  function renderOnline() {
+    const state = window.recompOnlineState || {}, config = window.recompOnline || {};
+    const me = state.name || config.name || "You", mine = crewNow();
+    const key = window.recompCrewKey || (v => String(v || "").toLowerCase().replace(/\s+/g, ""));
+    const peers = state.open ? (state.people || []).filter(p => p.id !== state.me) : [];
+    const nearby = new Set((state.slotIds || []).filter(Boolean));
+    const query = $(".cm-online-search").value.trim().toLocaleLowerCase();
+    const filter = $(".cm-online-filter").value;
+    const invitationState = window.recompRace?.state?.();
+    const invitations = state.open ? invitationState?.invites || [] : [];
+    const signature = JSON.stringify([onlineTab, query, filter, playerLimit, selectedPlayer, mine, state.open, me,
+      peers.map(p => [p.id, p.name, p.crew, p.activity, nearby.has(p.id)]),
+      invitations.map(i => [i.race, i.name, i.joined]), invitationState?.game?.flow, invitationState?.game?.car,
+      !!invitationState?.race, invitationState?.lobby?.roster?.length, invitationState?.hosting]);
+    if (signature === onlineSignature) return;
+    onlineSignature = signature;
+    const connectionText = state.open ? `${peers.length + 1} online · You are ${me}` : "Connecting to online play…";
+    if ($(".cm-who").textContent !== connectionText) $(".cm-who").textContent = connectionText;
+    for (const b of root.querySelectorAll("[data-online-tab]")) b.setAttribute("aria-pressed", String(b.dataset.onlineTab === onlineTab));
+    $(".cm-online-players").hidden = onlineTab !== "players";
+    $(".cm-online-crew").hidden = onlineTab !== "crew";
+    $(".cm-online-invites").hidden = onlineTab !== "invites";
+    const empty = (parent, message) => { const p = document.createElement("p");p.className = "cm-online-empty";p.textContent = message;parent.append(p); };
+    if (onlineTab === "invites") {
+      const list = $(".cm-online-invitations");
+      const focused = document.activeElement?.dataset.raceInvite;
+      list.replaceChildren();
+      if (!invitations.length) empty(list, "No race invitations. Nearby rival challenges appear in the game.");
+      for (const inv of invitations) {
+        const item = document.createElement("div"), title = document.createElement("p"), action = document.createElement("button");
+        item.className = "cm-online-invite";title.textContent = `Quick Race · ${inv.name || "Another player"}`;
+        action.type = "button";action.className = "cm-item";action.dataset.raceInvite = String(inv.race);
+        action.textContent = inv.joined ? "Leave invitation" : "Join race";
+        const ready = inv.joined || (!invitationState?.race && !invitationState?.lobby && invitationState?.game?.flow === 3 && invitationState?.game?.car);
+        action.disabled = !ready;
+        action.addEventListener("click", () => {
+          if (inv.joined) window.recompRace?.leave?.(inv.race); else window.recompRace?.join?.(inv.race);
+          onlineSignature = "";renderOnline();drawActions();
+        });
+        item.append(title, action);
+        if (!ready) { const note = document.createElement("p");note.className = "cm-note";note.textContent = "Return to the game's main menu to join.";item.append(note); }
+        list.append(item);
+      }
+      if (focused) [...list.querySelectorAll("button")].find(b => b.dataset.raceInvite === focused)?.focus({preventScroll:true});
+      return;
+    }
+    let matches = onlineTab === "crew" ? (mine ? peers.filter(p => key(p.crew) === key(mine)) : []) : peers.filter(p =>
+      (filter === "all" || filter === "nearby" && nearby.has(p.id) || filter === "crew" && mine && key(p.crew) === key(mine)) &&
+      (!query || `${p.name} ${p.crew || ""}`.toLocaleLowerCase().includes(query)));
+    matches = matches.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)) || a.id - b.id);
+    if (onlineTab === "crew" && mine && state.open) matches.unshift({id:state.me || -1,name:`${me} (you)`,crew:mine,activity:"self"});
+    const list = $(onlineTab === "crew" ? ".cm-online-members" : ".cm-online-players .cm-online-list");
+    const scroll = list.scrollTop, focused = document.activeElement?.dataset.playerId;
+    list.replaceChildren();
+    if (!matches.length) empty(list, !state.open ? "The connection is not ready yet." : onlineTab === "crew" && !mine ? "Set a crew name to see your crew here." : query ? "No players match your search." : filter === "crew" && !mine ? "You have no crew name set." : "No players to show here yet.");
+    const activity = p => p.activity === "race" ? "Racing" : p.activity === "roam" ? "Free roam" : p.activity === "self" ? "You" : nearby.has(p.id) ? "Nearby" : "Online";
+    for (const player of matches.slice(0, playerLimit)) {
+      const row = document.createElement("button"), name = document.createElement("strong"), crew = document.createElement("span"), status = document.createElement("span");
+      row.type = "button";row.className = "cm-online-player";row.dataset.playerId = String(player.id);
+      row.setAttribute("aria-pressed", String(player.id === selectedPlayer));
+      name.textContent = player.name || "Player";crew.className = "crew";crew.textContent = player.crew || "No crew";
+      status.className = "activity";status.textContent = activity(player);
+      row.append(name, crew, status);
+      row.addEventListener("click", () => { selectedPlayer = selectedPlayer === player.id ? null : player.id;onlineSignature = "";renderOnline(); });
+      list.append(row);
+    }
+    list.scrollTop = scroll;
+    if (focused) {
+      const row = [...list.querySelectorAll("button")].find(b => b.dataset.playerId === focused);
+      if (row) row.focus({preventScroll:true});else $(onlineTab === "crew" ? ".cm-crew-edit" : ".cm-online-search").focus();
+    }
+    const more = $(".cm-online-more");
+    more.hidden = onlineTab !== "players" || matches.length <= playerLimit;
+    more.textContent = `Show more · ${Math.max(0, matches.length - playerLimit)} remaining`;
+    $(".cm-online-crew-more").hidden = onlineTab !== "crew" || matches.length <= playerLimit;
+    const countText = `${matches.length} ${matches.length === 1 ? "player" : "players"} · showing ${Math.min(matches.length, playerLimit)}`;
+    if ($(".cm-online-count").textContent !== countText) $(".cm-online-count").textContent = countText;
+    const detail = $(".cm-online-detail"), selected = matches.find(p => p.id === selectedPlayer);
+    detail.hidden = !selected;
+    if (selected) {
+      detail.replaceChildren();const name = document.createElement("strong"), description = document.createElement("p");
+      name.textContent = selected.name;description.textContent = `${selected.crew || "No crew"} · ${activity(selected)}`;
+      detail.append(name, description);
+    }
+  }
+  $(".cm-online-go").addEventListener("click", openOnline);
+  $(".cm-online-close").addEventListener("click", close);
+  for (const b of root.querySelectorAll("[data-online-tab]")) {
+    b.addEventListener("click", () => chooseOnlineTab(b.dataset.onlineTab));
+    b.addEventListener("keydown", e => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();e.stopPropagation();
+      const tabs = [...root.querySelectorAll("[data-online-tab]")], at = tabs.indexOf(b);
+      const next = e.key === "Home" ? tabs[0] : e.key === "End" ? tabs.at(-1) : tabs[(at + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.click();next.focus();
+    });
+  }
+  for (const type of ["input", "change"]) $(".cm-online-search").addEventListener(type, () => { playerLimit = 50;onlineSignature = "";$(".cm-online-players .cm-online-list").scrollTop = 0;renderOnline(); });
+  $(".cm-online-filter").addEventListener("change", () => { playerLimit = 50;onlineSignature = "";renderOnline(); });
+  for (const selector of [".cm-online-more", ".cm-online-crew-more"]) $(selector).addEventListener("click", () => { playerLimit += 50;onlineSignature = "";renderOnline(); });
+  addEventListener("recomp-open-online", openOnline);
+  addEventListener("recomp-race-invitations", () => {
+    if (!onlineOpen) return;
+    const before = onlineSignature, focused = document.activeElement?.dataset.id;
+    renderOnline();
+    if (before !== onlineSignature) {
+      drawActions();
+      if (focused) [...root.querySelectorAll(".cm-action")].find(b => b.dataset.id === focused)?.focus({preventScroll:true});
+    }
+  });
 
   // ---- Your crew ----
   // Changed while driving through net.js (window.recompOnlineCrew), which tells
@@ -384,20 +481,17 @@
     crewNote.textContent = text;
     crewNote.hidden = !text;
     crewNote.classList.toggle("bad", bad);
-    fit();
   }
   function editCrew() {
     crewIn.value = crewNow();
     crewSay("");
     crewForm.hidden = false;
-    fit();
     crewIn.focus();
     crewIn.select();
   }
   function hideCrew() {
     crewForm.hidden = true;
     $(".cm-crew-edit").focus();
-    fit();
   }
   function setCrew() {
     const want = crewClean(crewIn.value).trim().slice(0, 16);
@@ -516,6 +610,8 @@
       });
       groups.get(group).push(btn);
     }
+    $(".cm-online-actions").replaceChildren(...(groups.get("Race together") || []));
+    groups.delete("Race together");
     $(".cm-extra").replaceChildren(...[...groups].flatMap(([name, btns]) => {
       const h = document.createElement("h3");
       h.textContent = name;
@@ -1103,13 +1199,17 @@
   });
 
   // ---- Open and close ----
-  function items() { return [...shade.querySelectorAll("button, input")].filter((b) => !b.closest("[hidden]")); }
+  function items() { return [...shade.querySelectorAll("button, input, select")].filter((b) => !b.disabled && !b.closest("[hidden]")); }
   function open() {
     if (!shade.hidden) return;
     if (document.pointerLockElement) document.exitPointerLock();
     drawToggles();
     drawActions();
     resetCrew();
+    onlineOpen = false;
+    onlinePage.hidden = true;
+    $(".cm-panel").setAttribute("aria-label", "Menu");
+    $(".cm-panel").classList.remove("cm-panel-online");
     page = null;
     rowEls.clear();
     checking = false;
@@ -1120,7 +1220,6 @@
     $(".cm-quit-box").hidden = true;
     shade.hidden = false;
     openBtn.hidden = true;
-    fit();
     $(".cm-back").focus();
     if (S.block) ask(""); // a fresh list: F11 or the game may have changed a value
     kick();
@@ -1132,8 +1231,11 @@
     shade.hidden = true;
     openBtn.hidden = false;
     checking = false;
+    onlineOpen = false;
     globalThis.recompMenuOpen = false;
-    canvas?.focus();
+    if (onlineReturn?.isConnected && onlineReturn.getClientRects().length) onlineReturn.focus();
+    else canvas?.focus();
+    onlineReturn = null;
   }
   const toggle = () => (shade.hidden ? open() : close());
 
@@ -1144,6 +1246,12 @@
   let keyAt = -1e9;
   const MENU_KEYS = new Set(["F9", "F10"]);
   addEventListener("keydown", (e) => {
+    if (globalThis.carbonHudPickerOpen) return;
+    if (e.code === "F8" && (window.recompOnline || window.recompOnlineState)) {
+      e.preventDefault();e.stopImmediatePropagation();
+      if (!e.repeat) { if (onlineOpen && !shade.hidden) close(); else openOnline(); }
+      return;
+    }
     if (MENU_KEYS.has(e.code)) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -1153,22 +1261,27 @@
     if (!shade.hidden && !root.contains(e.target)) {
       e.preventDefault();
       e.stopImmediatePropagation();
-      (mainPage.hidden ? setPage.querySelector(".cm-set-row") || $(".cm-up") : $(".cm-back")).focus();
+      (onlineOpen ? $(".cm-online-close") : mainPage.hidden ? setPage.querySelector(".cm-set-row") || $(".cm-up") : $(".cm-back")).focus();
     }
   }, true);
   addEventListener("keypress", (e) => {
+    if (globalThis.carbonHudPickerOpen) return;
     if (MENU_KEYS.has(e.code) || (!shade.hidden && !root.contains(e.target))) {
       e.preventDefault();
       e.stopImmediatePropagation();
     }
   }, true);
-  addEventListener("recomp-menu", () => { if (performance.now() - keyAt > 400) toggle(); });
+  addEventListener("recomp-menu", () => {
+    if (globalThis.carbonHudPickerOpen) { globalThis.carbonCustomHud?.closePicker(); return; }
+    if (performance.now() - keyAt > 400) toggle();
+  });
   // Keys inside the menu stop here, before the game's listeners on the window.
   for (const type of ["keydown", "keypress"]) root.addEventListener(type, (e) => e.stopPropagation());
   // One step back: a confirmation, the crew field, the controller check or a settings
   // page; on the first page `closing` (Esc, the controller's ○ / B) closes the menu.
   function back(closing) {
-    if (checking) leaveCheck();
+    if (onlineOpen) { if (!crewForm.hidden) hideCrew(); else close(); }
+    else if (checking) leaveCheck();
     else if (!$(".cm-quit-box").hidden) hideConfirm();
     else if (!crewForm.hidden) hideCrew();
     else if (!$(".cm-reset-box").hidden) hideReset();
@@ -1186,6 +1299,7 @@
     const list = items(), at = list.indexOf(document.activeElement);
     const row = document.activeElement?.closest?.(".cm-set-row");
     const inField = e.target instanceof HTMLInputElement;
+    if (e.target instanceof HTMLSelectElement && e.key !== "Escape" && e.key !== "Tab") return;
     if (e.key === "Escape" || (e.key === "Backspace" && !inField)) {
       e.preventDefault();
       back(e.key === "Escape");
@@ -1225,9 +1339,9 @@
       return s;
     }
     for (const [n, i] of Object.entries(SONY_RAW)) s[n] = pressed(i);
-    const dir = Math.round((axis(9) + 1) * 3.5); // 0 up, 1 up-right ... 7 up-left, 8 centred
+    const dir = Number.isFinite(gp.axes[9]) ? Math.round((gp.axes[9] + 1) * 3.5) : 8; // 0 up, 1 up-right ... 7 up-left, 8 centred
     Object.assign(s, { up: dir === 7 || dir === 0 || dir === 1, right: dir >= 1 && dir <= 3, down: dir >= 3 && dir <= 5,
-      left: dir >= 5 && dir <= 7, ry: axis(5), l2v: (axis(3) + 1) / 2, r2v: (axis(4) + 1) / 2 });
+      left: dir >= 5 && dir <= 7, ry: axis(5), l2v: Number.isFinite(gp.axes[3]) ? (gp.axes[3] + 1) / 2 : value(6), r2v: Number.isFinite(gp.axes[4]) ? (gp.axes[4] + 1) / 2 : value(7) });
     return s;
   }
   // Match SDL's browser-name normalization, rather than treating any open
@@ -1287,7 +1401,12 @@
       padNext = now + (dir !== padDir ? 400 : 120); // held: repeats, like a key
       padDir = dir;
       padUsed();
-      if (!shade.contains(document.activeElement)) $(".cm-back").focus();
+      if (!shade.contains(document.activeElement)) (onlineOpen ? $(".cm-online-close") : $(".cm-back")).focus();
+      else if (onlineOpen && document.activeElement instanceof HTMLSelectElement && (dir === "left" || dir === "right")) {
+        const select = document.activeElement;
+        select.selectedIndex = (select.selectedIndex + (dir === "right" ? 1 : select.options.length - 1)) % select.options.length;
+        select.dispatchEvent(new Event("change", {bubbles:true}));
+      }
       else if (dir === "up" || dir === "down") step(dir === "down" ? 1 : -1);
       else {
         const row = document.activeElement.closest(".cm-set-row");
@@ -1298,7 +1417,7 @@
       padUsed();
       const el = document.activeElement;
       if (el instanceof HTMLButtonElement && shade.contains(el)) el.click();
-      else if (!shade.contains(el)) $(".cm-back").focus();
+      else if (!shade.contains(el)) (onlineOpen ? $(".cm-online-close") : $(".cm-back")).focus();
     } else if (press("east")) {
       padUsed();
       back(true);
@@ -1388,7 +1507,7 @@
   $(".cm-full").addEventListener("click", async () => {
     try {
       if (document.fullscreenElement) await document.exitFullscreen();
-      else await document.documentElement.requestFullscreen();
+      else await document.documentElement.requestFullscreen({ keyboardLock: "browser" });
     } catch {}
     store.set("fullscreen", !!document.fullscreenElement);
     refresh();

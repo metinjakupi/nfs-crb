@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Carbon mobile beta recovery</title>
+<style>body{background:#070c16;color:#e9f6ff;font:17px/1.5 system-ui;padding:24px;max-width:650px;margin:auto}button{min-height:48px;padding:12px 18px;background:#5fe4f2;color:#070c16;border:0;font:inherit}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>
+<h1>Mobile beta temporarily stopped</h1>
+<p>The latest test build is disabled while we investigate a crash. This page does not load the game.</p>
+<button id="download">Download last test results</button>
+<p id="status" role="status"></p>
+<script>
+"use strict";
+const button = document.querySelector('#download');
+let raw;
+try {raw = localStorage.getItem('carbon.mobile-startup.v1');} catch {}
+if (!raw) {button.disabled = true;document.querySelector('#status').textContent = 'No saved results in this browser.';}
+button.onclick = () => {
+ const url = URL.createObjectURL(new Blob([raw],{type:'application/json'}));
+ const a = document.createElement('a');a.href=url;a.download='carbon-mobile-startup.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+</script>
+</html>

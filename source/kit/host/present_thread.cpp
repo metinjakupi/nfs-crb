@@ -6,6 +6,7 @@
 #include "present_test.h"
 #include "performance_overlay.h"
 #include "gpu_time.h"
+#include "web_performance.h"
 #include "d3d_render.h"
 #include "input_gate.h"
 #include "../dx/passes.h"
@@ -37,6 +38,33 @@ extern "C" void host_audio_restart_output(const char *why); // weak default: run
 #include "../platform/os.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten/threading.h>
+#include <emscripten/em_js.h>
+#include <emscripten/emscripten.h>
+extern "C" EMSCRIPTEN_KEEPALIVE void host_performance_reports_stop() {
+    g_performance_reports_stopped.store(true, std::memory_order_relaxed);
+}
+EM_JS(void, host_performance_render, (double at, double encode, double wait, double defer), {
+    try {
+        globalThis['recompPerformance'] ?.render(at, encode, wait, defer);
+    } catch {
+    }
+});
+EM_JS(void, host_performance_gpu, (double at, double ms, int passes), {
+    try {
+        globalThis['recompPerformance'] ?.gpu(at, ms, passes);
+    } catch {
+    }
+});
+EM_JS(void, host_performance_frame,
+      (double at, int cls, double epoch, int w, int h, int repeat, double slot, double yield_ms,
+       double blocked, double ready, double sleep, double over, double object),
+      {
+          try {
+              globalThis['recompPerformance'] ?.frame(at, cls, epoch, w, h, repeat, slot, yield_ms,
+                                                      blocked, ready, sleep, over, object);
+          } catch {
+          }
+      });
 #endif
 
 namespace {
@@ -384,6 +412,14 @@ struct Service : std::enable_shared_from_this<Service> {
                 if (!f->repeat && !f->completion_fallback && f->cls == HOST_SCREEN_GAMEPLAY &&
                     f->epoch == epoch)
                     metric.complete(std::max(f->presented_ts, f->gpu_ts));
+#ifdef __EMSCRIPTEN__
+                if (host_performance_reports_enabled() && !offscreen && !f->completion_fallback)
+                    host_performance_frame(
+                        f->presented_ts * 1000, f->screen_class_valid ? int(f->cls) : -1,
+                        double(f->epoch), f->input.drawable_w, f->input.drawable_h, int(f->repeat),
+                        f->slot_wait_ms, f->guest_yield_ms, f->guest_blocked_ms, f->guest_late_ms,
+                        f->guest_sleep_req_ms, f->guest_sleep_over_ms, f->guest_wait_ms);
+#endif
                 if (timings) {
                     fprintf(
                         timings,
@@ -563,7 +599,7 @@ struct Service : std::enable_shared_from_this<Service> {
             cpu_prev = cpu;
             cpu_thread = self;
         }
-        if (timings && g_sched_probe) {
+        if ((timings || host_performance_reports_enabled()) && g_sched_probe) {
             uint64_t t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             g_sched_probe(t);
             if (sched_primed) {

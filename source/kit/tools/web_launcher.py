@@ -72,6 +72,19 @@ def copy_web_build(game_id, build, out):
         if f.is_file() and (f.name == "index.html" or f.suffix in WEB_BUILD_SUFFIXES):
             shutil.copy2(f, dest / f.name)
 
+    assets = build / "custom-assets"
+    if (assets / "manifest.json").is_file():
+        import subprocess
+        for source in assets.rglob("*"):
+            if not source.is_file():
+                continue
+            destination = dest / "custom-assets" / source.relative_to(assets)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "darwin":
+                subprocess.run(["cp", "-c", str(source), str(destination)], check=True)
+            else:
+                shutil.copy2(source, destination)
+
 
 class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map, ".wasm": "application/wasm",

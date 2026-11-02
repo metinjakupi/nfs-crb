@@ -15,7 +15,8 @@ site=root/'build/web-stub-site'
 staging=Path(tempfile.mkdtemp(prefix='runtime-publish-',dir=site))
 w.copy_web_build('nfsc',source,staging)
 for f in (staging/'nfsc').iterdir():
-    assert f.stat().st_size==(source/f.name).stat().st_size, f.name
+    if f.is_file():
+        assert f.stat().st_size==(source/f.name).stat().st_size, f.name
 # Stamp the exact publish copy; preserve the original build output for reproducibility.
 import subprocess
 subprocess.run([sys.executable,str(root.parent/'tools/carbon-build-info.py'),

@@ -92,8 +92,15 @@ extern "C" int recomp_run_thunk(X86 *c, uint32_t target) {
         wr32(w.at, w.old);
     }
     char bytes[49] = {};
-    for (unsigned i = 0; i < 16 && pc < GUEST_SIZE && i < GUEST_SIZE - pc; ++i)
-        snprintf(bytes + i * 3, 4, "%02x ", rd8(pc + i));
+    // Misses recur for interpreted callbacks even when log_once suppresses the
+    // message. Encode the fixed-width bytes without sixteen printf calls.
+    constexpr char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 16 && pc < GUEST_SIZE && i < GUEST_SIZE - pc; ++i) {
+        const uint8_t value = rd8(pc + i);
+        bytes[i * 3] = hex[value >> 4];
+        bytes[i * 3 + 1] = hex[value & 15];
+        bytes[i * 3 + 2] = ' ';
+    }
     // Reported once per SHAPE of code, not once per address. A guest that
     // generates code writes the same routine to a new address every time, so a
     // per-address report is one line per call - which on a blit path is
