@@ -4,6 +4,7 @@ Game features, performance improvements, and bug fixes for NFS Carbon in the bro
 
 ## Unreleased
 
+- Play the story movies and start-up movies in the browser. They were skipped on the web; the game's own VP6 decoder plays them there. Skip intro movies still skips only the EA logo and the street-racing warning.
 - Keep shared effect values in their effect pool, as Direct3D does, instead of copying each per-object matrix into every other effect of the pool, cutting about 1.5% of the game thread's CPU time in races.
 - Remember Direct3D interface pointers between calls instead of reading them back from guest memory and the object table each time.
 - Reduce the cost of every Direct3D and Windows call from the game: the scheduler's call counter is no longer atomic, and the clock is read less often in the browser.

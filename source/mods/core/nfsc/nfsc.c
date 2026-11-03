@@ -29,7 +29,7 @@
  * message; the left and right HUD groups are then moved out by the same
  * offset with the game's FindObject/GetCenter/SetCenter, as the fix does.
  * Rear-view mirror / picture-in-picture placement and FE/movie scaling are
- * also adapted below. Movie geometry does not supply a browser movie decoder.
+ * also adapted below.
  *
  * CONTROLLER. The console layout, analog triggers and the controller's own
  * button names on the Controls screen: see pad.h. Console prompts in the
