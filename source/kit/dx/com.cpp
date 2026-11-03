@@ -28,6 +28,9 @@ std::deque<uint32_t> &graveyard() {
     return *v;
 }
 uint64_t g_com_freed = 0;
+// Moves whenever an object dies (com_destroy, com_reset): the only times an interface pointer can
+// stop meaning the object it did, since its view is freed then and only then.
+uint64_t g_com_deaths = 0;
 void bury(uint32_t id) {
     graveyard().push_back(id);
     while (graveyard().size() > COM_GRAVEYARD) {
@@ -93,6 +96,7 @@ uint32_t build_vtable(const VtDef &d) {
 // Lifetime
 // ---------------------------------------------------------------------------
 void com_reset() {
+    ++g_com_deaths;
     objects().clear();
     graveyard().clear();
     g_com_freed = 0;
@@ -125,6 +129,21 @@ ComIface com_iface_of(uint32_t addr) {
 }
 
 ComObj *com_this(uint32_t addr, ComIface want) {
+    // Every COM call starts here (~25,000 a frame in a Carbon race): the view's three words in
+    // guest memory, then the object table, are dependent loads that often miss the cache. The
+    // interface pointers seen last are kept by address, until any object dies (g_com_deaths).
+    // Views are COM_VIEW_SIZE apart, so the low bits above that pick the slot. 1024 slots: a
+    // frame passes hundreds of textures and buffers as arguments, not just the device.
+    struct Seen {
+        uint32_t addr;
+        uint32_t iface;
+        ComObj *obj;
+        uint64_t deaths;
+    };
+    static thread_local Seen seen[1024];
+    Seen &e = seen[(addr / COM_VIEW_SIZE) & 1023];
+    if (addr && e.addr == addr && e.deaths == g_com_deaths)
+        return want == IF_NONE || e.iface == (uint32_t)want ? e.obj : nullptr;
     if (!addr || !gm_valid(addr, COM_VIEW_SIZE))
         return nullptr;
     if (rd32(addr + COM_OFF_magic) != COM_MAGIC) {
@@ -134,7 +153,9 @@ ComObj *com_this(uint32_t addr, ComIface want) {
     ComObj *o = com_get(rd32(addr + COM_OFF_obj));
     if (!o)
         return nullptr;
-    if (want != IF_NONE && rd32(addr + COM_OFF_iface) != want)
+    const uint32_t iface = rd32(addr + COM_OFF_iface);
+    e = {addr, iface, o, g_com_deaths};
+    if (want != IF_NONE && iface != want)
         return nullptr;
     return o;
 }
@@ -300,6 +321,7 @@ void com_destroy(ComObj *o) {
         }
     }
     o->alive = false;
+    ++g_com_deaths;
     bury(o->id);
 }
 
