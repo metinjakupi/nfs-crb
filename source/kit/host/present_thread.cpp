@@ -697,6 +697,7 @@ struct Service : std::enable_shared_from_this<Service> {
     // a released texture only when its garbage collector runs, and 30 MB a
     // frame came back as gigabytes at once, the GPU stalled for half a second
     // every 15 s or so. A composite only this pool holds is in no frame.
+    uint64_t unpictured = 0; // menu frames skipped for want of a picture (tick)
     std::mutex composites_mutex;
     std::vector<std::shared_ptr<Composite>> composites;
     std::shared_ptr<Composite> composite(int w, int h, gpu::Format format) {
@@ -1000,6 +1001,27 @@ struct Service : std::enable_shared_from_this<Service> {
                     auto old = *it;
                     it = mailbox.erase(it);
                     drop(old);
+                }
+                // A menu frame sealed before its picture was staged has nothing to show: no
+                // staged image, no world and no UI records, so it composed as a black screen
+                // under the overlays (the browser's black flashes, NFS Carbon 2026-11-04: about
+                // one frame in 80). On the web the back buffer is staged on the main thread when
+                // it reaches the game's Present, and host_frame_seal on the guest thread can get
+                // there first; the picture then lands in the next frame. Take it if it has
+                // arrived since; otherwise skip this frame and leave the last image on screen.
+                if (!f->capture && f->supplied && !f->input.legacy && !f->input.world &&
+                    f->input.cls != HOST_SCREEN_GAMEPLAY && f->ui.elements.empty() &&
+                    !f->input.settings_page) {
+                    if (f->staged_pixels && f->target && f->target->pixels) {
+                        f->input.legacy = true;
+                        f->input.legacy_frame = f->target->pixels;
+                        f->input.guest_w = guest_w;
+                        f->input.guest_h = guest_h;
+                    } else {
+                        ++unpictured;
+                        drop(f);
+                        return;
+                    }
                 }
             }
             flights.push_back(f);

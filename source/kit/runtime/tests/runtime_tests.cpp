@@ -2908,7 +2908,8 @@ static void fake_free_run_thread(X86 *c) {
 // A thread running free makes the baton-free calls (imports_register_baton_free) without the
 // baton, while the main thread keeps it; then a critical section passes between the two both
 // ways: the free thread's Leave wakes the main thread waiting for it, and its own Enter of a
-// section the main thread holds waits in the scheduler, holding the baton, as before.
+// section the main thread holds waits for it on the section's word, still running free (waiting
+// for the baton there made the sound thread late, critsec_free_wait_take).
 static std::atomic<int> g_bf_stage{0};
 static uint32_t g_bf_cs = 0, g_bf_tls = 0, g_bf_out = 0;
 static bool g_bf_free_ok = false, g_bf_got = false;
@@ -2951,10 +2952,10 @@ static void fake_baton_free_thread(X86 *c) {
     g_bf_stage.store(5, std::memory_order_release);
     os_sleep_us(100000);
     call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
-    // Now the main thread owns it: this Enter has to wait, with the baton.
+    // Now the main thread owns it: this Enter has to wait, still running free.
     bf_wait_stage(6);
     call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
-    g_bf_got = rd32(g_bf_cs + 12) == me && sched_holds_baton();
+    g_bf_got = rd32(g_bf_cs + 12) == me && sched_free_running() && !sched_holds_baton();
     call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
     sched_free_run_leave();
     set_eax(c, 0);
@@ -3390,8 +3391,8 @@ static void test_scheduling(X86 *c) {
         call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
         uint32_t result = call_import(c, "KERNEL32.dll", "WaitForSingleObject", {worker, 3000});
         check(result == 0 && g_bf_got,
-              "baton-free imports: an Enter of a section the main thread held waited for it and "
-              "came back with the baton");
+              "baton-free imports: an Enter of a section the main thread held waited for it on "
+              "its word and came back still running free");
         call_import(c, "KERNEL32.dll", "CloseHandle", {worker});
     }
 

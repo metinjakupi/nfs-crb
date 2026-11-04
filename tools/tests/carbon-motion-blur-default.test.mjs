@@ -1,4 +1,5 @@
-// The start page's one-time motion-blur default (source/web/start.js motionBlurOffOnce): the
+// The start page's one-time settings defaults (source/web/start.js motionBlurOffOnce and
+// reflectionsHalfOnce): the
 // function's own source, run against an in-memory stand-in for the browser's private storage.
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -28,8 +29,8 @@ function storage(tree) {
   });
   return { getDirectory: async () => dir(tree) };
 }
-function load(tree) {
-  const run = new Function("navigator", "game", body + "\nreturn motionBlurOffOnce;");
+function load(tree, name = "motionBlurOffOnce") {
+  const run = new Function("navigator", "game", body + "\nreturn " + name + ";");
   return run({ storage: storage(tree) }, { id: "nfsc" });
 }
 const KEY = "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Need for Speed Carbon";
@@ -69,4 +70,39 @@ test("a damaged settings file does not stop the game from starting", async () =>
   const tree = { nfsc: { profile: { "registry.json": "{ not json" } } };
   await load(tree)("profile");
   assert.equal(tree.nfsc.profile["registry.json"], "{ not json");
+});
+
+const reflections = (level) => JSON.stringify({ [KEY]: { g_CarEnvironmentMapEnable: { type: 4, data: level }, g_RainEnable: { type: 4, data: 1 } } });
+
+test("car reflections at the top level are set to the middle one once", async () => {
+  const tree = { nfsc: { profile: { "registry.json": reflections(3) } } };
+  await load(tree, "reflectionsHalfOnce")("profile");
+  const settings = JSON.parse(tree.nfsc.profile["registry.json"]);
+  assert.equal(settings[KEY].g_CarEnvironmentMapEnable.data, 2);
+  assert.deepEqual(settings[KEY].g_RainEnable, { type: 4, data: 1 });
+  assert.ok("car-reflections-default-v1" in tree.nfsc.profile);
+});
+
+test("lower reflection levels are never raised, and a player's own choice is kept", async () => {
+  for (const level of [0, 1, 2]) {
+    const tree = { nfsc: { profile: { "registry.json": reflections(level) } } };
+    await load(tree, "reflectionsHalfOnce")("profile");
+    assert.equal(JSON.parse(tree.nfsc.profile["registry.json"])[KEY].g_CarEnvironmentMapEnable.data, level);
+  }
+  const tree = { nfsc: { profile: { "registry.json": reflections(3) } } };
+  const once = load(tree, "reflectionsHalfOnce");
+  await once("profile");
+  tree.nfsc.profile["registry.json"] = reflections(3); // set back to the top level in the game's options
+  await once("profile");
+  assert.equal(JSON.parse(tree.nfsc.profile["registry.json"])[KEY].g_CarEnvironmentMapEnable.data, 3);
+});
+
+test("the motion blur and reflection defaults keep separate markers", async () => {
+  const tree = { nfsc: { profile: { "registry.json": JSON.stringify({ [KEY]: { g_MotionBlurEnable: { type: 4, data: 1 }, g_CarEnvironmentMapEnable: { type: 4, data: 3 } } }) } } };
+  await load(tree)("profile");
+  await load(tree, "reflectionsHalfOnce")("profile");
+  const settings = JSON.parse(tree.nfsc.profile["registry.json"]);
+  assert.equal(settings[KEY].g_MotionBlurEnable.data, 0);
+  assert.equal(settings[KEY].g_CarEnvironmentMapEnable.data, 2);
+  assert.ok("motion-blur-default-v1" in tree.nfsc.profile && "car-reflections-default-v1" in tree.nfsc.profile);
 });

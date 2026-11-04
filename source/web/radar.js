@@ -67,12 +67,11 @@
         letter-spacing: .1em; text-transform: uppercase; color: #8fa6bd; background: rgba(6, 12, 22, .62);
         border: 1px solid rgba(95, 228, 242, .25); transform: skewX(-12deg); text-shadow: 0 1px 2px rgba(0, 0, 0, .8); }
   .cr-near b { display: inline-block; transform: skewX(12deg); font-weight: 800; color: #e9f6ff; }
-  .cr-near i { display: inline-block; transform: skewX(12deg); font-style: inherit; margin-left: .45em; }
   .cr-near[hidden] { display: none; }
   @media (prefers-reduced-motion: reduce) { .cr { transition: none; } }
   `;
 
-  let root, cv, ctx, near, nearName, nearDist, nearColor = "", gameCanvas;
+  let root, cv, ctx, near, nearName, nearColor = "", gameCanvas;
 
   function wake() {
     if (active) return;
@@ -80,13 +79,12 @@
     root = document.createElement("div");
     root.className = "cr";
     root.setAttribute("aria-hidden", "true"); // the game's picture, in a corner: nothing to read out
-    root.innerHTML = `<style>${css}</style><canvas></canvas><div class="cr-near" hidden><span><b></b><i></i></span></div>`;
+    root.innerHTML = `<style>${css}</style><canvas></canvas><div class="cr-near" hidden><span><b></b></span></div>`;
     document.body.append(root);
     cv = root.querySelector("canvas");
     ctx = cv.getContext("2d");
     near = root.querySelector(".cr-near");
     nearName = near.querySelector("b");
-    nearDist = near.querySelector("i");
     gameCanvas = document.getElementById("canvas");
     // The F9 menu's switch (menu.js lists window.recompMenuToggles).
     const toggles = (window.recompMenuToggles ||= []);
@@ -324,10 +322,8 @@
     for (const m of marks) if (!pick || m.mate > pick.mate || (m.mate === pick.mate && m.d < pick.d)) pick = m;
     near.hidden = !pick;
     if (pick) {
-      const dist = `· ${pick.d < 1000 ? `${Math.round(pick.d)} m` : `${(pick.d / 1000).toFixed(1)} km`}`;
       if (nearName.textContent !== pick.name) nearName.textContent = pick.name;
       if (nearColor !== pick.color) nearName.style.color = (nearColor = pick.color) === NEUTRAL ? "" : pick.color;
-      if (nearDist.textContent !== dist) nearDist.textContent = dist;
     }
   }
 
@@ -340,7 +336,7 @@
     // A car pointing straight up or down for a moment keeps the heading it had.
     if (o && o.state === 1) heading = nose(o.q) || heading;
     const f = o && o.state === 1 ? heading : null;
-    const show = enabled && !!f && someoneElse();
+    const show = enabled && !!f && someoneElse() && !window.recompWorldMapOpen?.();
     if (show !== shown) {
       shown = show;
       root.classList.toggle("on", show);

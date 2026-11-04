@@ -200,6 +200,7 @@ static void pad_watch(unsigned port) {
 /* 00692240: the per-frame input update (thiscall). */
 static void pad_keyboard_crew(void);
 static void impact_feedback_tick(const PopModApi *api);
+static void cp_camera_input(uint32_t self, uint32_t values); /* cockpit.h */
 static void pad_update_hook(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
     (void)inv;
     (void)user;
@@ -222,6 +223,7 @@ static void pad_update_hook(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoca
     uint32_t values = get_u32(self + 0x20);
     if (get_u32(self + 0x24) != 0 || !values)
         return;
+    cp_camera_input(self, values);
     for (unsigned p = 0; p < pad_ports(); ++p) {
         uint32_t device = get_u32(PAD_DEVICES + p * 4u), state = 0;
         if (!device)

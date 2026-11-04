@@ -20,6 +20,20 @@ if(EMSCRIPTEN)
   add_compile_options(-mtail-call)
   add_link_options(-mtail-call)
 endif()
+# The guest diagnostics in every translated store and call (runtime/x86.h,
+# RECOMP_GUEST_DIAGNOSTICS) are a quarter of the translated code's instructions. The web
+# build, where the game thread is the limit, leaves them out unless asked; the generated
+# code and the runtime must agree, so the definition is global.
+if(EMSCRIPTEN)
+  set(POP_GUEST_DIAGNOSTICS_DEFAULT OFF)
+else()
+  set(POP_GUEST_DIAGNOSTICS_DEFAULT ON)
+endif()
+option(POP_GUEST_DIAGNOSTICS "Build the guest store and call diagnostics (RECOMP_WATCH, RECOMP_WATCH_FRAME, RECOMP_PROFILE)"
+       ${POP_GUEST_DIAGNOSTICS_DEFAULT})
+if(NOT POP_GUEST_DIAGNOSTICS)
+  add_compile_definitions(RECOMP_GUEST_DIAGNOSTICS=0)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(ANDROID)
   # All static and object libraries feed the shared SDL application.

@@ -151,6 +151,7 @@ static void log_line(const char *text) {
 #include "photo_zoom.h"
 #include "autosculpt.h" /* balance native model buffer locks */
 #include "cockpit.h" /* local driver-seat camera and native wheel animation */
+#include "traffic.h" /* less traffic by default: race traffic density halved */
 #include "custom_hud.h" /* local World HUD; original gauges remain the default */
 
 /* ---- the resolution list --------------------------------------------------
@@ -623,6 +624,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     ai_fixes_install();
     photo_zoom_install();
     cockpit_install();
+    traffic_install();
     /* Match the effect-render caller patched by XenonEffectFix.ixx, rather
      * than changing blending for every use of this shared setup routine. */
     if (setting("xenon_effects", 1) && api->hook_install_at_callsite &&
@@ -665,6 +667,7 @@ PopModStatus pop_mod_exit(void) {
     custom_hud_shutdown();
     ai_fixes_shutdown();
     photo_zoom_shutdown();
+    traffic_shutdown();
     customization_shutdown();
     impact_feedback_stop(g_api);
     for (unsigned i = 0; i < sizeof g_hooks / sizeof g_hooks[0]; ++i)

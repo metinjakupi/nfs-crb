@@ -998,6 +998,7 @@
     $(".cm-career-actions").replaceChildren(...(groups.get("Career") || []));groups.delete("Career");
     $(".cm-report-actions").replaceChildren(...(groups.get("Report a problem") || []));groups.delete("Report a problem");
     displayActions.replaceChildren(...(groups.get("Display") || []));groups.delete("Display");
+    controlsActions.replaceChildren(...(groups.get("Controls") || []));groups.delete("Controls");
     $(".cm-extra").replaceChildren(...[...groups].flatMap(([name, btns]) => {
       const h = document.createElement("h3");
       h.textContent = name;
@@ -1262,7 +1263,7 @@
       note: "Keys and controller buttons for driving are changed in the game: Options → Controls.",
       sections: [
         ["Controller", ["core.nfsc/console_layout", "core.nfsc/controller_buttons", "core.nfsc/console_prompts"]],
-        ["Camera", ["camera/enabled", "core.nfsc/freelook", "core.nfsc/freelook_invert", "camera/height", "camera/forward", "camera/left", "camera/pitch", "camera/light"]],
+        ["Camera", ["camera/enabled", "core.nfsc/freelook", "core.nfsc/freelook_invert"]],
         ["Rumble", ["core.nfsc/impact_rumble", "core.nfsc/surface_rumble", "core.nfsc/rumble_floor"]],
       ],
     },
@@ -1461,6 +1462,7 @@
     box.replaceChildren();
     if (name === "controls") box.append(checkGo);
     if (name === "display") { refreshGraphics(); box.append(graphicsCard, displayActions); }
+    if (name === "controls") box.append(controlsActions);
     for (const [title, list] of sections) {
       const h = document.createElement("h3");
       h.textContent = title;
@@ -2112,8 +2114,8 @@
   bottom.className = "cm-bottom";bottom.innerHTML = `<span><kbd>↑ ↓</kbd>Navigate &nbsp; <kbd>← →</kbd>Change &nbsp; <kbd>Enter</kbd>Select</span><span><kbd>Esc</kbd>Back &nbsp; <kbd>F9</kbd>Close menu</span>`;
   const searchBar = document.createElement("div");searchBar.className = "cm-searchbar";
   searchBar.innerHTML = `<label class="cm-search-label" for="cm-feature-search">Find a setting or get help</label><input class="cm-search" id="cm-feature-search" type="search" placeholder="Try overlay, controller, graphics, or crew…" autocomplete="off">`;
-  const careerPage = document.createElement("section"), supportPage = document.createElement("section"), resultsPage = document.createElement("section"), displayActions = document.createElement("div");
-  careerPage.className = "cm-career";supportPage.className = "cm-support";resultsPage.className = "cm-search-results";displayActions.className = "cm-display-actions";
+  const controlsActions = document.createElement("section"), careerPage = document.createElement("section"), supportPage = document.createElement("section"), resultsPage = document.createElement("section"), displayActions = document.createElement("div");
+  controlsActions.className = "cm-controls-actions";careerPage.className = "cm-career";supportPage.className = "cm-support";resultsPage.className = "cm-search-results";displayActions.className = "cm-display-actions";
   careerPage.hidden = supportPage.hidden = resultsPage.hidden = true;
   careerPage.innerHTML = `<h2>Career tools · Local only</h2><p class="cm-note">Available on this computer only. Save backups and eligibility checks apply.</p><div class="cm-career-actions"></div>`;
   supportPage.innerHTML = `<h2>Help & support</h2><p class="cm-note">Choose a topic for steps, or send a report with the game log.</p><div class="cm-report-actions"></div><h3>Step-by-step help</h3><div class="cm-guides"></div>`;
@@ -2277,7 +2279,7 @@
       if (HIDDEN(s) || SHOWN_IF[s.id] && !SHOWN_IF[s.id]()) continue;
       if(matches(s.label,s.help,WEB_NOTE[s.id])) result(labelOf(s),PAGES[pageOf(s)]?.title || "Display & graphics",()=>{showPage(s.id===FULLSCREEN.id?"display":pageOf(s));rowEls.get(s.id)?.focus();});
     }
-    for(const btn of new Set([...root.querySelectorAll(".cm-toggle,.cm-action"), ...displayActions.querySelectorAll(".cm-action")])) {
+    for(const btn of new Set([...root.querySelectorAll(".cm-toggle,.cm-action"), ...displayActions.querySelectorAll(".cm-action"), ...controlsActions.querySelectorAll(".cm-action")])) {
       const owner=btn.closest(".cm-career-actions")?"career":btn.closest(".cm-online-actions")?"race":btn.closest(".cm-report-actions")?"support":btn.closest(".cm-display-actions")?"display":"quick";
       if(owner==="career"&&window.recompSite)continue;
       if(matches(btn.textContent,...(featureHelp[btn.dataset.id]||[])))result(btn.querySelector("span")?.textContent||btn.textContent,owner==="career"?"Career tools · Local only":owner==="race"?"Race together":"Menu action",()=>{routeMenu(owner);btn.focus();});

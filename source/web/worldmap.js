@@ -142,6 +142,8 @@
     if (updates !== lastUpdates) { lastUpdates = updates; lastAt = performance.now(); }
     return at;
   }
+  // Page overlays (name tags, radar) step aside while the map is up.
+  window.recompWorldMapOpen = () => { watch(); return performance.now() - lastAt < 600; };
   window.recompWorldMap = () => {
     const at = watch();
     if (!at) return null;

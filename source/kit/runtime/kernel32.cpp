@@ -2354,7 +2354,14 @@ void sched_wait_locked(size_t me, double until, double max_slice) {
     if (until)
         sched_ticker_arm(until);
 
-    if (g_idle_waiter && threads()[me]->is_main) {
+    // A main thread waiting for a critical section: whoever holds it (the sound thread, running
+    // free) gives it back within microseconds to a few milliseconds, and its Leave notifies this
+    // thread's condition variable. The host's idle slice cannot hear that - in the browser it is
+    // a plain sleep of up to 4 ms - so such a wait sleeps on the condition variable below
+    // instead, for one short host slice at most (HOST_IDLE_BATON_SLICE). 2026-11-04: the Dell's game thread spent 7% of
+    // its time oversleeping these.
+    const bool lock_wait = threads()[me]->blocked && threads()[me]->wait_kind == W_CRITSEC;
+    if (g_idle_waiter && threads()[me]->is_main && !lock_wait) {
         const bool awaiting_baton = g_baton != me;
         double slice = max_slice;
         if (until && until - now < slice)
@@ -2381,7 +2388,7 @@ void sched_wait_locked(size_t me, double until, double max_slice) {
     // capped so host events and deadlines are still re-examined.
     double wait = until ? (until - sched_now()) : 1.0;
     if (g_idle_waiter && threads()[me]->is_main)
-        wait = std::min(wait, max_slice);
+        wait = std::min(wait, lock_wait ? HOST_IDLE_BATON_SLICE : max_slice);
     if (wait <= 0.0)
         return;
     if (wait > 1.0)
@@ -2600,6 +2607,81 @@ bool critsec_take(uint32_t cs, uint32_t tid) {
     wr32(cs + CS_OFF_RECURSION, rec + 1);
     wr32(cs + CS_OFF_LOCK_COUNT, rec); // LockCount is recursion - 1
     return true;
+}
+
+// A contended section is usually given back within microseconds, now that the sound thread
+// runs free beside the game and both take the sound engine's mutex. Spins up to
+// CRITSEC_SPIN_NS for it to come free and takes it, as Windows does with a critical section's
+// spin count: a blocked main thread otherwise sleeps out a host idle slice (sched_wait_locked,
+// up to 2 ms in the browser) however soon the section comes free, which was 7% of the Dell's
+// game thread (2026-11-04 profile). False, with nothing taken, while another thread still holds
+// it. RECOMP_CRITSEC_SPIN=0 (TEST ONLY) blocks at once as before.
+const uint64_t CRITSEC_SPIN_NS = 100000;
+std::atomic<uint32_t> g_critsec_spun{0}, g_critsec_slept{0};
+void critsec_spin_note(bool won) {
+    static const bool on = recomp_env("AUDIO_STATS") != nullptr;
+    if (!on)
+        return;
+    (won ? g_critsec_spun : g_critsec_slept).fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint64_t> from{0};
+    const uint64_t now = os_monotonic_ns();
+    uint64_t was = from.load(std::memory_order_relaxed);
+    if (!was) {
+        from.store(now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - was < 5000000000ull || !from.compare_exchange_strong(was, now))
+        return;
+    LOGW("critical sections, last %.1f s: %u contended taken by spinning, %u still held after %.0f us",
+         (now - was) * 1e-9, g_critsec_spun.exchange(0), g_critsec_slept.exchange(0), CRITSEC_SPIN_NS / 1e3);
+}
+// A thread running free that finds a section held past the spin waits for it here, on the
+// section's own word, without the baton: asking for the baton first and then waiting in the
+// scheduler made the sound thread wait up to a second for the game thread to hand the baton over,
+// and the sound card replayed its ring meanwhile (players heard sounds twice, 2026-11-04). Every
+// Leave that frees a section wakes these waiters (critsec_free_notify). The waiter counts itself
+// before its last try and the Leave clears the owner before it reads the count, both
+// sequentially consistent, so one of them sees the other; the 1 ms timeout is a backstop.
+std::mutex g_critsec_free_m;
+std::condition_variable g_critsec_free_cv;
+std::atomic<int> g_critsec_free_waiters{0};
+void critsec_free_notify() {
+    if (g_critsec_free_waiters.load(std::memory_order_seq_cst) > 0) {
+        std::lock_guard<std::mutex> held(g_critsec_free_m);
+        g_critsec_free_cv.notify_all();
+    }
+}
+// False, with nothing taken, when the process is exiting: the scheduler ends the thread there.
+bool critsec_free_wait_take(uint32_t cs, uint32_t tid) {
+    std::unique_lock<std::mutex> held(g_critsec_free_m);
+    g_critsec_free_waiters.fetch_add(1, std::memory_order_seq_cst);
+    bool got;
+    while (!(got = critsec::try_take(cs, tid)) && !g_exit_requested)
+        g_critsec_free_cv.wait_for(held, std::chrono::milliseconds(1));
+    g_critsec_free_waiters.fetch_sub(1, std::memory_order_seq_cst);
+    return got;
+}
+
+bool critsec_spin_take(uint32_t cs, uint32_t tid) {
+    static const bool off = [] {
+        const char *e = recomp_env("CRITSEC_SPIN");
+        return e && !strcmp(e, "0");
+    }();
+    if (off || !critsec::atomic_ok(cs))
+        return false;
+    const uint64_t until = os_monotonic_ns() + CRITSEC_SPIN_NS;
+    for (;;) {
+        // The clock is a call out of the module in the browser: read it every 256 looks.
+        for (int i = 0; i < 256; ++i)
+            if (critsec::owner(cs) == 0 && critsec::try_take(cs, tid)) {
+                critsec_spin_note(true);
+                return true;
+            }
+        if (os_monotonic_ns() >= until) {
+            critsec_spin_note(false);
+            return false;
+        }
+    }
 }
 
 // Caller holds g_sched_m.  Can this blocked thread's wait complete now?  If it
@@ -3548,6 +3630,8 @@ void sched_enter_critsec(uint32_t cs) {
     // Uncontended (nearly always): one compare-exchange, no scheduler.
     if (critsec::atomic_ok(cs) && critsec::try_take(cs, me->id))
         return;
+    if (critsec_spin_take(cs, me->id))
+        return;
     g_sched_m.lock();
     g_critsec_waiters.fetch_add(1, std::memory_order_seq_cst);
     if (critsec_take(cs, me->id)) {
@@ -3585,6 +3669,9 @@ void sched_leave_critsec(uint32_t cs) {
                      "LeaveCriticalSection(%08x) from thread %u, which does not own it", cs, me->id);
             return;
         }
+        // A thread running free may wait for it on its word (critsec_free_wait_take).
+        if (left == critsec::Left::Freed)
+            critsec_free_notify();
         // Somebody waits in the scheduler: as before, a baton holder leaves the handoff to recheck
         // the section; any other thread (one running free) wakes the waiters now.
         if (left == critsec::Left::Freed && g_critsec_waiters.load(std::memory_order_seq_cst) > 0) {
@@ -5458,8 +5545,11 @@ void k_SleepEx(X86 *c) {
 namespace {
 bool kf_EnterCriticalSection(X86 *c) {
     const uint32_t cs = arg(c, 0);
-    if (!t_me || !critsec::atomic_ok(cs) || !critsec::try_take(cs, t_me->id))
+    if (!t_me || !critsec::atomic_ok(cs))
         return false;
+    if (!critsec::try_take(cs, t_me->id) && !critsec_spin_take(cs, t_me->id) &&
+        !critsec_free_wait_take(cs, t_me->id))
+        return false; // exiting: the ordinary shim, with the baton
     profile_note_lock(cs);
     set_eax(c, 0);
     return true;
@@ -5479,11 +5569,13 @@ bool kf_LeaveCriticalSection(X86 *c) {
         return false;
     // A thread running free holds no baton, so it wakes the waiters itself
     // (sched_leave_critsec).
-    if (critsec::leave(cs, t_me->id) == critsec::Left::Freed &&
-        g_critsec_waiters.load(std::memory_order_seq_cst) > 0) {
-        g_sched_m.lock();
-        sched_notify_all_locked();
-        g_sched_m.unlock();
+    if (critsec::leave(cs, t_me->id) == critsec::Left::Freed) {
+        critsec_free_notify();
+        if (g_critsec_waiters.load(std::memory_order_seq_cst) > 0) {
+            g_sched_m.lock();
+            sched_notify_all_locked();
+            g_sched_m.unlock();
+        }
     }
     set_eax(c, 0);
     return true;
@@ -5520,6 +5612,15 @@ bool kf_InterlockedDecrement(X86 *c) {
 }
 bool kf_InterlockedExchange(X86 *c) {
     k_InterlockedExchange(c);
+    return true;
+}
+// kernel32_wide.cpp's two, the same host atomics.
+bool kf_InterlockedExchangeAdd(X86 *c) {
+    set_eax(c, recomp_lock_xadd32(arg(c, 0), arg(c, 1)));
+    return true;
+}
+bool kf_InterlockedCompareExchange(X86 *c) {
+    set_eax(c, recomp_lock_cmpxchg32(arg(c, 0), arg(c, 2), arg(c, 1)));
     return true;
 }
 bool kf_QueryPerformanceFrequency(X86 *c) {
@@ -5565,6 +5666,8 @@ const ImportFreeShim g_kernel32_free_shims[] = {
     {"KERNEL32.dll", "InterlockedIncrement", kf_InterlockedIncrement},
     {"KERNEL32.dll", "InterlockedDecrement", kf_InterlockedDecrement},
     {"KERNEL32.dll", "InterlockedExchange", kf_InterlockedExchange},
+    {"KERNEL32.dll", "InterlockedExchangeAdd", kf_InterlockedExchangeAdd},
+    {"KERNEL32.dll", "InterlockedCompareExchange", kf_InterlockedCompareExchange},
     {"KERNEL32.dll", "QueryPerformanceFrequency", kf_QueryPerformanceFrequency},
     {"KERNEL32.dll", "QueryPerformanceCounter", kf_QueryPerformanceCounter},
     {"KERNEL32.dll", "Sleep", kf_Sleep},

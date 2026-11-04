@@ -64,6 +64,10 @@ bool imports_has_dll(const char *dll_lower);
 // ---------------------------------------------------------------------------
 typedef void (*ImportReturnObserver)(const char *desc, uint32_t eax);
 void imports_set_return_observer(ImportReturnObserver fn);
+// The same for results with the sign bit set only (an HRESULT failure): the DirectX layer's report
+// (dx.cpp), which every other result would only call to return at once - tens of thousands of calls
+// a frame for nothing.
+void imports_set_failure_observer(ImportReturnObserver fn);
 
 // ---------------------------------------------------------------------------
 // Call observer. The return observer above sees only a name and a result,

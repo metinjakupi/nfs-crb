@@ -451,10 +451,14 @@ void imports_dump_report(FILE *out) {
 
 namespace {
 ImportReturnObserver g_return_observer = nullptr;
+ImportReturnObserver g_failure_observer = nullptr;
 }
 
 void imports_set_return_observer(ImportReturnObserver fn) {
     g_return_observer = fn;
+}
+void imports_set_failure_observer(ImportReturnObserver fn) {
+    g_failure_observer = fn;
 }
 
 namespace {
@@ -662,6 +666,8 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
         g_return_observer(label(), c->r[R_EAX]);
+    if (RECOMP_UNLIKELY((c->r[R_EAX] & 0x80000000u) != 0) && g_failure_observer)
+        g_failure_observer(label(), c->r[R_EAX]);
     if (trace)
         log_msg(2, "<- %s (eax=%08x)", label(), c->r[R_EAX]);
     if (RECOMP_UNLIKELY(ab_old))

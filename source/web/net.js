@@ -1629,9 +1629,10 @@
   }
   show();
 
-  // Name tags over the other players' cars: "Name · 12 m", after a chip with
+  // Name tags over the other players' cars: just the name, after a chip with
   // the player's crew in its colour. Your own crew's tags get a frame and a glow
-  // in that colour, and stay bright however far away the car is.
+  // in that colour, and stay bright however far away the car is. No tags over
+  // the big world map: it has its own arrows and names.
   const canvas = document.getElementById("canvas");
   const tags = [];
   let views = null, crewsOf = null, crews = new Map(); // player id -> crew, from state.people
@@ -1645,7 +1646,6 @@
     el.chip.style.color = el.chip.style.borderColor = color;
     el.chip.style.background = color ? `${color}2a` : "";
     el.style.borderColor = mate ? color : "transparent";
-    el.style.background = mate ? "rgba(6,12,22,.62)" : "rgba(0,0,0,.35)";
     el.style.boxShadow = mate ? `0 0 10px ${color}88` : "none";
   }
   function drawTags() {
@@ -1662,7 +1662,7 @@
       const who = state.slots[i];
       const b = (block.ptr + LABELS + i * 16) >> 2, depth = f32[b + 2];
       let el = tags[i];
-      if (!who || !(depth > 0)) {
+      if (!who || !(depth > 0) || window.recompWorldMapOpen?.()) {
         if (el) el.style.display = "none";
         continue;
       }
@@ -1670,7 +1670,7 @@
         el = tags[i] = document.createElement("div");
         el.style.cssText = "position:fixed;left:0;top:0;pointer-events:none;z-index:4;white-space:nowrap;" +
           "font:600 14px system-ui,sans-serif;color:#fff;text-shadow:0 1px 3px #000,0 0 2px #000;" +
-          "padding:1px 6px;border-radius:4px;background:rgba(0,0,0,.35);border:1px solid transparent";
+          "padding:1px 6px;border-radius:4px;border:1px solid transparent";
         el.chip = document.createElement("span");
         el.chip.style.cssText = "display:none;margin:0 6px 0 -2px;padding:0 5px;border:1px solid;border-radius:3px;" +
           "font:italic 700 .82em/1.3 'Avenir Next Condensed','DIN Condensed','Bahnschrift',system-ui,sans-serif;" +
@@ -1689,7 +1689,7 @@
       const isPolice = police.has(state.slotIds?.[i]);
       el.badge.style.display = isPolice ? "inline-block" : "none";
       const paused = state.slotModes?.[i] === 0;
-      const text = paused ? `${who} · PAUSED` : `${who} · ${Math.round(depth)} m`;
+      const text = paused ? `${who} · PAUSED` : who;
       if (el.text.data !== text) el.text.data = text;
       const size = Math.max(11, Math.min(16, 17 - depth / 25));
       el.style.display = "block";

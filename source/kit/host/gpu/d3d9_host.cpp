@@ -384,8 +384,11 @@ class RenderThread {
             filling_->clear();
             return;
         }
-        // Hand work over often enough that the worker keeps pace with the game.
-        if (filling_->commands.size() >= 48 || filling_->bytes.size() >= (1u << 20))
+        // Hand work over often enough that the worker keeps pace with the game. 128 commands
+        // (2026-11-04, was 48): each hand-over takes the queue's lock, wakes the worker and, in
+        // the browser, may post a pump request to the main thread - 1.2% of the game thread at
+        // ~40 hand-overs a frame; a crowded frame still hands over a dozen batches or more.
+        if (filling_->commands.size() >= 128 || filling_->bytes.size() >= (1u << 20))
             hand_over();
     }
     // Everything queued has been encoded; the caller may use the backend.

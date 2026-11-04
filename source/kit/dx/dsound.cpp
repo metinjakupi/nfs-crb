@@ -1645,6 +1645,9 @@ void DS_CreateSoundBuffer(X86 *c) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
+    // Known to the baton-free calls from the start: the sound thread's first Lock is otherwise
+    // the one that waits for the baton, at boot, while the game thread loads (late writes).
+    g_ds_known[view] = b;
     com_out_ptr(out, view);
     LOGV("dsound: created a %s buffer of %u bytes (flags %08x)", primary ? "primary" : "secondary",
          bytes, flags);
@@ -1702,6 +1705,9 @@ void DS_DuplicateSoundBuffer(X86 *c) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
+    // Known to the baton-free calls from the start: the sound thread's first Lock is otherwise
+    // the one that waits for the baton, at boot, while the game thread loads (late writes).
+    g_ds_known[view] = b;
     com_out_ptr(out, view);
     com_ret(c, DS_OK);
 }

@@ -7,7 +7,7 @@ static int cockpit_requested(void){return g_cp.enabled && get_u32(0x00a99bbcu)==
 static float cp_bound(float,float,float,float);
 /* Private cockpit renderer mailbox. Page owns heartbeat/ready only. */
 static struct {uint32_t magic,seq,frame,active;volatile uint32_t heartbeat,ready;float model[16],view[16],projection[16];float speed,rpm,steer;uint32_t gear,valid;} g_cv={0x32565043u};
-static uint32_t g_cv_heartbeat,g_cv_scratch,g_cv_service_hook;static uint64_t g_cv_page_at;
+static uint32_t g_cv_heartbeat,g_cv_scratch;static uint64_t g_cv_page_at;
 static int cv_page_ready(void){const uint32_t beat=__atomic_load_n(&g_cv.heartbeat,__ATOMIC_SEQ_CST);const uint64_t now=fl_now_ms();if(beat!=g_cv_heartbeat){g_cv_heartbeat=beat;g_cv_page_at=now;}return g_cv.ready==1u&&beat&&now-g_cv_page_at<350;}
 static int cv_read(uint32_t fn,uint32_t *value){const uint32_t a[2]={g_cv_scratch,0};uint32_t result=0;g_api->guest_write_u32(g_api,g_cv_scratch,0);if(g_api->guest_call(g_api,fn,0,a,2,&result)!=POP_OK||!(result&255))return 0;*value=get_u32(g_cv_scratch);return 1;}
 static uint64_t g_cv_valid_at;
@@ -23,10 +23,20 @@ static const CwSegment g_cw_segments[]={{0,989,0,536,0},{0,989,536,249,1},{0,989
 static const CwCar g_cw_cars[]={{2825858044u,0,5,{0.951676609f,0.0f,-0.30710199f},{0.388474444f,0.378165513f,0.579860465f}},{1746378961u,5,3,{0.963634041f,-1.51162166e-07f,-0.267225439f},{0.386717022f,0.403640556f,0.746170693f}},{890471737u,8,5,{0.978017565f,1.8873372e-08f,-0.208522525f},{0.244750381f,0.401234432f,0.668384531f}},{1518310457u,13,3,{0.965315429f,2.84715868e-08f,-0.261086428f},{0.2715897f,0.364952517f,0.617078474f}},{4167515348u,16,3,{0.950742916f,1.31663257e-07f,-0.309980495f},{0.296486517f,0.396498527f,0.754713138f}},{2425636121u,19,3,{0.960223131f,-5.27009816e-08f,-0.279233843f},{0.289289464f,0.387167246f,0.643315899f}},{1728462292u,22,7,{0.97279495f,2.51615601e-06f,-0.231667833f},{0.157502343f,0.382213114f,0.683158777f}},{1096113131u,29,3,{0.965616832f,-5.65769739e-07f,-0.259969485f},{0.0426694361f,0.365444421f,0.603463981f}},{2744149874u,32,5,{0.96489645f,0.0008291337f,-0.262629308f},{0.209330665f,0.394753569f,0.578858895f}},{3111694136u,37,3,{0.963548077f,-2.01248864e-07f,-0.267535237f},{0.283907758f,0.374776973f,0.627882436f}},{3802426170u,40,3,{0.965925881f,-5.16219052e-07f,-0.25881884f},{0.456462531f,0.397571134f,0.748745933f}},{2257416053u,43,5,{0.933340572f,0.0f,-0.358992167f},{0.440880027f,0.418366f,0.66278046f}},{3944245227u,48,5,{0.854065464f,-1.27442186e-07f,-0.520165535f},{0.261740705f,-0.316075045f,0.688713904f}},{2188881711u,53,7,{0.9490062f,0.000171475432f,-0.315257361f},{0.587451018f,0.412943993f,0.658693563f}},{1853505843u,60,3,{0.966396836f,-2.15959468e-08f,-0.257054771f},{0.112584485f,0.397577181f,0.61845661f}},{1601041606u,63,5,{0.964420022f,2.15988893e-06f,-0.264374773f},{0.208964433f,0.394773999f,0.578239895f}},{2763398250u,68,3,{0.953069542f,-5.6700565e-07f,-0.302751462f},{0.144637526f,0.38773254f,0.670759186f}},{2732002237u,71,6,{0.964993036f,-4.38717759e-06f,-0.262275503f},{0.354647447f,0.41540018f,0.569374246f}},{826100022u,77,5,{0.96724608f,-2.73944705e-07f,-0.253840543f},{0.233038095f,0.250648074f,0.536091483f}},{1119921642u,82,5,{0.952264393f,-3.99450557e-08f,-0.305274508f},{0.258638209f,0.389610498f,0.579904387f}},{3879636592u,87,6,{0.976433662f,0.0f,-0.215817757f},{0.42957199f,0.425205735f,0.655729024f}},{2066531339u,93,3,{0.962414571f,-2.12133927e-07f,-0.271584599f},{0.45867226f,0.425124373f,0.600418172f}},{2721246661u,96,4,{0.937840123f,-9.43170259e-08f,-0.347067579f},{0.380800187f,0.38751948f,0.688555864f}},{492781130u,100,5,{0.963633475f,-5.86145665e-07f,-0.26722748f},{0.0657483532f,0.412009427f,0.644787318f}},{2101449805u,105,5,{0.938202991f,0.0f,-0.346085463f},{0.393945607f,0.402382849f,0.663113508f}},{1886825490u,110,3,{0.938584871f,-1.0085805e-06f,-0.345048461f},{0.499987199f,0.404432961f,0.707679596f}},{3637764513u,113,6,{0.988554142f,1.62905764e-08f,-0.150866528f},{0.447321178f,-0.409215946f,0.663560781f}},{3251468267u,119,4,{0.963415146f,1.09988416e-07f,-0.268013537f},{0.534762547f,0.42992642f,0.593540491f}},{2610167117u,123,5,{0.952331573f,-2.86716232e-07f,-0.30506487f},{0.258264163f,0.409939739f,0.669994856f}},{44436048u,128,5,{0.961603469f,2.07976103e-06f,-0.274442649f},{0.282423953f,0.365133071f,0.596931423f}},{2485894945u,133,3,{0.949851f,-0.000227f,-0.312703f},{0.359364f,0.361029f,0.634591f}},{2383005747u,136,3,{0.953015331f,-5.75019686e-07f,-0.302922068f},{0.115459817f,0.387731988f,0.589654873f}},{3593684023u,139,7,{0.953015515f,-7.15128502e-07f,-0.302921489f},{0.329078612f,0.387732066f,0.715983166f}},{3685220761u,146,5,{0.963633969f,4.77855583e-08f,-0.267225699f},{0.296136794f,-0.396824596f,0.688600011f}},{1900542369u,151,9,{0.949006124f,0.00017150044f,-0.315257589f},{0.161008166f,0.386742034f,0.658693499f}},{3811236283u,160,3,{0.965923602f,1.43801334e-05f,-0.258827345f},{-0.203781357f,0.425027899f,0.670882836f}},{1727083572u,163,5,{0.948206812f,1.84525024e-08f,-0.317653649f},{0.16325029f,0.363293865f,0.667802444f}},{1857999880u,168,3,{0.982043622f,-3.9672559e-07f,-0.18865398f},{-0.202596385f,0.399943141f,0.638736482f}}};
 static const CwCar *cw_car(uint32_t key){for(unsigned i=0;i<sizeof(g_cw_cars)/sizeof(g_cw_cars[0]);i++)if(g_cw_cars[i].key==key)return &g_cw_cars[i];return NULL;}
 static void cp_track_model(uint32_t key);
+static uint32_t g_cp_render_info;
+static uint32_t cp_local_render_info(void){
+ const uint32_t list=get_u32(LT_RENDER_LIST),count=get_u32(LT_RENDER_LIST+8u);
+ for(uint32_t i=0;list&&i<count&&i<96u;i++){
+  const uint32_t conn=get_u32(list+4u*i),who=conn?get_u32(conn+0x3cu):0;
+  if(who&&get_u32(who+0x478u)==0u)return get_u32(conn+0x40u);
+ }
+ return 0;
+}
 static void cv_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user){
  (void)api;(void)cpu;(void)inv;(void)user;
- const uint32_t car=mp_player();const uint64_t now=fl_now_ms();
+ const uint32_t car=mp_player();const uint64_t now=fl_now_ms();g_cp_render_info=0;
  if(!g_cv_scratch||!car||get_u32(0xa99bbcu)!=6u||!cp_car(mp_model_key(car))||(mp_call(MP_IS_PAUSED,0,NULL,0)&255)){cv_invalidate();return;}
+ g_cp_render_info=cp_local_render_info();
  cp_track_model(mp_model_key(car));
  uint32_t speed=0,rpm=0,gear=0;
  if(!cv_read(0x004b6500u,&speed)||!cv_read(0x004b65f0u,&rpm)||!cv_read(0x004b68c0u,&gear)){if(now-g_cv_valid_at>250)cv_invalidate();return;}
@@ -175,7 +185,10 @@ static int cp_clear_window(uint32_t solid,uint32_t mat,uint32_t state,uint32_t v
  g_cg.hidden++;return 1;
 }
 
-/* Use the body draw's actual origin. CarRenderInfo includes the model-to-body
+/* CarRenderInfo::Render stores its body matrix at +2cb4 (007de5ee),
+ * and uses it for body-kit meshes too. Cache the local render owner once per
+ * camera update; do not scan cars on every mesh draw or require BODY_A's name.
+ * Use the body draw's actual origin. CarRenderInfo includes the model-to-body
  * offset that is not in the rigid-body position. Capture its local offset,
  * then apply it to the current pose, so camera movement is not a frame behind. */
 static void cp_capture(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user){
@@ -187,7 +200,7 @@ static void cp_capture(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
     if(solid&&st&&mat&&info&&g_cp.enabled&&g_cv.valid&&cpu->ecx==0x00b4af90u&&(get_u32(solid+0x10u)==info->driver_a||get_u32(solid+0x10u)==info->driver_c)){
       const float root[3]={bits_float(get_u32(st+0x18u)),-bits_float(get_u32(st+0x10u)),bits_float(get_u32(st+0x14u))};float sq=0;for(unsigned i=0;i<3;i++){const float d=bits_float(get_u32(mat+0x30u+4*i))-root[i];sq+=d*d;}if(isfinite(sq)&&sq<4){g_cn.hidden++;api->hook_return(api,cpu,0,24);return;}
     }
-    if(solid&&info&&st&&mat&&(get_u32(solid+0x10u)==info->interior||(info->key!=2485894945u&&get_u32(solid+0x10u)==info->body))){
+    if(solid&&info&&st&&mat&&(get_u32(solid+0x10u)==info->interior||(info->key!=2485894945u&&(get_u32(solid+0x10u)==info->body||(g_cp_render_info&&mat==get_u32(g_cp_render_info+0x2cb4u)))))){
       const float root[3]={bits_float(get_u32(st+0x18u)),-bits_float(get_u32(st+0x10u)),bits_float(get_u32(st+0x14u))};
       float delta[3],sq=0;for(unsigned i=0;i<3;i++){delta[i]=bits_float(get_u32(mat+0x30u+4*i))-root[i];sq+=delta[i]*delta[i];}
       if(isfinite(sq)&&sq<9){
@@ -262,6 +275,46 @@ static void cp_headlight_glare(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvoc
  api->call_next(api,inv,cpu);
 }
 
+/* CubicCameraMover copies the selected view (+a8) to its working view (+ac)
+ * before selecting parameters at 0049227d. Bumper/hood parameters hide the
+ * cabin and can bypass LookAt. Borrow chase parameters for the local driver's
+ * frame only; F6 off restores the unchanged selected view on the next update. */
+static uint32_t g_cp_view_hook,g_cp_selected=0xffffffffu;static uint64_t g_cp_selected_ms;
+static void cp_view(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user){
+    (void)inv;(void)user;
+    const uint32_t mover=cpu->ecx;
+    if(mover&&get_u32(mover+0x10u)==1u)cv_service(api,cpu,inv,user);
+    const uint32_t car=mp_player();
+    if(!mover||get_u32(0x00a99bbcu)!=6u||get_u32(mover+0x10u)!=1u||!car||!cp_car(mp_model_key(car)))return;
+    g_cp_selected=get_u32(mover+0xa8u);g_cp_selected_ms=fl_now_ms();
+    if(!g_cp.enabled)return;
+    api->guest_write_u32(api,mover+FL_VIEW,2u);
+    api->guest_write_u32(api,cpu->esp+4u,2u);
+}
+
+/* Driver view is a stop in the game's camera cycle, next to bumper (view 0).
+ * CAM_ACTION_CHANGE (row 24, whatever it is bound to) from bumper enters it and
+ * the game's press is held back, so bumper stays selected underneath. The next
+ * press leaves it and goes through, so the cycle carries on where it was.
+ * Runs after 00692240 fills the row values: the game turns them into actions later. */
+#define CP_CAMERA_ROW 24u
+static void cp_camera_input(uint32_t self,uint32_t values){
+    static struct {uint32_t self;int held,swallow;} ports[4];
+    if(!g_cv_scratch)return;
+    unsigned i=0;for(;i<4&&ports[i].self&&ports[i].self!=self;i++){}
+    if(i==4)return;
+    ports[i].self=self;
+    const uint32_t at=values+CP_CAMERA_ROW*4u;
+    const int down=bits_float(get_u32(at))>.5f,press=down&&!ports[i].held;
+    ports[i].held=down;
+    if(press&&g_cv.valid&&get_u32(0x00a99bbcu)==6u&&fl_now_ms()-g_cp_selected_ms<250){
+        if(__atomic_load_n(&g_cp.enabled,__ATOMIC_RELAXED))__atomic_store_n(&g_cp.enabled,0,__ATOMIC_RELAXED);
+        else if(g_cp_selected==0u){__atomic_store_n(&g_cp.enabled,1,__ATOMIC_RELAXED);ports[i].swallow=1;}
+    }
+    if(!down)ports[i].swallow=0;
+    else if(ports[i].swallow)put_float(at,0); /* held: the game must not see a late press */
+}
+
 static void cockpit_install(void){
     const char *local=getenv("RECOMP_COCKPIT");if(!local||strcmp(local,"1"))return;g_cp.enabled=1;
     g_api->hook_install(g_api,LT_RENDER_FLARE,cp_headlight_glare,POP_HOOK_WRAP,NULL,&g_cf_hook);
@@ -271,11 +324,13 @@ static void cockpit_install(void){
 #ifdef __EMSCRIPTEN__
     MAIN_THREAD_ASYNC_EM_ASM({var b={};b.memory=wasmMemory;b.ptr=$0;globalThis.carbonCockpitGlass=b;},(uint32_t)(uintptr_t)&g_cg);
 #endif
+    g_api->hook_install_at_callsite(g_api,0x00486500u,0x00492282u,cp_view,POP_HOOK_BEFORE,NULL,&g_cp_view_hook);
     g_api->guest_alloc(g_api,16,&g_cv_scratch);
     g_api->guest_alloc(g_api,0x4000,&g_cn_mem);
     g_api->guest_alloc(g_api,0x4000,&g_cw_mem);
     g_api->hook_install(g_api,0x00727930u,cn_queue,POP_HOOK_WRAP,NULL,&g_cn_queue_hook);
-    g_api->hook_install(g_api,0x00600c90u,cv_service,POP_HOOK_BEFORE,NULL,&g_cv_service_hook);
+    /* The HUD service can already have its 16 BEFORE hooks in a normal local
+     * game. Update cockpit state from cp_view instead of losing this callback. */
     g_api->hook_install_at_callsite(g_api,FL_LOOKAT,FL_LOOKAT_RET,cp_built,POP_HOOK_AFTER,NULL,&g_cp_after_hook);
     g_api->hook_install(g_api,0x004822f0u,cp_final,POP_HOOK_BEFORE,NULL,&g_cp_final_hook);
     g_api->hook_install(g_api,0x00729320u,cp_capture,POP_HOOK_WRAP,NULL,&g_cp_capture_hook);
@@ -293,4 +348,4 @@ static void cockpit_install(void){
 }
 
 static uint32_t g_cp_tracked;
-static void cp_track_model(uint32_t key){if(key==g_cp_tracked)return;g_cp_tracked=key;g_cp_offset_valid=0;g_cp_matrix_valid=0;g_cp_seen_ms=0;const CwCar *wheel=cw_car(key);g_cp.left=key==2485894945u?.34f:(wheel?wheel->pivot[1]:.34f);const CpCar *c=cp_car(key);if(c){g_cp.height=c->key==2485894945u?1.05f:.98f;g_cp.forward=c->key==2485894945u?-.18f:-.4f;}}
+static void cp_track_model(uint32_t key){if(key==g_cp_tracked)return;g_cp_tracked=key;g_cp.model=key;g_cp_offset_valid=0;for(unsigned i=0;i<3;i++)g_cp_offset[i]=0;g_cp_matrix_valid=0;g_cp_seen_ms=0;const CwCar *wheel=cw_car(key);g_cp.left=key==2485894945u?.34f:(wheel?wheel->pivot[1]:.34f);const CpCar *c=cp_car(key);if(c){g_cp.height=c->key==2485894945u?1.05f:.98f;g_cp.forward=c->key==2485894945u?-.18f:-.4f;}}

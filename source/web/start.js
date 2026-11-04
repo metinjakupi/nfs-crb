@@ -898,23 +898,39 @@
   // a player who turns blur back on in the game's options from being switched off again. A
   // slot whose game has not written its settings yet is tried again at the next Play.
   const BLUR_DEFAULT_MARK = "motion-blur-default-v1";
-  async function motionBlurOffOnce(folder) {
+  // Car reflections at the game's middle level by default (2026-11-04): at its top level the game
+  // redraws all six faces of the car reflection cube every frame, 11-22% of a race frame's draws;
+  // at level 2 it redraws three a frame (left and down every frame, the other four in turn: the
+  // game's own schedule, 007218a0). Lowered once per slot from 3 to 2, never raised, and a player
+  // who sets it again in the game's options keeps that.
+  const REFLECTION_DEFAULT_MARK = "car-reflections-default-v1";
+  // One of the slot's own settings (registry.json) changed once, before the game reads them;
+  // `change` gives the new value, or undefined to keep it. The marker file keeps a player's own
+  // later choice. A slot whose game has not written its settings yet is tried again at the next
+  // Play.
+  async function settingOnce(folder, mark, name, change) {
     try {
       const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle(game.id)).getDirectoryHandle(folder);
-      try { await dir.getFileHandle(BLUR_DEFAULT_MARK); return; } catch {}
+      try { await dir.getFileHandle(mark); return; } catch {}
       const file = await dir.getFileHandle("registry.json");
       const settings = JSON.parse(await (await file.getFile()).text());
-      const values = Object.values(settings).filter((key) => key && key.g_MotionBlurEnable);
+      const values = Object.values(settings).filter((key) => key && key[name]);
       if (!values.length) return;
-      for (const key of values) key.g_MotionBlurEnable.data = 0;
+      for (const key of values) {
+        const next = change(key[name].data);
+        if (next !== undefined) key[name].data = next;
+      }
       const out = await file.createWritable();
       await out.write(JSON.stringify(settings, null, 2));
       await out.close();
-      const mark = await (await dir.getFileHandle(BLUR_DEFAULT_MARK, { create: true })).createWritable();
-      await mark.write("1\n");
-      await mark.close();
+      const marker = await (await dir.getFileHandle(mark, { create: true })).createWritable();
+      await marker.write("1\n");
+      await marker.close();
     } catch {} // no settings yet, or storage unavailable: the game keeps its own default
   }
+  const motionBlurOffOnce = (folder) => settingOnce(folder, BLUR_DEFAULT_MARK, "g_MotionBlurEnable", () => 0);
+  const reflectionsHalfOnce = (folder) =>
+    settingOnce(folder, REFLECTION_DEFAULT_MARK, "g_CarEnvironmentMapEnable", (level) => (level > 2 ? 2 : undefined));
   let starting = false;
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
@@ -936,6 +952,7 @@
     await recovery?.begin({ online: on.checked, name, room: roomEl.value.trim(),
       crew: crewEl.value.trim(), server: serverEl.value }, restoring);
     await motionBlurOffOnce(slot > 1 ? `profile-${slot}` : "profile");
+    await reflectionsHalfOnce(slot > 1 ? `profile-${slot}` : "profile");
     root.remove();
     // Online gives both: free roam with others (net.js, the relay room) and the game's own
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).
@@ -948,7 +965,7 @@
     const hud = document.createElement("script");
     hud.src = "custom-hud.js";
     document.body.append(hud);
-    for (const src of ["menu.js", "chat.js", "race.js", "worldmap.js", "report.js", "encounter.js"]) { // the in-game menu (F9), chat and horn, the radar, racing together, friends on the world map, Download log / Send report
+    for (const src of ["menu.js", "chat.js", "race.js", "worldmap.js", "report.js", "encounter.js", "touch.js"]) { // the in-game menu (F9), chat and horn, the radar, racing together, friends on the world map, Download log / Send report
       const script = document.createElement("script");
       script.src = src;
       document.body.append(script);
