@@ -4,6 +4,10 @@ Game features, performance improvements, and bug fixes for NFS Carbon in the bro
 
 ## Unreleased
 
+- Keep shared effect values in their effect pool, as Direct3D does, instead of copying each per-object matrix into every other effect of the pool, cutting about 1.5% of the game thread's CPU time in races.
+- Remember Direct3D interface pointers between calls instead of reading them back from guest memory and the object table each time.
+- Reduce the cost of every Direct3D and Windows call from the game: the scheduler's call counter is no longer atomic, and the clock is read less often in the browser.
+
 - Reduce CPU overhead before interpreted audio callbacks by replacing repeated diagnostic byte formatting, preserving callback execution and sound.
 
 - Reduce browser CPU overhead when binding shader resources by using the typed-array WebGPU call, retaining the Firefox memory workaround.

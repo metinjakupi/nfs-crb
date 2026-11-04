@@ -371,6 +371,16 @@ struct FxParam {
     // value is bound to a shader; `value` itself keeps what the game set.
     bool scaled = false;
     float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // A shared parameter in a pool: its index in FxEffect::pool_refs (-1: the effect's own).
+    int32_t pool_ref = -1;
+};
+// The value of a shared parameter, held by the pool as D3DX does. An effect's own copy is
+// brought up to date when it is read (pull_param), not on every write through another effect:
+// the per-draw matrices are shared by every effect of Carbon's single pool.
+struct PoolSlot {
+    std::vector<uint8_t> value;
+    uint32_t texture = 0; // holds a reference, like each effect's copy
+    uint64_t stamp = 0;   // g_pool_writes at the last change
 };
 // Counts parameter writes, so a result computed from parameters can tell
 // whether any of them changed.
@@ -423,10 +433,14 @@ struct FxEffect {
         const void *table = nullptr;    // const std::vector<CtabConst> *
         std::vector<int32_t> *resolved = nullptr;
     } ctab_last[2];
-    // Shared parameters: for each parameter index, the same parameter in the
-    // other effects of the pool, valid while pool_generation matches.
-    std::unordered_map<uint32_t, std::vector<struct FxParam *>> peers;
-    uint64_t peers_generation = 0;
+    // Shared parameters: each one's pool slot and the slot stamp its copy holds.
+    struct PoolRef {
+        PoolSlot *slot;
+        uint64_t pulled;
+        uint32_t index; // in params
+    };
+    std::vector<PoolRef> pool_refs;
+    uint64_t pool_pulled = 0; // g_pool_writes when every copy was last brought up to date
     uint64_t scale_generation = 0; // mods_fx_scale_generation() when the factors were last read
 };
 // Changes whenever an effect is created or destroyed.
@@ -435,6 +449,58 @@ static uint64_t g_effect_generation = 1;
 static std::map<uint32_t, FxEffect> &effects() {
     static auto *m = new std::map<uint32_t, FxEffect>();
     return *m;
+}
+
+// Point a texture slot at a texture, moving the reference it holds.
+static void hold_texture(uint32_t &slot, uint32_t id) {
+    if (slot == id)
+        return;
+    if (ComObj *tex = com_get(id))
+        com_addref(tex);
+    if (ComObj *old = com_get(slot))
+        com_release(old);
+    slot = id;
+}
+static void set_param_texture(FxParam &p, uint32_t id) {
+    hold_texture(p.texture, id);
+}
+
+// ---- Shared parameters ------------------------------------------------------
+// A parameter marked shared has one value across every effect created with the same pool: the
+// game sets COLORWRITEMODE or BLENDSTATE through whichever effect is at hand and every other
+// effect's passes read it. Carbon also sets its per-draw matrices (WorldViewProj, cmWorldView,
+// cvLocalEyePos...) this way: ~1,300 shared writes a frame, each once copied into the 12-28
+// other effects of its single pool. The value now goes to the pool's slot, and an effect copies
+// it in when it next reads it: a getter or setter of that parameter, or a pass applied.
+static uint64_t g_pool_writes = 0;
+static std::map<std::pair<uint32_t, std::string>, PoolSlot> &pool_slots() {
+    static auto *m = new std::map<std::pair<uint32_t, std::string>, PoolSlot>();
+    return *m;
+}
+static void pull_param(FxEffect::PoolRef &r, FxParam &p) {
+    if (r.pulled == r.slot->stamp)
+        return;
+    r.pulled = r.slot->stamp;
+    if (!p.value.empty())
+        memcpy(p.value.data(), r.slot->value.data(), p.value.size());
+    // Each effect's copy holds its own reference: fx_destroy releases every parameter's
+    // texture, so an unreferenced copy over-released the shared texture once per effect
+    // destroyed. NFSC's race load freed its colour-grading volume this way (black 3D).
+    set_param_texture(p, r.slot->texture);
+    param_touched(p);
+}
+// Brings the effect's shared parameters up to date before something reads them.
+static void pull_pool(FxEffect &fx) {
+    if (fx.pool_pulled == g_pool_writes)
+        return;
+    fx.pool_pulled = g_pool_writes;
+    for (FxEffect::PoolRef &r : fx.pool_refs)
+        pull_param(r, fx.params[r.index]);
+}
+// The one parameter `p`, when it is one of the effect's shared parameters (not an annotation).
+static void pull_shared(FxEffect &fx, FxParam &p) {
+    if (p.pool_ref >= 0 && &p >= fx.params.data() && &p < fx.params.data() + fx.params.size())
+        pull_param(fx.pool_refs[(size_t)p.pool_ref], p);
 }
 
 // A bounds-checked reader over the effect body. Every offset in the file is
@@ -1456,6 +1522,7 @@ static void apply_state(FxEffect &fx, D9Pipeline &pl, const FxState &s, uint32_t
 static void apply_pass(FxEffect &fx) {
     if (fx.technique >= fx.techniques.size())
         return;
+    pull_pool(fx);
     FxTechnique &tech = fx.techniques[fx.technique];
     if (fx.pass >= tech.passes.size())
         return;
@@ -1767,7 +1834,8 @@ void Fx_GetPassByName(X86 *c) {
     if (!p) {                                                                                      \
         com_ret(c, D3DERR_INVALIDCALLX);                                                           \
         return;                                                                                    \
-    }
+    }                                                                                              \
+    pull_shared(*fx, *p)
 
 // (this, h, pData, Bytes)
 void Fx_SetValue(X86 *c) {
@@ -2091,17 +2159,6 @@ void Fx_GetDevice(X86 *c) {
     com_ret(c, D3D_OKX);
 }
 
-// Point a parameter at a texture, moving the reference it holds.
-static void set_param_texture(FxParam &p, uint32_t id) {
-    if (p.texture == id)
-        return;
-    if (ComObj *tex = com_get(id))
-        com_addref(tex);
-    if (ComObj *old = com_get(p.texture))
-        com_release(old);
-    p.texture = id;
-}
-
 static void fx_destroy(ComObj *o) {
     auto it = effects().find(o->id);
     if (it == effects().end())
@@ -2113,74 +2170,29 @@ static void fx_destroy(ComObj *o) {
     ++g_effect_generation;
 }
 
-// ---- Shared parameters ------------------------------------------------------
-// A parameter marked shared has one value across every effect created with
-// the same pool: the game sets COLORWRITEMODE or BLENDSTATE through whichever
-// effect is at hand and every other effect's passes read it.
-static void share_parameter(FxEffect &fx, uint32_t index, bool numeric_changed) {
-    if (!fx.pool)
-        return;
-    const FxParam &value = fx.params[index];
-    if (!value.shared)
-        return;
-    if (fx.peers_generation != g_effect_generation) {
-        fx.peers.clear();
-        fx.peers_generation = g_effect_generation;
-    }
-    // The same parameter in the pool's other effects, by address: effects
-    // live in map nodes, their parameter vectors do not change size, and the
-    // list is rebuilt whenever an effect comes or goes.
-    auto found = fx.peers.find(index);
-    if (found == fx.peers.end()) {
-        std::vector<FxParam *> list;
-        for (auto &kv : effects()) {
-            if (kv.first == fx.self || kv.second.pool != fx.pool)
-                continue;
-            int32_t j = param_index_of(kv.second, value.t.name);
-            if (j >= 0 && kv.second.params[(size_t)j].shared &&
-                kv.second.params[(size_t)j].value.size() == value.value.size())
-                list.push_back(&kv.second.params[(size_t)j]);
-        }
-        found = fx.peers.emplace(index, std::move(list)).first;
-    }
-    const size_t n = value.value.size();
-    // Typed numeric setters stamp only an actual byte change. The pool copies
-    // must receive those bytes; comparing every peer first adds a second read
-    // of the same matrix. Raw/object setters still need the equality check.
-    const bool copy_numeric = numeric_changed && value.t.numeric();
-    for (FxParam *other : found->second) {
-        if (!copy_numeric && other->texture == value.texture &&
-            (n == 0 || memcmp(other->value.data(), value.value.data(), n) == 0))
-            continue;
-        if (n)
-            memcpy(other->value.data(), value.value.data(), n);
-        // Each effect's copy holds its own reference: fx_destroy releases
-        // every parameter's texture, so an unreferenced copy over-released
-        // the shared texture once per peer effect destroyed. NFSC's race
-        // load freed its colour-grading volume this way (black 3D).
-        set_param_texture(*other, value.texture);
-        param_touched(*other);
-    }
-}
-// A new effect starts from the pool's current value of each shared parameter.
+// A new effect takes the pool's slot of each shared parameter, or opens it with its own value.
+// A parameter whose size differs from the slot's is a different parameter: it stays the
+// effect's own, as it never received the others' values before either.
 static void join_pool(uint32_t effect_id) {
     FxEffect &fx = effects()[effect_id];
     if (!fx.pool)
         return;
-    for (FxParam &p : fx.params) {
+    for (uint32_t i = 0; i < (uint32_t)fx.params.size(); ++i) {
+        FxParam &p = fx.params[i];
         if (!p.shared)
             continue;
-        for (auto &kv : effects()) {
-            if (kv.first == effect_id || kv.second.pool != fx.pool)
-                continue;
-            const FxParam *other = param_named(kv.second, p.t.name);
-            if (other && other->shared && other->value.size() == p.value.size()) {
-                p.value = other->value;
-                set_param_texture(p, other->texture);
-                param_touched(p);
-                break;
-            }
+        auto [it, fresh] = pool_slots().try_emplace({fx.pool, p.t.name});
+        PoolSlot &slot = it->second;
+        if (fresh) {
+            slot.value = p.value;
+            hold_texture(slot.texture, p.texture);
+            slot.stamp = ++g_pool_writes;
+        } else if (slot.value.size() != p.value.size()) {
+            continue;
         }
+        p.pool_ref = (int32_t)fx.pool_refs.size();
+        // A slot already open holds the pool's current value: the copy takes it when read.
+        fx.pool_refs.push_back({&slot, fresh ? slot.stamp : 0, i});
     }
 }
 // Wraps a setter: after it runs, a shared parameter's new value reaches the pool.
@@ -2189,18 +2201,31 @@ template <void (*F)(X86 *)> void shared_setter(X86 *c) {
     FxParam *shared = nullptr;
     uint64_t before = 0;
     if (fx)
-        if (FxParam *p = param_of(*fx, arg(c, 1));
-            p && p->shared && p >= fx->params.data() && p < fx->params.data() + fx->params.size()) {
+        if (FxParam *p = param_of(*fx, arg(c, 1)); p && p->pool_ref >= 0 && p >= fx->params.data() &&
+                                                   p < fx->params.data() + fx->params.size()) {
+            // Up to date first: the setter compares the new value with the current one.
+            pull_shared(*fx, *p);
             shared = p;
             before = p->stamp;
         }
     F(c);
+    if (!shared || shared->stamp == before)
+        return;
     // SetValue, SetRawValue and SetTexture can stamp an unchanged value.
     // The typed numeric setters stamp only when their stored bytes differ.
     constexpr bool numeric_changed =
         F != Fx_SetValue && F != Fx_SetRawValue && F != Fx_SetTexture && F != Fx_SetString;
-    if (shared && shared->stamp != before)
-        share_parameter(*fx, uint32_t(shared - fx->params.data()), numeric_changed);
+    FxEffect::PoolRef &r = fx->pool_refs[(size_t)shared->pool_ref];
+    PoolSlot &slot = *r.slot;
+    const size_t n = shared->value.size();
+    if (!(numeric_changed && shared->t.numeric()) && slot.texture == shared->texture &&
+        (n == 0 || memcmp(slot.value.data(), shared->value.data(), n) == 0))
+        return;
+    if (n)
+        memcpy(slot.value.data(), shared->value.data(), n);
+    hold_texture(slot.texture, shared->texture);
+    slot.stamp = ++g_pool_writes;
+    r.pulled = slot.stamp;
 }
 
 static const ComMethod g_effect_pool[] = {
@@ -2465,6 +2490,8 @@ static const ImportShim g_d3dx9_exports[] = {
 
 void d3dx9_reset() {
     effects().clear();
+    // The pools' objects (and the textures the slots hold) went with com_reset.
+    pool_slots().clear();
 }
 
 void d3dx9_register() {

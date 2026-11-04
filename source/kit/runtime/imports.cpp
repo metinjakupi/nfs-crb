@@ -569,10 +569,15 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     // checkpoint, rate limited to one yield per millisecond per thread, and it
     // runs before the shim so the guest state is a consistent call boundary -
     // except at an atomic import, and inside a sched_atomic_enter stretch.
+    // The table itself is leaked and never moves; only its storage does when a
+    // shim allocates a trampoline. So the vector is fetched once (each tramps()
+    // call reads its static's guard), and elements are indexed again after fn(c).
+    std::vector<Tramp> &table = tramps();
     uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
-    if (idx >= tramps().size() || !tramps()[idx].atomic)
+    const bool allocated = idx < table.size();
+    if (!allocated || !table[idx].atomic)
         sched_checkpoint();
-    if (idx >= tramps().size()) {
+    if (!allocated) {
         // No shim to say how many arguments to drop, but the return address
         // must still be consumed or the guest stack is displaced from here on.
         LOGW("imports: call to unallocated trampoline %08x (ESP=%08x, return=%08x)", target,
@@ -585,8 +590,8 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     // The shim may allocate trampolines (GetProcAddress, a COM shim, a guest
     // callback), which reallocates this vector, so nothing may hold a
     // reference to the element across the call.
-    void (*fn)(X86 *) = tramps()[idx].fn;
-    uint8_t argc = tramps()[idx].argc;
+    void (*fn)(X86 *) = table[idx].fn;
+    uint8_t argc = table[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
     // across that call, and do not retain a pointer into the movable vector:
     // the label is read from the table again after the shim returns (the
@@ -597,8 +602,8 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     // changes); below 2, LOGV and the SEH chain check do nothing.
     static const bool trace = log_level() >= 2;
     // Fetched at each use: a shim or an observer may allocate a trampoline and move the table.
-    auto label = [idx] { return tramps()[idx].desc.c_str(); };
-    ++tramps()[idx].calls;
+    auto label = [&table, idx] { return table[idx].desc.c_str(); };
+    ++table[idx].calls;
     ++g_import_calls;
     profile_note_import(idx); // the thread map (profile.cpp); returns at once unless it is on
 
@@ -613,8 +618,8 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     char ab_desc[512];
     const bool ab_old = recomp_ab::old(recomp_ab::IMPORTS);
     if (RECOMP_UNLIKELY(ab_old)) {
-        const size_t n = std::min(tramps()[idx].desc.size(), sizeof ab_desc - 1);
-        memcpy(ab_desc, tramps()[idx].desc.data(), n);
+        const size_t n = std::min(table[idx].desc.size(), sizeof ab_desc - 1);
+        memcpy(ab_desc, table[idx].desc.data(), n);
         ab_desc[n] = '\0';
         LOGV("-> %s (esp=%08x ret=%08x)", ab_desc, c->r[R_ESP], ret_addr);
         recomp_seh_validate_chain(c, "import enter", ab_desc);

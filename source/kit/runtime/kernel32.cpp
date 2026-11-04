@@ -3361,17 +3361,26 @@ void sched_checkpoint() {
     // Test75: the stride is counted before anything else, so 15 of 16 calls return without touching
     // a thread-local (each one is a _tlv_get_addr call on macOS). The counter is shared: only the
     // baton holder runs guest code, and a lost increment would only move a yield by one call.
+    // 2026-11-03, the browser: every 256th call. On Windows (Edge) each read still cost ~0.4 us
+    // and ~1.2% of the game thread at 64. A yield, or a hand-over to a thread back from free run,
+    // is now at most ~150 us late.
     static const uint32_t stride_mask = [] {
         const char *e = recomp_env("SCHED_CHECKPOINT_STRIDE");
 #ifdef __EMSCRIPTEN__
-        return (e && !strcmp(e, "1")) ? 0u : 63u;
+        return (e && !strcmp(e, "1")) ? 0u : 255u;
 #else
         return (e && !strcmp(e, "1")) ? 0u : 15u;
 #endif
     }();
-    static std::atomic<uint32_t> calls{0};
-    const uint32_t n = calls.load(std::memory_order_relaxed) + 1;
-    calls.store(n, std::memory_order_relaxed);
+    // 2026-11-03: a plain counter, not an atomic. In wasm every atomic access is sequentially
+    // consistent whatever order it asks for, and a store compiles to an XCHG on x86 (a full fence)
+    // on each of ~2 million import calls a second. Every caller holds the baton (imports_dispatch
+    // takes it back from free run first), and the baton handoff orders the accesses.
+    static uint32_t calls = 0;
+    const uint32_t n = ++calls;
+    // g_baton_wanted stays behind the stride too: tried on every call (to hand the baton to a
+    // thread back from free run sooner), it hung about one browser start in six right after
+    // the sound thread was created, with that whole thread running free.
     if ((n & (recomp_ab::old(recomp_ab::STRIDE) ? 0u : stride_mask)) != 0)
         return;
     if (threads().size() < 2 || t_atomic)
