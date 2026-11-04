@@ -156,6 +156,13 @@ def load(game_dir):
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
         raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
+    # tools/recomp/regloc.py over the translation before it is published (build.py
+    # run_translator): "off", "safe" (flags written back at every sync point) or "regs-only"
+    # (registers around calls, flags in locals across jumps and returns).
+    register_locals = translate.setdefault("register_locals", "off")
+    if register_locals not in ("off", "safe", "regs-only"):
+        raise ValueError('%s: [translate] register_locals must be "off", "safe" or "regs-only", not %r'
+                         % (source, register_locals))
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

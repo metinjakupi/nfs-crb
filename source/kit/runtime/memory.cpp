@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -35,6 +36,14 @@ uint32_t g_dirty_count = 0;
 namespace {
 struct WatchArm {
     WatchArm() {
+#if !RECOMP_GUEST_DIAGNOSTICS
+        // Compiled out of the generated code (x86.h): asking for one gets nothing, so say so.
+        for (const char *name : {"WATCH", "WATCH_FRAME", "PROFILE"})
+            if (const char *v = recomp_env(name); v && *v)
+                fprintf(stderr, "[recomp] RECOMP_%s does nothing in this build: it has no guest diagnostics "
+                                "(cmake -DPOP_GUEST_DIAGNOSTICS=ON builds them)\n", name);
+        return;
+#endif
         recomp_frame_watch = recomp_env("WATCH_FRAME") ? 1u : 0u;
         const char *s = recomp_env("WATCH");
         if (!s || !*s)
@@ -143,6 +152,9 @@ void log_msg(int level, const char *fmt, ...) {
 static const size_t kLogOnceKeys = 4096;
 
 bool log_once(const char *key, const char *fmt, ...) {
+    // Locked: a guest thread running free (win32.h free run) reports through it too.
+    static std::mutex m;
+    std::lock_guard<std::mutex> held(m);
     static std::set<std::string> seen;
     static bool capped = false;
     if (seen.size() >= kLogOnceKeys) {

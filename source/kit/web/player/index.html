@@ -513,6 +513,12 @@ async function start(options = {}) {
     startup("preparing customization assets");
     await (await import(new URL("./custom-install.js", document.baseURI).href)).prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"});
   }
+  if (id === "nfsc" && !stream) {
+    await (await import(new URL("./billboards.js", document.baseURI).href)).prepareBillboards(status, {enabled: new URLSearchParams(location.search).get("billboards") !== "0"});
+  }
+  if (id === "nfsc" && !stream && ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) && !window.recompSite) {
+    await (await import(new URL("./cockpit-assets.js", document.baseURI).href)).prepareCockpitAssets(startup);
+  }
   const streamChannel = new BroadcastChannel("recomp-stream");
   if (stream) {
     window.recompStream = {
@@ -670,11 +676,14 @@ async function start(options = {}) {
     onAbort: (what) => reportFailure("abort", what),
     preRun: [() => {
       const m = Module;
+      // Imported files and streamed assets can both wait on browser storage.
+      // Let other guest threads run while the file reader waits.
+      m.ENV.RECOMP_FILE_READ_YIELD = "1";
       if (stream) {
+        if (new URLSearchParams(location.search).get("billboards") !== "0") m.ENV.RECOMP_BILLBOARD_OVERLAY = new URL("./billboard-stream.js", document.baseURI).href;
         m.ENV.RECOMP_WEB_ASSET_BASE = stream.base;
         m.ENV.RECOMP_WEB_ASSET_INDEX = stream.index;
         if (stream.manifest) m.ENV.RECOMP_WEB_ASSET_MANIFEST = stream.manifest;
-        m.ENV.RECOMP_FILE_READ_YIELD = "1";
       }
       m.ENV.RECOMP_PROFILE_DIR = `/opfs/${id}/${profile}`;
       if (renderScale !== undefined) m.ENV.RECOMP_D3D9_SCALE = renderScale;
@@ -684,6 +693,7 @@ async function start(options = {}) {
       for (const [k, v] of extra) if (k.startsWith("RECOMP_")) m.ENV[k] = v;
       // An exhausted upload budget or opt-out must also disable native measurement.
       m.ENV.RECOMP_PERF_REPORTS = window.recompPerformance?.enabled ? "1" : "0";
+      m.ENV.RECOMP_COCKPIT = id === "nfsc" && ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) && !window.recompSite ? "1" : "0";
       m.ENV.RECOMP_CUSTOMIZATION = customizationReady ? "1" : "0";
       m.ENV.RECOMP_CUSTOM_COSMETICS_SHOP = customizationReady ? "1" : "0";
       m.ENV.RECOMP_CUSTOM_VECTOR_RESOURCE_SHA256 = customizationReady ? globalThis.__carbonCustomVectorResourceSha256 : "";
@@ -741,5 +751,5 @@ window.recompBoot = (options) => {
   document.body.append(page);
 })().catch((e) => status(e.message, true));
 </script>
-</body>
+<script src="cockpit.js"></script></body>
 </html>

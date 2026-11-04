@@ -25,8 +25,31 @@ The online server for the browser port of Need for Speed: Carbon, in Rust. One s
   screens too: friends, presence, private chat and game invites (`messenger.rs`, below), and so do its Statistics
   screens: Player Stats and the Leaderboard (`stats.rs`, below).
 
+## Protected crews
+
+Protected crews use `CARBON_CREWS_DIR/crews.json`, defaulting to `CARBON_MESSENGER_DIR/crews.json`.
+With neither directory configured the server advertises no protected crew support. A player must first
+protect their player name with the existing cloud-keyphrase claim flow. The server gives that owner a
+separate random public account ID. Crew labels supplied by clients grant no membership.
+
+Online → My crew supports creation, unique names, rename, offline rosters, invitations by protected
+player name, remove, leave, leadership transfer and disband. Invitations require acceptance and expire
+after seven days. There is no crew member cap; private lists use 50-entry pages. Chat remains room-wide.
+The Node relay does not support protected crews. See its header for the negotiated protocol and limits.
+
+Keep one server process as the writer of the crew store. Each successful mutation replaces the file
+atomically after flushing it and preserves the prior committed file as `crews.json.bak`. A failed write
+returns an error and rolls back memory. Invalid data prevents startup; the server never resets a bad
+registry automatically. To recover, stop the server, preserve the failed file, verify the backup, and
+restore that backup as `crews.json` before restarting. Crew data must be backed up with name claims;
+neither file contains the cloud keyphrase, and private owner digests never go to peers.
+
+Focused checks: `cargo build` in `server/`, then from the project root
+`node --test tools/tests/carbon-crews.test.mjs`. These tests use temporary synthetic accounts and stores.
+
 Dependencies: tokio, httparse, serde_json, sha1 and sha2. Everything runs on one thread, plus a few helper threads for
 file work. The source is `src/`, with comments at the top of each file:
+
 
 | File | What it does |
 |---|---|
@@ -454,3 +477,58 @@ server from the site's side at the end).
 `/opt/carbon-relay/carbon-relay.service.node` (and `relay.mjs` stays in that folder). Copy it to
 `/etc/systemd/system/carbon-relay.service`, then `systemctl daemon-reload && systemctl restart carbon-relay`. The Node
 relay has no `/lan`: the game's own Online mode needs this server.
+
+## Admin moderation and chat filtering
+
+The Rust relay supports `/mute "Player Name" [minutes]` (default 10, up to 10080),
+`/unmute "Player Name"`, `/muted [page]`, `/kick "Player Name" [reason]`,
+`/announce message`, and `/reports [page]`. Any named player can use
+`/report "Player Name" reason`; reports do not automatically punish a player.
+Reports are private to Admin. Kick disconnects the target's active relay sessions;
+the new client stops automatic reconnect after the server's policy close. Kick is
+not a ban. Announcements reach all relay rooms and use a server-generated label.
+
+Set `CARBON_ADMIN_OWNERS` to the **server-side owner digest** of your protected
+account in that server's Messenger `names.json`. This is the stored `owner` field,
+not a nickname, public crew account ID, cloud-save token, or keyphrase. Keep the
+configuration server-side. Do not paste account proofs into chat or source code.
+Only a configured owner connected as `Admin` gets moderation rights. The same owner
+can use the reserved Admin alias without rewriting its existing protected name,
+Messenger data, statistics, or saves. Do not configure a digest until the operator
+confirms which protected account is theirs. Empty configuration grants nobody
+admin rights. No first-visitor claim or crew membership can grant those rights.
+
+`CARBON_MODERATION_DIR` defaults to `CARBON_MESSENGER_DIR`. It stores atomic
+`moderation.json` updates with active mutes, player reports, and moderation action
+history. Invalid saved data stops startup rather than silently discarding it.
+Mutes block room chat and whispers across relay rooms. Protected-account mutes
+survive reconnect and restart. Unprotected players are muted by their current
+name; changing an unprotected identity can evade a name mute. Mutes expire by the
+server clock. Reports allow three submissions per actor per ten minutes. Report
+and action history retain the newest 10000 entries each; admin reads are paged.
+
+Admin player/crew names and punctuation, case, full-width and common numeric
+variants are reserved. Only the configured owner may use the exact Admin alias
+or create the exact Admin crew. Other accounts cannot join that crew or receive
+its leadership. Existing conflicting names/crews should be reviewed before public
+activation; the feature does not rewrite existing memberships or save records.
+
+Both relays reject a common English profanity list in public and private chat,
+including spaced/punctuated, full-width and common numeric substitutions. The
+filter matches whole words, so ordinary words such as `class`, `assistance`, and
+`cockpit` stay allowed. It is a best-effort English filter, not coverage of every
+language or obfuscation. Reports may quote abuse privately. Admin announcements
+also pass through the filter. The Node relay has no protected identity registry:
+it reserves Admin labels and provides filtering, but refuses moderation actions.
+
+Protocol: `{t:"moderation",q,op,name?,text?,minutes?,offset?}` receives a private
+`{t:"moderation",q,op,ok,data?,error?}` response. After `hi`, the server sends
+`{t:"moderation",k:"state",supported,admin,chatAck:true}` only to that connection.
+Announcements use `{t:"moderation",k:"announcement",text}`. Clients requesting
+`hi.chatAck=1` receive successful public-chat receipts with `ack:true`; rejected
+chat receives `error:"profanity"|"muted"` (plus `until` for an active mute). Clients
+must wait for receipts rather than displaying blocked messages as sent.
+
+The public service's existing `/etc/carbon-relay.env` can hold
+`CARBON_ADMIN_OWNERS`; the deploy script preserves that file. Local compilation,
+local publishing, server restart, and public deployment are separate steps.

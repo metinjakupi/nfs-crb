@@ -125,10 +125,18 @@
   .cs-btn.cs-discord:hover { background: #4752c4; border-color: #b3b9ff; }
   .cs-btn.cs-discord:active { background: #3c45a5; }
   .cs-btn.cs-discord:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-  .cs-btn.cs-support { color: #160506; background: #ff5e5b; border-color: #ffaaa8; min-height: 44px; }
-  .cs-btn.cs-support:hover { background: #ff7774; border-color: #ffd0cf; }
-  .cs-btn.cs-support:active { background: #e94f4c; transform: skewX(-12deg) scale(.97); }
+  .cs-head-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .cs-btn.cs-support { color: #160506; background: #ff7774; border-color: #ffaaa8; min-height: 44px;
+        padding: 12px 18px; font-size: 13px; line-height: 1.2; letter-spacing: .09em; box-shadow: 0 4px 20px rgba(255, 94, 91, .18); }
+  .cs-btn.cs-support > span { display: inline-flex; align-items: center; justify-content: center; gap: 9px; }
+  .cs-support svg { width: 19px; height: 19px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  @media (hover: hover) { .cs-btn.cs-support:hover { background: #ff918e; border-color: #ffd0cf; box-shadow: 0 4px 24px rgba(255, 94, 91, .3); } }
+  .cs-btn.cs-support:active { background: #e9625f; transform: skewX(-12deg) scale(.97); }
   .cs-btn.cs-support:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+  @media (max-width: 600px) {
+    .cs-head-actions { width: 100%; flex-direction: row; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+    .cs-head-actions .cs-support { flex-grow: 1; text-align: center; }
+  }
   .cs-btn:disabled { opacity: .4; cursor: default; }
   .cs-btn.big { font-size: 30px; padding: 18px 34px; color: #021018; border-color: transparent;
         background: linear-gradient(100deg, #9ff3fb, var(--cyan) 40%, #2aa4dc); box-shadow: 0 0 28px rgba(95, 228, 242, .35); }
@@ -205,7 +213,8 @@
   <div class="cs-wrap">
     <header class="cs-head">
       <h1 class="cs-logo"><span class="cs-word"><small>Need for Speed</small>Carbon</span></h1>
-      <div class="cs-tag">Browser edition</div>
+      <div class="cs-head-actions"><div class="cs-tag">Browser edition</div>
+        <a class="cs-btn cs-support" href="https://ko-fi.com/nfscrbn" target="_blank" rel="noopener" hidden><span><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/></svg>Support the Creator</span></a></div>
     </header>
     <div class="cs-grid">
       <div class="cs-col">
@@ -248,7 +257,8 @@
               <input type="text" class="cs-name" maxlength="20" autocomplete="nickname" spellcheck="false" placeholder="Name others see"></label>
             <div class="cs-identity" aria-live="polite"><span class="cs-identity-text"></span><button class="cs-identity-action" type="button" hidden></button></div>
             <label class="cs-row"><span class="cs-label">Crew</span>
-              <input type="text" class="cs-crew" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Optional: same name = same crew"></label>
+              <input type="text" class="cs-crew" maxlength="16" readonly aria-describedby="cs-crew-help" placeholder="Manage in Online → My crew"></label>
+            <p id="cs-crew-help" class="cs-note">Create a crew or accept an invitation in Online → My crew after starting.</p>
             <label class="cs-row"><span class="cs-label">Room</span>
               <input type="text" class="cs-room" maxlength="40" autocomplete="off" spellcheck="false" placeholder="Empty: everyone on the server"></label>
             <div class="cs-note">Friends who type the same room name drive together. Leave it empty to meet everyone.
@@ -265,7 +275,6 @@
           <div class="cs-note">Play solo or join other drivers online. Your saves stay on this device.</div>
           <div class="cs-actions" style="margin-top:12px">
             <a class="cs-btn cs-discord" href="https://discord.gg/UP3fhwbB2" target="_blank" rel="noopener"><span><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>Join Discord</span></a>
-            <a class="cs-btn cs-support" href="https://ko-fi.com/nfscrbn" target="_blank" rel="noopener" hidden><span>Support on Ko-fi</span></a>
             <a class="cs-btn cs-source" href="https://github.com/metinjakupi/nfs-crb" target="_blank" rel="noopener"><span>Source code on GitHub</span></a>
           </div>
           <div class="cs-note cs-community" style="margin-top:12px">Find players, ask for help, or report a bug in <a href="https://discord.com/channels/1565102068673286255/1565102215327387658" target="_blank" rel="noopener">#bug-reports</a> after joining. Include your browser, graphics card, and steps to reproduce the problem. Use F9 → Send report for game logs.</div>
@@ -350,7 +359,7 @@
   for (const [id, s] of Object.entries(SERVERS)) serverEl.append(new Option(s.label, id));
   on.checked = !!online;
   roomEl.value = store.get("room", "");
-  crewEl.value = store.get("crew", "");
+  crewEl.value = ""; // Protected membership is loaded from the server after connecting.
   serverEl.value = SERVERS[store.get("server", "internet")] ? store.get("server", "internet") : "internet";
   fullEl.checked = store.get("fullscreen", false);
   // On the public site (tools/carbon-site-deploy.sh sets window.recompSite in its copy of
@@ -500,7 +509,21 @@
       return body && typeof body === "object" ? { status: r.status, body } : null;
     } catch { return null; }
   }
+  // Match the server's reserved Admin spelling rules before attempting a connection.
+  function reservedAdminName(name) {
+    return Array.from(name, c => {
+      const n = c.charCodeAt(0);
+      if (n >= 0xff01 && n <= 0xff5e) c = String.fromCharCode(n - 0xfee0);
+      c = c.toLowerCase();
+      return c === "4" || c === "@" ? "a" : c === "1" || c === "!" ? "i" : c;
+    }).join("").replace(/[^a-z0-9]/g, "").includes("admin");
+  }
+  const adminNameMessage = "Admin names are reserved. Choose another name.";
   function scheduleIdentity() {
+    ++identitySeq;
+    const reserved = reservedAdminName(nameEl.value.trim());
+    nameEl.setCustomValidity(reserved ? adminNameMessage : "");
+    if (reserved) showIdentity(adminNameMessage, "bad");
     clearTimeout(identityTimer);
     identityTimer = setTimeout(refreshIdentity, 250);
   }
@@ -509,7 +532,12 @@
     if (!on.checked || !name) { identityState = ""; showIdentity(); return; }
     const token = cloudIdentity()?.token?.() || "";
     const got = await namesRequest("GET", name, token);
-    if (seq !== identitySeq) return;
+    if (seq !== identitySeq || name !== nameEl.value.trim()) return;
+    if (reservedAdminName(name)) {
+      const authorized = /^admin$/i.test(name) && got?.status === 200 && got.body.state === "yours";
+      nameEl.setCustomValidity(authorized ? "" : adminNameMessage);
+      if (!authorized) { identityState = "reserved"; showIdentity(adminNameMessage, "bad"); return; }
+    }
     if (!got || got.status !== 200) { identityState = ""; showIdentity(); return; }
     const shown = got.body.name || name;
     identityState = got.body.state || "";
@@ -592,6 +620,12 @@
     const token = cloudIdentity()?.token?.() || "";
     const browser = browserProof();
     const got = await namesRequest("GET", name, token);
+    if (reservedAdminName(name) && !( /^admin$/i.test(name) && got?.status === 200 && got.body.state === "yours")) {
+      nameEl.setCustomValidity(adminNameMessage);
+      showIdentity(adminNameMessage, "bad"); nameEl.focus(); nameEl.reportValidity();
+      return { ok: false, claim: "", browser };
+    }
+    nameEl.setCustomValidity("");
     if (got?.status === 200 && got.body.state === "taken") {
       const shown = got.body.name || name;
       showIdentity(`Another player claimed ${shown}. Choose another name, or load its keyphrase under Cloud saves.`, "bad", "Cloud saves", showCloudSaves);
@@ -858,6 +892,29 @@
       $(".cs-go").disabled = !ready;
     }
   });
+  // Motion blur off by default (2026-11-03): its pass draws about a quarter of every frame's
+  // objects a second time, the largest single cost measured in a race. Once per save slot, in
+  // the slot's own settings (registry.json) before the game reads them; the marker file keeps
+  // a player who turns blur back on in the game's options from being switched off again. A
+  // slot whose game has not written its settings yet is tried again at the next Play.
+  const BLUR_DEFAULT_MARK = "motion-blur-default-v1";
+  async function motionBlurOffOnce(folder) {
+    try {
+      const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle(game.id)).getDirectoryHandle(folder);
+      try { await dir.getFileHandle(BLUR_DEFAULT_MARK); return; } catch {}
+      const file = await dir.getFileHandle("registry.json");
+      const settings = JSON.parse(await (await file.getFile()).text());
+      const values = Object.values(settings).filter((key) => key && key.g_MotionBlurEnable);
+      if (!values.length) return;
+      for (const key of values) key.g_MotionBlurEnable.data = 0;
+      const out = await file.createWritable();
+      await out.write(JSON.stringify(settings, null, 2));
+      await out.close();
+      const mark = await (await dir.getFileHandle(BLUR_DEFAULT_MARK, { create: true })).createWritable();
+      await mark.write("1\n");
+      await mark.close();
+    } catch {} // no settings yet, or storage unavailable: the game keeps its own default
+  }
   let starting = false;
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
@@ -878,6 +935,7 @@
     const relay = `${server.url}/${encodeURIComponent(room)}${key}`;
     await recovery?.begin({ online: on.checked, name, room: roomEl.value.trim(),
       crew: crewEl.value.trim(), server: serverEl.value }, restoring);
+    await motionBlurOffOnce(slot > 1 ? `profile-${slot}` : "profile");
     root.remove();
     // Online gives both: free roam with others (net.js, the relay room) and the game's own
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).
@@ -907,7 +965,7 @@
     on.checked = saved.online;
     nameEl.value = saved.name;
     roomEl.value = saved.room;
-    crewEl.value = saved.crew;
+    crewEl.value = ""; // A saved display tag cannot restore crew membership.
     serverEl.value = saved.server;
     reflect();
     play(true);

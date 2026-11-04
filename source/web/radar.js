@@ -151,7 +151,6 @@
   }
 
   // ---- Who is who ----
-  const key = (c) => (window.recompCrewKey ? window.recompCrewKey(c) : String(c || "").toLowerCase().replace(/\s+/g, ""));
   const color = (c) => (c && window.recompCrewColor?.(c)) || "";
   let peopleOf = null, people = new Map();
   function person(id) {
@@ -162,7 +161,6 @@
     }
     return people.get(id);
   }
-  const myCrew = () => window.recompOnlineState?.crew ?? window.recompOnline?.crew ?? "";
   const someoneElse = () => {
     const s = window.recompOnlineState;
     return !!s && !!s.open && (s.people || s.names || []).length > 0;
@@ -267,10 +265,10 @@
     ctx.restore();
 
     // The other players: strangers first, crewmates on top, the nearest last.
-    const crew = key(myCrew());
+    const crew = window.recompOnlineState?.crewId;
     const marks = list.map((o) => {
       const p = person(o.id), r = relative(me, f, o.at), d = Math.hypot(r.side, r.ahead);
-      return { ...r, d, name: p?.name || "Player", color: color(p?.crew) || NEUTRAL, mate: !!crew && key(p?.crew) === crew };
+      return { ...r, d, name: p?.name || "Player", color: color(p?.crew) || NEUTRAL, mate: !!crew && p?.crewId === crew };
     });
     marks.sort((a, b) => a.mate - b.mate || b.d - a.d);
     for (const m of marks) {

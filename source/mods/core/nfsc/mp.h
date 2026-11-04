@@ -1360,14 +1360,22 @@ static void mp_render_view(uint32_t id, uint32_t self) {
 }
 
 /* The other players' cars, from the page's slots. */
+/* Space expensive constructor attempts, including failed spool requests. Existing
+ * cars still receive every service/physics update; native race.h owns its racers. */
+static double g_mp_build_after;
+#define MP_BUILD_GAP_MS 100.0
+
 static void mp_remotes(MpShared *sh, uint32_t player) {
     const double now = mp_now();
+    int build_slot = -1;
+    float build_d2 = MP_NEAR * MP_NEAR;
     float here[3] = {0, 0, 0};
     const uint32_t state = player ? mp_state(get_u32(player + 0x70)) : 0;
     g_mp_page_ghost = (__atomic_load_n(&sh->flags, __ATOMIC_RELAXED) & MP_PAGE_GHOST) != 0;
     for (int i = 0; i < 3 && state; ++i)
         here[i] = bits_float(get_u32(state + 0x10 + 4u * i));
     mp_spares(here, state != 0);
+    if (!state) g_mp_build_after = 0;
     for (int i = 0; i < MP_SLOTS; ++i) {
         MpSlot *src = &sh->slots[i], copy;
         const uint32_t before = __atomic_load_n(&src->seq, __ATOMIC_ACQUIRE);
@@ -1457,11 +1465,25 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         }
         if (d2 > MP_NEAR * MP_NEAR || (c->wait && --c->wait))
             continue;
+        if (build_slot < 0 || d2 < build_d2) {
+            build_slot = i;
+            build_d2 = d2;
+        }
+    }
+    /* Select after reading every slot. Slot order must not make a farther car
+     * consume the construction budget before a newly arrived nearby racer. */
+    if (build_slot >= 0 && now >= g_mp_build_after) {
+        const int i = build_slot;
+        const MpSlot *s = &g_mp_seen_slot[i];
+        MpCar *c = &g_mp_remote[i];
+        const MpPose *last = &c->pose[c->kept - 1];
+        const float d2 = build_d2;
         /* Another model may not be loaded: the first try builds it as it is, the second asks
          * for it to be spooled. Both were refused for a friend whose car this game had not
          * loaded (2026-10-24: one window never saw the other), so from the third try the
          * friend is shown in this player's own model, which is always loaded, rather than
          * not at all. */
+        g_mp_build_after = now + MP_BUILD_GAP_MS;
         const int own_model = c->tries >= 2;
         const uint32_t flags = 2u | 8u | (!own_model && (c->tries & 1) ? 1u : 0u);
         const uint32_t look = g_mp_look ? g_mp_look(i, s->id, own_model ? 0u : s->key) : 0;
@@ -1495,6 +1517,7 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         if (!c->simable)
             c->wait = 120;
     }
+
     mp_place_all(NULL, 0);
 }
 

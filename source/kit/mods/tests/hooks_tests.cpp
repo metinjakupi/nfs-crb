@@ -212,6 +212,66 @@ MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
     MOD_CHECK_EQ(recomp_hooked[recomp_index_of(target)], 0u);
 }
 
+// A call from a caller no hook is limited to runs the function directly (hooks.cpp
+// callsite_filters); the filter must follow every install and removal: a hook for every caller
+// added later is run for all of them, more callsites than the table holds still dispatch, and
+// removing the broad hook makes the other callers skip again.
+MOD_TEST_SUITE(hook_callsite_filter_follows_installs) {
+    reset_world();
+    constexpr uint32_t target = 0x401000, match = 0x517613, other = 0x5176d7;
+    auto counted = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *user) {
+        ++*(uint32_t *)user;
+    };
+    static uint32_t at_site = 0, everyone = 0, extra = 0;
+    at_site = everyone = extra = 0;
+    const auto call_from = [&](uint32_t ret) {
+        X86 *c = loader_context();
+        loader_init_context(c);
+        uint32_t sp = c->r[R_ESP] - 16;
+        c->r[R_ESP] = sp;
+        wr32(sp, ret);
+        wr32(sp + 4, 200);
+        wr32(sp + 8, 100);
+        auto index = recomp_index_of(target);
+        recomp_hook_ptrs[index](c, index);
+        MOD_CHECK_EQ(c->r[R_EAX], 100u);
+        MOD_CHECK_EQ(c->r[R_ESP], sp + 4);
+        MOD_CHECK_EQ(c->eip, ret);
+        MOD_CHECK_EQ(mods_hook_depth(), 0u);
+    };
+    uint32_t site = 0, broad = 0, many[5]{};
+    auto install = g_api[0].hook_install_at_callsite;
+    MOD_CHECK_EQ(install(&g_api[0], target, match, counted, POP_HOOK_BEFORE, &at_site, &site), POP_OK);
+    call_from(other);
+    call_from(match);
+    MOD_CHECK_EQ(at_site, 1u);
+    MOD_CHECK_EQ(mods_hook_install(0, target, counted, POP_HOOK_BEFORE, &everyone, &broad), POP_OK);
+    call_from(other);
+    call_from(match);
+    MOD_CHECK_EQ(at_site, 2u);
+    MOD_CHECK_EQ(everyone, 2u);
+    MOD_CHECK_EQ(mods_hook_remove(0, broad), POP_OK);
+    call_from(other);
+    MOD_CHECK_EQ(everyone, 2u);
+    // Five more callsites than the one: past the table's four, every call dispatches, and each
+    // hook still runs only for its own caller.
+    for (uint32_t k = 0; k < 5; ++k)
+        MOD_CHECK_EQ(install(&g_api[0], target, 0x520000u + 16u * k, counted, POP_HOOK_BEFORE, &extra,
+                             &many[k]),
+                     POP_OK);
+    call_from(other);
+    call_from(0x520000u + 32u);
+    call_from(match);
+    MOD_CHECK_EQ(extra, 1u);
+    MOD_CHECK_EQ(at_site, 3u);
+    for (auto id : many)
+        MOD_CHECK_EQ(mods_hook_remove(0, id), POP_OK);
+    call_from(0x520000u + 32u);
+    MOD_CHECK_EQ(extra, 1u);
+    MOD_CHECK_EQ(mods_hook_remove(0, site), POP_OK);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(target)], 0u);
+}
+
 MOD_TEST_SUITE(hook_explicit_no_view_preserves_nested_snapshots) {
     reset_world();
     mods_view_reset();

@@ -32,10 +32,12 @@ extern "C" {
  * memory access, so these insist. */
 #if defined(__GNUC__) || defined(__clang__)
 #define RECOMP_HOT_INLINE static inline __attribute__((always_inline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
 #define RECOMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define RECOMP_COLD_OUTLINE static inline __attribute__((noinline, cold))
 #else
 #define RECOMP_HOT_INLINE static inline
+#define RECOMP_LIKELY(x) (x)
 #define RECOMP_UNLIKELY(x) (x)
 #define RECOMP_COLD_OUTLINE static inline
 #endif
@@ -136,6 +138,18 @@ RECOMP_HOT_INLINE uint64_t rd64(uint32_t a) {
     memcpy(&v, g_mem + a, 8);
     return v;
 }
+/* The guest diagnostics below sit in every translated store (the watchpoint and the
+ * DirectDraw dirty ranges) and every translated call (the frame watch and the profiler).
+ * Unarmed each is a compare, but the compares are in every store and call the game makes:
+ * in one Carbon chunk (2026-11-02) they were a quarter of its WebAssembly instructions
+ * (291,204 -> 214,730), and translated code is most of the browser build's game thread.
+ * A build with RECOMP_GUEST_DIAGNOSTICS=0 (cmake -DPOP_GUEST_DIAGNOSTICS=OFF, the web
+ * build's default) leaves them out: RECOMP_WATCH, RECOMP_WATCH_FRAME and RECOMP_PROFILE
+ * then say at start that this build has none, and a DirectDraw Unlock compares the whole
+ * locked surface. The generated code and the runtime must agree, so the switch is global. */
+#ifndef RECOMP_GUEST_DIAGNOSTICS
+#define RECOMP_GUEST_DIAGNOSTICS 1
+#endif
 /* A guest-memory watchpoint.  RECOMP_WATCH=<hex address>[:<length>] reports
  * every write that touches those bytes together with the host backtrace, which
  * names the generated function and so the guest routine doing the writing.
@@ -184,8 +198,14 @@ RECOMP_COLD_OUTLINE void recomp_store_hooks(uint32_t a, uint32_t n, uint64_t v, 
     recomp_dirty(a, n);
 }
 static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
+#if RECOMP_GUEST_DIAGNOSTICS
     if (RECOMP_UNLIKELY((g_watch_len | g_dirty_count) != 0))
         recomp_store_hooks(a, n, v, 1);
+#else
+    (void)a;
+    (void)n;
+    (void)v;
+#endif
 }
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
@@ -227,6 +247,60 @@ RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
     if (RECOMP_UNLIKELY(g_dirty_count != 0))
         recomp_store_hooks(a, 8, 0, 0);
 }
+
+/* Locked read-modify-writes: LOCK XADD, LOCK CMPXCHG, XCHG with a memory operand (which
+ * x86 always locks) and the Interlocked* imports. While guest threads took turns on the
+ * baton a plain read and write was enough; a thread running free (kernel32 free run) runs
+ * beside the baton holder, and the game, written for Windows threads on two cores, counts
+ * on these being atomic. A naturally aligned address gets a host atomic (sequentially
+ * consistent, as LOCK is a full barrier); an unaligned one keeps the plain read and write,
+ * because WebAssembly has no unaligned atomics (they trap). Each returns the old value. */
+#define RECOMP_LOCK_OPS(N, T)                                                                      \
+    RECOMP_HOT_INLINE T recomp_lock_xadd##N(uint32_t a, T v) {                                     \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old;                                                                                     \
+        if (RECOMP_LIKELY((a & (sizeof(T) - 1)) == 0))                                             \
+            old = __atomic_fetch_add((T *)(void *)(g_mem + a), v, __ATOMIC_SEQ_CST);               \
+        else {                                                                                     \
+            memcpy(&old, g_mem + a, sizeof(T));                                                    \
+            T sum = (T)(old + v);                                                                  \
+            memcpy(g_mem + a, &sum, sizeof(T));                                                    \
+        }                                                                                          \
+        recomp_watch(a, sizeof(T), (T)(old + v));                                                  \
+        return old;                                                                                \
+    }                                                                                              \
+    RECOMP_HOT_INLINE T recomp_lock_xchg##N(uint32_t a, T v) {                                     \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old;                                                                                     \
+        if (RECOMP_LIKELY((a & (sizeof(T) - 1)) == 0))                                             \
+            old = __atomic_exchange_n((T *)(void *)(g_mem + a), v, __ATOMIC_SEQ_CST);              \
+        else {                                                                                     \
+            memcpy(&old, g_mem + a, sizeof(T));                                                    \
+            memcpy(g_mem + a, &v, sizeof(T));                                                      \
+        }                                                                                          \
+        recomp_watch(a, sizeof(T), v);                                                             \
+        return old;                                                                                \
+    }                                                                                              \
+    /* Stores `desired` only if the memory held `expected`; the old value either way. */          \
+    RECOMP_HOT_INLINE T recomp_lock_cmpxchg##N(uint32_t a, T expected, T desired) {                \
+        RECOMP_NULL_GUARD(a, 1);                                                                   \
+        T old = expected;                                                                          \
+        if (RECOMP_LIKELY((a & (sizeof(T) - 1)) == 0))                                             \
+            __atomic_compare_exchange_n((T *)(void *)(g_mem + a), &old, desired, 0,                \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                       \
+        else {                                                                                     \
+            memcpy(&old, g_mem + a, sizeof(T));                                                    \
+            if (old == expected)                                                                   \
+                memcpy(g_mem + a, &desired, sizeof(T));                                            \
+        }                                                                                          \
+        if (old == expected)                                                                       \
+            recomp_watch(a, sizeof(T), desired);                                                   \
+        return old;                                                                                \
+    }
+RECOMP_LOCK_OPS(8, uint8_t)
+RECOMP_LOCK_OPS(16, uint16_t)
+RECOMP_LOCK_OPS(32, uint32_t)
+#undef RECOMP_LOCK_OPS
 
 /* 80-bit x87 extended precision.  x87 registers are `double` here (plan
  * ruling), so a tbyte load rounds to 64-bit and a store re-expands. */
@@ -436,6 +510,15 @@ void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, uint32_t aft
 extern const int recomp_profile_enabled;
 void recomp_profile_push(uint32_t index);
 void recomp_profile_pop(void);
+/* What the generated calls test (funcs.h, table.c): constant 0 without the diagnostics,
+ * so the compiler removes the tests (see RECOMP_GUEST_DIAGNOSTICS). */
+#if RECOMP_GUEST_DIAGNOSTICS
+#define RECOMP_FRAME_WATCHING recomp_frame_watch
+#define RECOMP_PROFILING recomp_profile_enabled
+#else
+#define RECOMP_FRAME_WATCHING 0u
+#define RECOMP_PROFILING 0
+#endif
 
 /* Indirect JMP or tail call: dispatch `target` through the generated
  * block-entry table (every function start plus every decoded jump-table

@@ -2905,6 +2905,61 @@ static void fake_free_run_thread(X86 *c) {
     set_eax(c, 0x1234);
 }
 
+// A thread running free makes the baton-free calls (imports_register_baton_free) without the
+// baton, while the main thread keeps it; then a critical section passes between the two both
+// ways: the free thread's Leave wakes the main thread waiting for it, and its own Enter of a
+// section the main thread holds waits in the scheduler, holding the baton, as before.
+static std::atomic<int> g_bf_stage{0};
+static uint32_t g_bf_cs = 0, g_bf_tls = 0, g_bf_out = 0;
+static bool g_bf_free_ok = false, g_bf_got = false;
+static void bf_wait_stage(int stage) {
+    const double from = wall_seconds();
+    while (g_bf_stage.load(std::memory_order_acquire) < stage && wall_seconds() - from < 5.0)
+        os_sleep_us(100);
+}
+static void fake_baton_free_thread(X86 *c) {
+    const uint32_t esp = c->r[R_ESP];
+    if (!sched_free_run_enter(esp)) {
+        set_eax(c, 0);
+        return;
+    }
+    g_bf_stage.store(1, std::memory_order_release);
+    bf_wait_stage(2);
+    const uint32_t me = call_import(c, "KERNEL32.dll", "GetCurrentThreadId", {});
+    bool ok = me > 1;
+    for (int i = 0; i < 2000 && ok; ++i) {
+        call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
+        call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
+        ok &= rd32(g_bf_cs + 12) == me && rd32(g_bf_cs + 8) == 2 && rd32(g_bf_cs + 4) == 1;
+        ok &= call_import(c, "KERNEL32.dll", "TryEnterCriticalSection", {g_bf_cs}) == 1;
+        call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+        call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+        call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+        ok &= rd32(g_bf_cs + 12) == 0 && rd32(g_bf_cs + 8) == 0 && rd32(g_bf_cs + 4) == 0xffffffffu;
+        ok &= call_import(c, "KERNEL32.dll", "TlsSetValue", {g_bf_tls, 0x5000u + i}) == 1 &&
+              call_import(c, "KERNEL32.dll", "TlsGetValue", {g_bf_tls}) == 0x5000u + i;
+        ok &= call_import(c, "KERNEL32.dll", "InterlockedIncrement", {g_bf_out + 8}) == uint32_t(i + 1);
+        ok &= call_import(c, "KERNEL32.dll", "QueryPerformanceCounter", {g_bf_out}) == 1;
+        ok &= sched_free_running() && !sched_holds_baton();
+    }
+    call_import(c, "KERNEL32.dll", "Sleep", {1});
+    g_bf_free_ok = ok && sched_free_running() && !sched_holds_baton();
+    g_bf_stage.store(3, std::memory_order_release);
+    // Owns the section while the main thread asks for it, then leaves it, running free.
+    bf_wait_stage(4);
+    call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
+    g_bf_stage.store(5, std::memory_order_release);
+    os_sleep_us(100000);
+    call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+    // Now the main thread owns it: this Enter has to wait, with the baton.
+    bf_wait_stage(6);
+    call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
+    g_bf_got = rd32(g_bf_cs + 12) == me && sched_holds_baton();
+    call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+    sched_free_run_leave();
+    set_eax(c, 0);
+}
+
 static void test_scheduling(X86 *c) {
     section("cooperative scheduling contracts");
     uint32_t pcode = scratch_block(4);
@@ -3297,6 +3352,46 @@ static void test_scheduling(X86 *c) {
         uint32_t result = call_import(c, "KERNEL32.dll", "WaitForSingleObject", {worker, 2000});
         check(result == 0 && g_free_run_returns == 8,
               "all eight audio returns regained the baton, including while the main thread waited");
+        call_import(c, "KERNEL32.dll", "CloseHandle", {worker});
+    }
+
+    // --- baton-free imports from a thread running free ---
+    {
+        g_bf_stage.store(0, std::memory_order_relaxed);
+        g_bf_free_ok = g_bf_got = false;
+        g_bf_cs = scratch_block(24);
+        g_bf_out = scratch_block(16);
+        wr32(g_bf_out + 8, 0);
+        call_import(c, "KERNEL32.dll", "InitializeCriticalSection", {g_bf_cs});
+        g_bf_tls = call_import(c, "KERNEL32.dll", "TlsAlloc", {});
+        uint32_t fn = imports_alloc_trampoline("test", "baton_free_thread", fake_baton_free_thread, 1);
+        uint32_t worker = call_import(c, "KERNEL32.dll", "CreateThread", {0, 0, fn, 0, 0, 0});
+        double from = wall_seconds();
+        while (g_bf_stage.load(std::memory_order_acquire) < 1 && wall_seconds() - from < 2.0)
+            call_import(c, "KERNEL32.dll", "GetTickCount", {});
+        check(g_bf_stage.load() >= 1, "baton-free imports: the worker went into free run");
+        // The main thread keeps the baton and makes no call: a free call that needed the baton
+        // would wait here until the main thread next yields.
+        g_bf_stage.store(2, std::memory_order_release);
+        bf_wait_stage(3);
+        check(g_bf_stage.load() >= 3 && g_bf_free_ok,
+              "baton-free imports: critical sections, TLS, Interlocked, the clock and Sleep ran "
+              "without the baton while the main thread held it");
+        g_bf_stage.store(4, std::memory_order_release);
+        bf_wait_stage(5);
+        from = wall_seconds();
+        call_import(c, "KERNEL32.dll", "EnterCriticalSection", {g_bf_cs});
+        const double waited = wall_seconds() - from;
+        check(rd32(g_bf_cs + 12) == 1 && waited > 0.05 && waited < 2.0,
+              "baton-free imports: the free thread's Leave woke the main thread waiting for the "
+              "section (%.0f ms)", waited * 1000.0);
+        g_bf_stage.store(6, std::memory_order_release);
+        os_sleep_us(20000);
+        call_import(c, "KERNEL32.dll", "LeaveCriticalSection", {g_bf_cs});
+        uint32_t result = call_import(c, "KERNEL32.dll", "WaitForSingleObject", {worker, 3000});
+        check(result == 0 && g_bf_got,
+              "baton-free imports: an Enter of a section the main thread held waited for it and "
+              "came back with the baton");
         call_import(c, "KERNEL32.dll", "CloseHandle", {worker});
     }
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## Imported browser file reads (local validation)
+
+- Enable the existing yielding file-read path for fully imported games as well
+  as streamed games. Other guest threads can run while browser storage reads
+  wait. Keep the explicit FILE_READ_YIELD override. This does not remove
+  directory-lookup stalls or establish an overall FPS gain.
+
+## Browser mouse coordinates
+
+- Read captured mouse positions in canvas coordinates on the SDL Emscripten backend.
+  Do not subtract an emulated desktop window position. This keeps the game cursor
+  at the same location when moving and clicking. Desktop sampling is unchanged.
+
+## CPU preparation (local validation)
+
+- Reuse up to 512 KiB of unlocked vertex/index buffer staging memory. Preserve
+  complete copies, nested locks, dirty spans and owned upload bytes; discard
+  cached addresses when the guest heap resets and evict before retrying a
+  resource lock that runs out of memory.
+- Batch decoded EAX/ESI word-copy runs while retaining original branch entries,
+  per-instruction limits, memory checks, write notifications and code-change
+  validation. Other instruction forms keep the ordinary interpreter path.
+
 ## Browser compatibility
 
 - Support bounded sampled volume textures in the WebGPU D3D9 backend, including mip slices and matching sampler layouts.

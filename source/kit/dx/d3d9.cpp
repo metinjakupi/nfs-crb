@@ -773,13 +773,74 @@ static void gpu_before_lock(ComObj *s);
 static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi);
 static void gpu_forget(ComObj *o);
 
+// Only unlocked VB/IB scratch blocks enter this bounded cache. Resource
+// ownership, canonical bytes and queued GPU upload ownership are unchanged.
+struct BufferStageSpan {
+    uint32_t address, bytes;
+};
+static BufferStageSpan g_buffer_stages[4];
+static uint32_t g_buffer_stage_count = 0, g_buffer_stage_bytes = 0;
+static constexpr uint32_t kBufferStageLimit = 512u * 1024u;
+static void buffer_stage_evict_first() {
+    if (!g_buffer_stage_count)
+        return;
+    heap_free(g_buffer_stages[0].address);
+    g_buffer_stage_bytes -= g_buffer_stages[0].bytes;
+    for (uint32_t i = 1; i < g_buffer_stage_count; ++i)
+        g_buffer_stages[i - 1] = g_buffer_stages[i];
+    --g_buffer_stage_count;
+}
+static void buffer_stage_clear() {
+    while (g_buffer_stage_count)
+        buffer_stage_evict_first();
+}
+static uint32_t buffer_stage_alloc(uint32_t bytes, bool buffer) {
+    if (buffer) {
+        uint32_t best = g_buffer_stage_count;
+        for (uint32_t i = 0; i < g_buffer_stage_count; ++i)
+            if (g_buffer_stages[i].bytes >= bytes &&
+                (best == g_buffer_stage_count ||
+                 g_buffer_stages[i].bytes < g_buffer_stages[best].bytes))
+                best = i;
+        if (best < g_buffer_stage_count) {
+            const BufferStageSpan found = g_buffer_stages[best];
+            for (uint32_t i = best + 1; i < g_buffer_stage_count; ++i)
+                g_buffer_stages[i - 1] = g_buffer_stages[i];
+            --g_buffer_stage_count;
+            g_buffer_stage_bytes -= found.bytes;
+            return found.address;
+        }
+    }
+    uint32_t address = heap_alloc(bytes, false, 16);
+    if (!address && g_buffer_stage_count) {
+        // Cached scratch must not cause a failed resource Lock. Retry after
+        // returning every idle block, including for non-buffer resources.
+        buffer_stage_clear();
+        address = heap_alloc(bytes, false, 16);
+    }
+    return address;
+}
+static void buffer_stage_release(uint32_t address, bool buffer) {
+    const uint32_t bytes = heap_size(address);
+    if (!buffer || !bytes || bytes > kBufferStageLimit) {
+        heap_free(address);
+        return;
+    }
+    while (g_buffer_stage_count &&
+           (g_buffer_stage_count == 4u || g_buffer_stage_bytes + bytes > kBufferStageLimit))
+        buffer_stage_evict_first();
+    g_buffer_stages[g_buffer_stage_count++] = {address, bytes};
+    g_buffer_stage_bytes += bytes;
+}
+
 static uint32_t stage_lock(ComObj *o) {
     if (!o || o->blob.empty())
         return 0;
     if (o->lock_count == 0)
         gpu_before_lock(o);
     if (o->lock_count++ == 0) {
-        o->pixels = heap_alloc((uint32_t)o->blob.size(), false, 16);
+        o->pixels = buffer_stage_alloc((uint32_t)o->blob.size(),
+                                       o->kind == K_D3D9VB || o->kind == K_D3D9IB);
         if (!o->pixels) {
             o->lock_count = 0;
             return 0;
@@ -839,7 +900,7 @@ static void stage_unlock(ComObj *o) {
         }
         if (hi > lo)
             memcpy(o->blob.data() + lo, staged + lo, hi - lo);
-        heap_free(o->pixels);
+        buffer_stage_release(o->pixels, o->kind == K_D3D9VB || o->kind == K_D3D9IB);
         o->pixels = 0;
         if (hi > lo) {
             d9_raster_invalidate(o->id);
@@ -4083,6 +4144,9 @@ static const ImportShim g_d3d9_exports[] = {
 };
 
 void d3d9_reset() {
+    // mem_init already discarded these allocations. Never free old-generation
+    // addresses: the new heap may have reused them for unrelated objects.
+    g_buffer_stage_count = g_buffer_stage_bytes = 0;
     g_scratch = 0;
     g_scratch_size = 0;
 }

@@ -178,12 +178,20 @@ static int cust_tire_factory_draw(CustTireState *s,uint32_t wheel,uint32_t model
  if(oldCount>CUST_TIRE_FACTORY_ROWS-2u || (oldCount&&!oldTable))return 0;
  const uint32_t table=s->storage+240u+wheel*CUST_TIRE_FACTORY_ROWS*12u;
  uint32_t count=oldCount,seen=0u;
+ /* No mapped pointer survives a native call. Keep all writes through the
+  * scalar API so null/dirty/watch hooks and failure handling are unchanged. */
+ {
+ void *mapped=NULL;
+ if(oldCount && oldTable>=0x10000u && api->guest_ptr(api,oldTable,oldCount*12u,&mapped)!=POP_OK)mapped=NULL;
  for(uint32_t i=0;i<oldCount;++i){
-  uint32_t old=get_u32(oldTable+i*12u),name=get_u32(oldTable+i*12u+4u),info=get_u32(oldTable+i*12u+8u);
+  uint32_t old,name,info;
+  if(mapped){memcpy(&old,(const unsigned char*)mapped+i*12u,4u);memcpy(&name,(const unsigned char*)mapped+i*12u+4u,4u);memcpy(&info,(const unsigned char*)mapped+i*12u+8u,4u);}
+  else{old=get_u32(oldTable+i*12u);name=get_u32(oldTable+i*12u+4u);info=get_u32(oldTable+i*12u+8u);}
   if(old==0xe4cea024u){name=texture;info=diffuseInfo;seen|=1u;}
   if(old==0x52f745b1u){name=normal;info=normalInfo;seen|=2u;}
   if(api->guest_write_u32(api,table+i*12u,old)!=POP_OK || api->guest_write_u32(api,table+i*12u+4u,name)!=POP_OK || api->guest_write_u32(api,table+i*12u+8u,info)!=POP_OK)return 0;
  }
+ } /* mapped source is no longer in scope before any native call */
  const uint32_t keys[2]={0xe4cea024u,0x52f745b1u},names[2]={texture,normal},infos[2]={diffuseInfo,normalInfo};
  for(uint32_t i=0;i<2u;++i)if(!(seen&(1u<<i))){
   if(api->guest_write_u32(api,table+count*12u,keys[i])!=POP_OK || api->guest_write_u32(api,table+count*12u+4u,names[i])!=POP_OK || api->guest_write_u32(api,table+count*12u+8u,infos[i])!=POP_OK)return 0;++count;

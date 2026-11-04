@@ -408,20 +408,15 @@ void k_FileTimeToLocalFileTime(X86 *c) {
     set_eax(c, ok ? 1 : 0);
 }
 // Need for Speed Carbon and its msvcr71/msvcp71 (game.toml [modules.aux]).
-// Guest threads are scheduled cooperatively, so plain reads and writes are
-// atomic with respect to each other, as the Interlocked shims above assume.
+// Host atomics (x86.h, recomp_lock_*): a guest thread running free beside the baton
+// holder may touch the same word with a LOCK instruction.
 void k_InterlockedCompareExchange(X86 *c) {
     uint32_t p = arg(c, 0), exchange = arg(c, 1), comparand = arg(c, 2);
-    uint32_t old = rd32(p);
-    if (old == comparand)
-        wr32(p, exchange);
-    set_eax(c, old);
+    set_eax(c, recomp_lock_cmpxchg32(p, comparand, exchange));
 }
 void k_InterlockedExchangeAdd(X86 *c) {
     uint32_t p = arg(c, 0), value = arg(c, 1);
-    uint32_t old = rd32(p);
-    wr32(p, old + value);
-    set_eax(c, old);
+    set_eax(c, recomp_lock_xadd32(p, value));
 }
 void k_SetThreadIdealProcessor(X86 *c) {
     set_eax(c, 0); // previous ideal processor

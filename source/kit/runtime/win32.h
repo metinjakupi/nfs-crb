@@ -271,6 +271,12 @@ bool sched_free_run_enter(uint32_t esp);
 // Returns the function's entry ESP when this thread was running free, else 0.
 uint32_t sched_free_run_leave();
 bool sched_free_running();
+// RECOMP_SCHED=parallel: every guest thread except the main one runs free for its whole
+// body (free run with no end), taking the baton only for imports and mod hooks; the main
+// thread is unchanged. rejoin puts such a thread back into free run after anything that
+// left it holding the baton (an import, a hook, a guest exception); a no-op otherwise.
+bool sched_parallel();
+void sched_parallel_rejoin();
 #ifdef POPM_TESTING
 // Forgets that, for a process that tears one guest down and starts another.
 // Compiled ONLY into a test binary: it resets a safety latch, and a latch that
@@ -292,6 +298,12 @@ void sched_run_checkpoint();
 // ---------------------------------------------------------------------------
 uint32_t host_millis();
 void host_set_time_source(uint32_t (*fn)());
+// The same clock read with no side effect, for a guest thread running without the baton
+// (imports_register_baton_free): a host's time source may also service the host, which only
+// the baton holder may do. A host that installs a time source installs this as well; while
+// it has not, host_millis_quiet answers false and the read takes the baton.
+void host_set_quiet_time_source(uint32_t (*fn)());
+bool host_millis_quiet(uint32_t *out);
 // What that clock IS, in the host's own words, for whatever has to record what
 // a run ran on. Installing a time source is not the same as pinning one - the
 // boot hosts install one that reads the real clock - so this cannot be derived
@@ -316,6 +328,10 @@ void host_set_time_source_pinned(uint32_t start_ms, uint32_t step_ms);
 // its frame path unconditionally.
 void host_pinned_clock_advance();
 bool host_time_source_is_pinned();
+// Pin from now on rather than from boot (misc.cpp says why). Any thread may
+// request it; the thread that presents takes the request at its next frame.
+void host_request_pinned_clock(uint32_t step_ms);
+void host_take_pinned_clock_request();
 // Take any installed time source away and go back to the real clock, naming it
 // "monotonic" again. A pinned clock left installed by whoever pinned it is a
 // clock that never moves for everyone after them: nothing advances it, every

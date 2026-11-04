@@ -75,6 +75,7 @@ pub enum Refusal {
 
 #[derive(Default)]
 pub struct Claims {
+    admins: std::collections::BTreeSet<String>,
     names: BTreeMap<String, Claim>,
     owners: BTreeMap<Owner, String>,
     reservations: BTreeMap<String, Reservation>,
@@ -119,6 +120,23 @@ pub fn owner_of(token: &str) -> Option<Owner> {
 }
 
 impl Claims {
+    pub fn set_admins(&mut self, admins: std::collections::BTreeSet<String>) { self.admins = admins; }
+    fn admin_alias(&self, name: &str, owner: Option<&Owner>) -> bool {
+        name.eq_ignore_ascii_case("admin") && owner.is_some_and(|o| self.admins.contains(o))
+    }
+
+    /// Protected crews use explicit name claims, never legacy browser keys.
+    pub fn verified_owner(&self, name: &str, owner: &Owner) -> bool {
+        if crate::moderation::reserved(name) { return self.admin_alias(name, Some(owner)); }
+        self.names.get(&canonical(name)).is_some_and(|c| &c.owner == owner)
+    }
+
+    pub fn claimed_owner(&self, name: &str) -> Option<(Owner, String)> {
+        if name.eq_ignore_ascii_case("admin") && self.admins.len() == 1 { return Some((self.admins.iter().next().unwrap().clone(), "Admin".into())); }
+        if crate::moderation::reserved(name) { return None; }
+        self.names.get(&canonical(name)).map(|c| (c.owner.clone(), c.name.clone()))
+    }
+
     /// Claims kept beside Messenger data in `names.json`; in memory only without a folder.
     pub fn open(dir: Option<PathBuf>, stats_dir: Option<PathBuf>) -> Result<Claims, String> {
         let mut out = Claims::default();
@@ -264,6 +282,7 @@ impl Claims {
     pub fn claim(&mut self, name: &str, owner: &Owner, browser_key: &str, now: u64) -> Result<String, Refusal> {
         let shown = clean_name(name);
         let key = canonical(&shown);
+        if crate::moderation::reserved(&shown) { return if self.admin_alias(&shown, Some(owner)) { Ok("Admin".into()) } else { Err(Refusal::Recovery) }; }
         if key == "player" {
             return Err(if name.is_empty() { Refusal::Invalid } else { Refusal::Default });
         }
@@ -308,6 +327,7 @@ impl Claims {
     pub fn status(&self, name: &str, owner: Option<&Owner>, browser_key: &str) -> (String, Status) {
         let shown = clean_name(name);
         let key = canonical(&shown);
+        if crate::moderation::reserved(&shown) { return (shown.clone(), if self.admin_alias(&shown, owner) { Status::Yours } else { Status::Reserved }); }
         if key == "player" {
             return (shown, Status::Default);
         }
@@ -327,6 +347,7 @@ impl Claims {
     /// A new name stays open. An old reserved name needs its old browser key until the player
     /// claims it. A claimed name needs the same keyphrase-derived owner.
     pub fn may_use(&self, name: &str, owner: Option<&Owner>, browser: Option<&str>) -> bool {
+        if crate::moderation::reserved(name) { return self.admin_alias(name, owner); }
         let key = canonical(name);
         if let Some(claim) = self.names.get(&key) {
             return owner.is_some_and(|o| o == &claim.owner);
@@ -452,6 +473,19 @@ pub async fn handle(app: &App, conn: &mut Conn, req: &mut Request, url: &Url) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_admin_claim_requires_the_configured_owner() {
+        let owner = owner_of(&"a".repeat(64)).unwrap();
+        let other = owner_of(&"b".repeat(64)).unwrap();
+        let mut claims = Claims::default();
+        claims.set_admins(std::collections::BTreeSet::from([owner.clone()]));
+        assert_eq!(claims.claim("Admin", &other, "", 1), Err(Refusal::Recovery));
+        assert_eq!(claims.claim("Admin", &owner, "", 1), Ok("Admin".into()));
+        assert!(claims.verified_owner("Admin", &owner));
+        assert!(!claims.verified_owner("FakeAdmin", &owner));
+        assert!(!claims.may_use("Admin", Some(&other), None));
+    }
 
     #[test]
     fn a_reserved_name_without_old_browser_proof_cannot_be_taken() {

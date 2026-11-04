@@ -1,6 +1,5 @@
 // Small, synthetic effects exercise the real guest ABI and CTAB binding.
 // No game files, window, physical controller or sound device are involved.
-#include <sys/resource.h>
 #include "../dx.h"
 #include "../d3d9_pipeline.h"
 #include "../host_d9.h"
@@ -10,6 +9,7 @@
 #include "guest_abi.h"
 
 #include <array>
+#include <chrono>
 #include <string>
 #include <unordered_map>
 #include <algorithm>
@@ -1091,7 +1091,224 @@ static void test_numeric_scale(uint32_t dev) {
     call_method(e, 2);
 }
 
-int main() {
+// Real public VB/IB ABI; bytes/lifetime are the contract, no cache test seam.
+struct BufferUploadCopy {
+    uint32_t id, total, offset;
+    std::vector<uint8_t> bytes;
+};
+static std::vector<BufferUploadCopy> buffer_uploads;
+extern "C" void host_d9_buffer_upload(uint32_t id, uint32_t total, uint32_t offset,
+                                      const uint8_t *bytes, uint32_t n) {
+    buffer_uploads.push_back({id, total, offset, {bytes, bytes + n}});
+}
+static uint32_t staging_buffer(uint32_t dev, uint32_t n, bool index = false) {
+    CHECK(call_method(dev, index ? 27 : 26, {n, 0, index ? 101u : 0u, 0, sc(0x1100), 0}) == 0);
+    return rd32(sc(0x1100));
+}
+static uint32_t staging_lock(uint32_t b, uint32_t offset = 0, uint32_t bytes = 0) {
+    CHECK(call_method(b, 11, {offset, bytes, sc(0x1104), 0}) == 0);
+    return rd32(sc(0x1104));
+}
+static void staging_unlock(uint32_t b) {
+    CHECK(call_method(b, 12) == 0);
+}
+static void test_buffer_staging(uint32_t dev) {
+    const uint32_t a = staging_buffer(dev, 65536), b = staging_buffer(dev, 65536, true);
+    uint32_t p = staging_lock(a, 16, 4);
+    CHECK(p != 0);
+    wr32(p, 0x12345678);
+    wr32(p + 32000, 0xaabbccdd); // write outside requested range
+    const uint32_t nested = staging_lock(a, 32, 4);
+    CHECK(nested == p + 16);
+    wr32(nested, 0x76543210);
+    const uint32_t other = staging_lock(b);
+    CHECK(other != p - 16);
+    wr32(other, 0x11223344);
+    staging_unlock(a);
+    CHECK(com_this(a)->pixels == p - 16 && com_this(a)->lock_count == 1);
+    staging_unlock(a);
+    CHECK(com_this(a)->pixels == 0 && com_this(a)->lock_count == 0);
+    staging_unlock(b);
+    CHECK(com_this(a)->blob.size() == 65536);
+    p = staging_lock(a);
+    CHECK(rd32(p + 16) == 0x12345678 && rd32(p + 32016) == 0xaabbccdd &&
+          rd32(p + 32) == 0x76543210);
+    staging_unlock(a);
+    p = staging_lock(b);
+    CHECK(rd32(p) == 0x11223344);
+    staging_unlock(b);
+    // Canonical bytes must survive another resource reusing the unlocked stage.
+    p = staging_lock(a);
+    wr32(p, 0xdeadbeef);
+    staging_unlock(a);
+    p = staging_lock(b);
+    memset(gm_ptr(p), 0xee, 65536);
+    staging_unlock(b);
+    p = staging_lock(a);
+    CHECK(rd32(p) == 0xdeadbeef);
+    staging_unlock(a);
+    // Verify bytes exported by the real draw shim; queue ownership is checked in the host layer.
+    const uint32_t fx = create_effect(dev, effect());
+    CHECK(call_method(fx, 63, {sc(0x1120), 0}) == 0);
+    CHECK(call_method(fx, 64, {0}) == 0);
+    const uint8_t decl[] = {0, 0, 0, 0, 2, 0, 0, 0, 0xff, 0, 0, 0, 17, 0, 0, 0};
+    memcpy(gm_ptr(sc(0x1140)), decl, sizeof decl);
+    CHECK(call_method(dev, 86, {sc(0x1140), sc(0x1160)}) == 0);
+    uint32_t declaration = rd32(sc(0x1160));
+    CHECK(call_method(dev, 87, {declaration}) == 0);
+    CHECK(call_method(dev, 100, {0, a, 0, 12}) == 0);
+    buffer_uploads.clear();
+    CHECK(call_method(dev, 81, {4, 0, 1}) == 0);
+    CHECK(!buffer_uploads.empty());
+    if (!buffer_uploads.empty()) {
+        const auto &upload = buffer_uploads.back();
+        CHECK(upload.id == com_this(a)->id);
+        CHECK(upload.total == 65536);
+        uint32_t word = 0;
+        memcpy(&word, upload.bytes.data(), 4);
+        CHECK(word == 0xdeadbeef);
+    }
+    p = staging_lock(b);
+    memset(gm_ptr(p), 0xab, 65536);
+    staging_unlock(b);
+    CHECK(call_method(dev, 100, {0, 0, 0, 0}) == 0);
+    call_method(dev, 87, {0});
+    call_method(declaration, 2);
+    call_method(fx, 66);
+    call_method(fx, 67);
+    call_method(fx, 2);
+    // Destruction while locked must free only its live allocation.
+    const uint32_t doomed = staging_buffer(dev, 8192);
+    p = staging_lock(doomed);
+    CHECK(heap_owns(p));
+    call_method(doomed, 2);
+    CHECK(!heap_owns(p));
+    call_method(a, 2);
+    call_method(b, 2);
+    // More simultaneous stages than slots and more than the byte budget.
+    uint32_t six[6];
+    for (auto &i : six)
+        i = staging_buffer(dev, 98304);
+    const auto before = heap_stats();
+    for (auto i : six) {
+        p = staging_lock(i);
+        wr32(p, 0x55779911);
+    }
+    for (auto i : six)
+        staging_unlock(i);
+    const auto after = heap_stats();
+    CHECK(after.used_bytes <= before.used_bytes + 512u * 1024u);
+    CHECK(after.used_blocks <= before.used_blocks + 4u);
+    for (auto i : six) {
+        p = staging_lock(i);
+        CHECK(rd32(p) == 0x55779911);
+        staging_unlock(i);
+        call_method(i, 2);
+    }
+}
+static void test_staging_pressure(uint32_t dev) {
+    mem_init();
+    dx_reset();
+    g_scratch = heap_alloc(0x4000, true, 16);
+    CHECK(g_scratch != 0);
+    cpu_reset();
+    dev = make_device();
+    // Baseline has no retained blocks; candidate can recover cached bytes on
+    // resource-Lock allocation failure. Derive the expected result from public
+    // heap accounting, not a cache flag or a private cache query.
+    uint32_t small[3];
+    for (auto &i : small)
+        i = staging_buffer(dev, 131072);
+    const uint32_t large = staging_buffer(dev, 262144);
+    const auto before = heap_stats();
+    for (auto i : small)
+        staging_lock(i);
+    for (auto i : small)
+        staging_unlock(i);
+    const auto after = heap_stats();
+    const uint64_t retained =
+        after.used_bytes > before.used_bytes ? after.used_bytes - before.used_bytes : 0;
+    std::vector<uint32_t> occupied;
+    for (unsigned tries = 0; tries < 32; tries++) {
+        auto h = heap_stats();
+        if (!h.largest_free)
+            break;
+        uint32_t block = heap_alloc(h.largest_free, false, 16);
+        if (!block)
+            break;
+        occupied.push_back(block);
+    }
+    CHECK(heap_stats().largest_free < 262144);
+    const uint32_t result = call_method(large, 11, {0, 0, sc(0x1104), 0});
+    if (retained >= 262144) {
+        CHECK(result == 0);
+        if (!result)
+            staging_unlock(large);
+    } else
+        CHECK(result == 0x8007000eu);
+    for (auto i : occupied)
+        CHECK(heap_free(i));
+    for (auto i : small)
+        call_method(i, 2);
+    call_method(large, 2);
+    CHECK(std::string(heap_check()).empty());
+}
+static void test_staging_reset() {
+    mem_init();
+    dx_reset();
+    g_scratch = heap_alloc(0x4000, true, 16);
+    CHECK(g_scratch != 0);
+    cpu_reset();
+    // Occupy bytes that the old generation used for staging, then lock again.
+    const uint32_t sentinel = heap_alloc(1024 * 1024, false, 16);
+    CHECK(sentinel != 0);
+    memset(gm_ptr(sentinel), 0x5a, 1024 * 1024);
+    const uint32_t dev = make_device(), b = staging_buffer(dev, 65536);
+    uint32_t p = staging_lock(b);
+    CHECK(p < sentinel || p >= sentinel + 1024 * 1024);
+    wr32(p, 0xaabbccdd);
+    staging_unlock(b);
+    CHECK(std::all_of(gm_ptr(sentinel), gm_ptr(sentinel + 1024 * 1024),
+                      [](uint8_t v) { return v == 0x5a; }));
+    call_method(b, 2);
+    call_method(dev, 2);
+    CHECK(heap_free(sentinel));
+}
+static void benchmark_staging(uint32_t dev) {
+    uint32_t buffers[12];
+    for (unsigned i = 0; i < 12; i++)
+        buffers[i] = staging_buffer(dev, i < 10 ? 65536 : 24576);
+    // Fragment the guest heap with live game-like allocations. No real saves.
+    std::vector<uint32_t> live;
+    for (unsigned i = 0; i < 1024; i++)
+        live.push_back(heap_alloc(64 + (i % 11) * 16, false, 16));
+    for (unsigned round = 0; round < 4; round++) {
+        const auto before = heap_stats();
+        auto start = std::chrono::steady_clock::now();
+        uint32_t checksum = 0;
+        for (unsigned frame = 0; frame < 500; frame++)
+            for (unsigned i = 0; i < 12; i++) {
+                uint32_t p = staging_lock(buffers[i], 0, 4);
+                wr32(p, frame + i);
+                checksum += rd32(p);
+                staging_unlock(buffers[i]);
+            }
+        const auto after = heap_stats();
+        double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+        printf("staging synthetic round=%u frames=500 locks=6000 stagedKiBPerFrame=688 ms=%.3f "
+               "allocs=%llu frees=%llu checksum=%u\n",
+               round, ms, (unsigned long long)(after.total_allocs - before.total_allocs),
+               (unsigned long long)(after.total_frees - before.total_frees), checksum);
+    }
+    for (auto p : live)
+        heap_free(p);
+    for (auto b : buffers)
+        call_method(b, 2);
+}
+
+int main(int argc, char **argv) {
     test_volume_dds();
     mem_init();
     imports_init();
@@ -1104,6 +1321,17 @@ int main() {
     const uint32_t dev = make_device();
     if (!dev)
         return 1;
+    if (argc > 1 && !strcmp(argv[1], "--staging-benchmark")) {
+        benchmark_staging(dev);
+        return g_failures ? 1 : 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--staging-only")) {
+        test_buffer_staging(dev);
+        test_staging_pressure(dev);
+        test_staging_reset();
+        printf("staging: %d checks, %d failures\n", g_checks, g_failures);
+        return g_failures ? 1 : 0;
+    }
     test_device_booleans(dev);
     test_draw_limits(dev);
     test_depth_stencil_get(dev);
@@ -1125,6 +1353,9 @@ int main() {
     test_numeric_binding(numeric_dev);
     test_numeric_scale(numeric_dev);
     call_method(numeric_dev, 2);
+    test_buffer_staging(make_device());
+    test_staging_pressure(make_device());
+    test_staging_reset();
     printf("d3d9 guest/effect: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

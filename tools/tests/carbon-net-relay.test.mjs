@@ -444,7 +444,8 @@ test("a hello delivered with the HTTP upgrade is not lost", async (t) => {
   assert.equal(peer.status, 101);
   const frame = await peer.readFrame();
   assert.equal(frame.opcode, 1);
-  assert.deepEqual(JSON.parse(frame.data), { t: "welcome", id: 1, peers: [] });
+  const welcome = JSON.parse(frame.data);
+  assert.deepEqual({ t: welcome.t, id: welcome.id, peers: welcome.peers }, { t: "welcome", id: 1, peers: [] });
   assert.deepEqual(await relay.stats(), { players: 1, here: 1 });
 });
 
@@ -457,6 +458,8 @@ test("partial frames, ping, and oversize rejection leave other players connected
   await delay(20);
   peer.socket.write(hello.subarray(3));
   const welcome = JSON.parse((await peer.readFrame()).data);
+  const state = JSON.parse((await peer.readFrame()).data);
+  assert.deepEqual({ t: state.t, k: state.k, chatAck: state.chatAck }, { t: "moderation", k: "state", chatAck: true });
   await alice.read("join", welcome.id);
   peer.socket.write(maskedFrame("test ping", 9));
   const pong = await peer.readFrame();
@@ -473,6 +476,8 @@ test("a closed connection cannot rejoin or crash a deleted room", async (t) => {
   const peer = await wire(t, relay, `/lobby?key=${key}`);
   peer.socket.write(maskedFrame(JSON.stringify({ t: "hi", name: "Leaving" })));
   assert.equal(JSON.parse((await peer.readFrame()).data).t, "welcome");
+  const state = JSON.parse((await peer.readFrame()).data);
+  assert.deepEqual({ t: state.t, k: state.k, chatAck: state.chatAck }, { t: "moderation", k: "state", chatAck: true });
   peer.socket.write(maskedFrame("", 8));
   assert.equal((await peer.readFrame()).opcode, 8);
   peer.socket.write(maskedFrame(JSON.stringify({ t: "hi", name: "Too late" })));
@@ -728,6 +733,8 @@ test("a player can change crew while connected; everyone learns the cleaned name
   assert.deepEqual(await alice.read("crew"), { t: "crew", id: bob.welcome.id, crew: "" });
   const carol = await connect(t, relay, "lobby", "Carol");
   assert.deepEqual(carol.welcome.peers.find((p) => p.id === bob.welcome.id).crew, "");
+  alice.send({t:"crewctl",op:"create",q:77,name:"Protected"});
+  assert.deepEqual(await alice.read("crewctl"),{t:"crewctl",op:"create",q:77,ok:false,error:"unavailable"});
 });
 
 test("race messages reach the whole room, the sender too, size-capped and rate-limited", async (t) => {
@@ -1139,7 +1146,7 @@ test("chat reaches the whole room without driving; the horn stays nearby or crew
   assert.deepEqual(await q.read("horn"), { t: "horn", id: r.welcome.id, on: false });
 });
 
-test("game workers give the 8 car slots to the nearest players, racers and crew-mates first, and swap them slowly", async (t) => {
+test("game workers prioritize nearest players and racers, ignore legacy crew tags, and swap slowly", async (t) => {
   const relay = await start(t);
   const g = await gameLink(t, relay, "G", "Owls");
   // The game's own car is at pose.s's place (12, 3, -40); the others stand along +x from it.
@@ -1177,18 +1184,18 @@ test("game workers give the 8 car slots to the nearest players, racers and crew-
   bots.set(75, await join(t, relay, "At 75"));
   await drive(); g.tick(250);
   assert.equal(has(75), false);
-  // A crew-mate within 400 m comes before strangers, however near.
+  // An unverified shared tag on a legacy relay grants no crew priority.
   bots.set(200, await join(t, relay, "Mate", "owls"));
   await drive(); g.tick(250);
-  assert.equal(has(200), true, "the crew-mate");
-  assert.equal(has(80), false, "in place of the farthest stranger");
+  assert.equal(has(200), false, "a copied tag is not verified membership");
+  assert.equal(has(80), true, "the nearer player keeps the slot");
   // A player racing with us (race.js) comes first, whatever the distance.
   bots.set(2000, await join(t, relay, "Racer"));
   g.post({ t: "racers", ids: [bots.get(2000).welcome.id] });
   await drive(); g.tick(250);
   assert.equal(has(2000), true, "the racer");
-  assert.equal(has(70), false);
-  assert.deepEqual([...bots.keys()].filter(has).sort((a, b) => a - b), [10, 20, 30, 40, 50, 60, 200, 2000]);
+  assert.equal(has(80), false);
+  assert.deepEqual([...bots.keys()].filter(has).sort((a, b) => a - b), [10, 20, 30, 40, 50, 60, 70, 2000]);
   // The where feed reaches the page, without this player.
   const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length === bots.size), "the where feed");
   assert.equal(where.p.some((e) => e[0] === g.id), false);
@@ -1202,13 +1209,13 @@ test("the world map shows 10 players: crew-mates first, then the nearest, at the
   const listeners = new Map();
   const buffer = new SharedArrayBuffer(0x200), u32 = new Uint32Array(buffer), f32 = new Float32Array(buffer), u8 = new Uint8Array(buffer);
   u32[0] = 0x32504d57; u32[1] = 2;
-  const people = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i >= 10 ? "OWLS" : "" }));
+  const people = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i >= 10 ? "OWLS" : "", crewId: i >= 10 ? "verified-owls" : null }));
   const feed = (moves = {}) => people.map((p) => [p.id, moves[p.id] ?? 100 * p.id, 0, 90]);
   const page = vm.createContext({
     performance: { now: () => clock }, setInterval() {}, Atomics,
     addEventListener: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
     carbonWorldMapBlock: { memory: { buffer }, ptr: 0 },
-    recompOnlineState: { open: true, crew: "Owls", people, slotIds: [3, 4, 0, 0, 0, 0, 0, 0] },
+    recompOnlineState: { open: true, crew: "Owls", crewId: "verified-owls", people, slotIds: [3, 4, 0, 0, 0, 0, 0, 0] },
     recompCrewKey: (c) => String(c || "").toLowerCase().replace(/\s+/g, ""),
     recompCrewColor: (c) => (c ? "#ff66cc" : ""),
     recompOnlineSelf: () => [0, 3, 0],
@@ -1948,4 +1955,61 @@ test("current clients do not publish AI rival replicas even with an older native
   await delay(100);
   assert.equal(legacy.messages.some(m => m.t === "rivals"), false, "removed spectator feature sends no rival cars");
   assert.equal(u32[2], 0, "old native rival scanning stays disabled");
+});
+
+
+test("private chat reaches only sender and recipient; invalid targets never broadcast", async (t) => {
+  const relay = await start(t);
+  const a = await connect(t, relay, "private-test", "Alice");
+  const b = await connect(t, relay, "private-test", "Bob");
+  const observer = await connect(t, relay, "private-test", "Observer");
+  const otherRoom = await connect(t, relay, "elsewhere", "Outside");
+  assert.equal(a.welcome.whispers, 1);
+  a.send({t:"chat", to:b.welcome.id, text:"private hello"});
+  const received = await b.read("chat");
+  assert.equal(received.text, "private hello");
+  assert.equal(received.id, a.welcome.id);
+  assert.equal(received.to, b.welcome.id);
+  assert.equal(received.targetName, "Bob");
+  assert.deepEqual(await a.read("chat"), received);
+  for (const to of [otherRoom.welcome.id, "2", null, 999999, a.welcome.id]) {
+    a.send({t:"chat", to, text:"must stay private"});
+    assert.equal((await a.read("chat")).error, "undelivered");
+  }
+  a.send({t:"chat", text:"room hello"});
+  assert.equal((await b.read("chat")).text, "room hello");
+  assert.equal((await observer.read("chat")).text, "room hello");
+  await delay(100);
+  assert.equal(observer.messages.some(m => m.t === "chat"), false);
+  assert.equal(otherRoom.messages.some(m => m.t === "chat"), false);
+  assert.equal(b.messages.some(m => m.t === "chat"), false);
+});
+
+test("private chat worker exposes capability and sender receipt without adding a self peer", async (t) => {
+  const relay = await start(t);
+  const a = await gameLink(t, relay, "Alice");
+  const b = await connect(t, relay, "lobby", "Bob");
+  await until(() => a.posted.some(m => m.t === "state" && m.whispersOk), "private capability");
+  a.post({t:"send",m:{t:"chat",to:b.welcome.id,text:"worker whisper"}});
+  assert.equal((await b.read("chat")).text, "worker whisper");
+  const receipt = await until(() => a.posted.find(m => m.t === "msg" && m.m.text === "worker whisper"), "sender receipt");
+  assert.equal(receipt.m.name, "Alice");
+  assert.equal(receipt.m.targetName, "Bob");
+  a.tick(1000);
+  const state = a.posted.filter(m => m.t === "state").at(-1);
+  assert.equal(state.people.some(p => p.id === a.id), false);
+});
+
+
+test("chat rejects profanity in room and private messages without blocking normal words", async t=>{
+ const relay=await start(t),a=await connect(t,relay,"filter-test","Alice"),b=await connect(t,relay,"filter-test","Bob");
+ for(const text of ["fuck you","FUCK YOU!","f.u.c.k you","f u c k you","sh!t","b1tch","ｆｕｃｋ","f\u200buck"]){
+  for(const to of [undefined,b.welcome.id]) {
+   a.send({t:"chat",text,...(to?{to}:{})});assert.equal((await a.read("chat")).error,"profanity",text);
+  }
+ }
+ for(const text of ["class assistance Scunthorpe cockpit","hello friend"]){
+  a.send({t:"chat",text});assert.equal((await b.read("chat")).text,text);
+ }
+ assert.equal(b.messages.some(m=>m.t==="chat"),false);
 });

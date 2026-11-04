@@ -158,6 +158,7 @@ enum Limit {
     Ping,
     Street,
     Rivals,
+    CrewRead,
 }
 
 impl Limit {
@@ -177,6 +178,7 @@ impl Limit {
             Limit::Ping => (5.0, 1.0),
             Limit::Street => (10.0, 5.0),
             Limit::Rivals => (10.0, 15.0),
+            Limit::CrewRead => (12.0, 2.0),
         }
     }
 }
@@ -349,6 +351,12 @@ struct Member {
     crew: String,
     /// the crew as compared: lower case, no spaces
     crew_key: String,
+    crew_id: Option<String>,
+    owner: Option<String>,
+    chat_ack: bool,
+    account: Option<String>,
+    protected: bool,
+    crew_client: bool,
     named: bool,
     physics: bool,
     pose: Option<Pose>,
@@ -356,7 +364,7 @@ struct Member {
     impact_seq: f64,
     /// sender id -> the last impact seq passed on to this player (what its acks may name)
     receipts: HashMap<u64, f64>,
-    buckets: [Option<Bucket>; 14],
+    buckets: [Option<Bucket>; 15],
     /// the newest non-empty car look: (k, base64 data)
     look: Option<(u32, String)>,
     /// its car's newest lights (lights.h bits 0-15; 0 = none on)
@@ -403,11 +411,12 @@ impl Member {
     /// {id, name, crew, physics?} as JSON members, for welcome lists and joins.
     fn identity(&self) -> String {
         format!(
-            r#""id":{},"name":{},"crew":{}{}"#,
+            r#""id":{},"name":{},"crew":{}{}{}"#,
             self.id,
             json_str(&self.name),
             json_str(&self.crew),
-            if self.physics { r#","physics":1"# } else { "" }
+            if self.physics { r#","physics":1"# } else { "" },
+            if self.protected { format!(",\"crewId\":{},\"account\":{}",serde_json::json!(self.crew_id),serde_json::json!(self.account)) } else { String::new() }
         )
     }
 
@@ -457,6 +466,8 @@ impl Room {
 }
 
 pub struct Relay {
+    moderation: crate::moderation::Moderation,
+    crews: crate::crews::Crews,
     /// room name -> its players
     rooms: HashMap<String, Room>,
     next_id: u64,
@@ -479,6 +490,8 @@ fn env_count(name: &str, fallback: usize, min: usize, max: usize) -> usize {
 impl Default for Relay {
     fn default() -> Relay {
         Relay {
+            crews: crate::crews::Crews::default(),
+            moderation: crate::moderation::Moderation::default(),
             rooms: HashMap::new(),
             next_id: 0,
             room_max: env_count("CARBON_ROOM_MAX", MAX_ROOM, 1, 10000),
@@ -808,6 +821,170 @@ fn where_binary(list: &[(u64, i64, i64, i64)]) -> Arc<[u8]> {
 }
 
 impl Relay {
+    pub fn with_moderation(mut self, moderation:crate::moderation::Moderation)->Self {self.moderation=moderation;self}
+
+    pub fn with_crews(crews: crate::crews::Crews) -> Self {
+        Self { crews, ..Self::default() }
+    }
+
+    fn moderation_control(&mut self, room:&str, id:u64, m:&Map<String,Value>, identities:&Mutex<Claims>) {
+        let Some(r)=self.rooms.get_mut(room) else{return};let Some(i)=r.index(id) else{return};
+        if !r.members[i].named || !r.members[i].out.is_open() {return;}
+        let q=m.get("q").and_then(Value::as_u64).unwrap_or(0);
+        let out=r.members[i].out.clone();
+        let actor=r.members[i].owner.clone();let actor_name=r.members[i].name.clone();
+        let allowed=r.members[i].allow(Limit::CrewRead,Instant::now());
+        let op=m.get("op").and_then(Value::as_str).unwrap_or("");
+        let result=(||->Result<Value,&'static str>{
+            if !allowed {return Err("busy");}if !self.moderation.enabled(){return Err("unavailable");}
+            let admin=self.moderation.is_admin(actor.as_deref(),&actor_name) && actor.as_ref().is_some_and(|o|lock(identities).verified_owner(&actor_name,o));
+            if op!="report" && !admin {return Err("forbidden");}
+            let text=m.get("text").and_then(Value::as_str).unwrap_or("").trim();
+            if text.chars().count()>120 || text.chars().any(char::is_control) {return Err("text");}
+            if op=="announce" && (text.is_empty() || crate::moderation::profane(text)) {return Err("profanity");}
+            let name=m.get("name").and_then(Value::as_str).unwrap_or("").trim();
+            let (target,owner)=if matches!(op,"mute"|"unmute"|"kick"|"report") {
+                if name.is_empty() || name.len()>20 {return Err("target");}
+                if let Some((owner,name))=lock(identities).claimed_owner(name){(name,Some(owner))}else if op=="unmute" && self.moderation.muted(None,name,crate::crews::now()).is_some() {(name.to_string(),None)}else{
+                    let found:Vec<_>=self.rooms.values().flat_map(|r|r.members.iter()).filter(|p|p.named && p.out.is_open() && p.name.eq_ignore_ascii_case(name)).collect();
+                    if found.len()!=1 {return Err("target");}(found[0].name.clone(),found[0].owner.clone())
+                }
+            }else{(String::new(),None)};
+            if matches!(op,"mute"|"kick") && (owner.as_ref().is_some_and(|o|self.moderation.admins.contains(o)) || crate::moderation::reserved(&target)) {return Err("protected");}
+            let minutes=match m.get("minutes") {None=>10,Some(v)=>v.as_u64().ok_or("duration")?};
+            let offset=m.get("offset").and_then(Value::as_u64).unwrap_or(0).min(usize::MAX as u64) as usize;
+            let actor_key=actor.as_deref().unwrap_or(&actor_name);
+            let result=self.moderation.action(op,actor_key,&target,owner.as_deref(),text,minutes,crate::crews::now(),offset)?;
+            if op=="kick" {
+                for p in self.rooms.values().flat_map(|r|r.members.iter()).filter(|p|p.named && if let Some(o)=&owner {p.owner.as_ref()==Some(o)}else{p.name.eq_ignore_ascii_case(&target)}) {
+                    p.out.finish(Some(ws::close_frame(1008,"removed by Admin")));
+                }
+            } else if op=="announce" {
+                let message=text_frame(serde_json::json!({"t":"moderation","k":"announcement","text":text}).to_string());
+                for p in self.rooms.values().flat_map(|r|r.members.iter()).filter(|p|p.named && p.out.is_open()) {p.out.push(0,message.clone());}
+            }
+            Ok(result)
+        })();
+        let reply=match result {Ok(data)=>serde_json::json!({"t":"moderation","q":q,"ok":true,"op":op,"data":data}),Err(error)=>serde_json::json!({"t":"moderation","q":q,"ok":false,"op":op,"error":error})};
+        out.push(0,text_frame(reply.to_string()));
+    }
+
+    fn crew_control(&mut self, room: &str, id: u64, m: &Map<String, Value>, identities: &Mutex<Claims>) {
+        let Some(r) = self.rooms.get_mut(room) else { return };
+        let Some(i) = r.index(id) else { return };
+        if !r.members[i].named {
+            return;
+        }
+        let allowed = r.members[i].allow(Limit::CrewRead, Instant::now());
+        let out = r.members[i].out.clone();
+        let q = m.get("q").and_then(Value::as_u64).unwrap_or(0);
+        if !allowed {
+            out.push(0, text_frame(serde_json::json!({"t":"crewctl","q":q,"ok":false,"error":"busy"}).to_string()));
+            return;
+        }
+        let op = m.get("op").and_then(Value::as_str).unwrap_or("");
+        let owner = r.members[i].owner.clone();
+        let crew_client = r.members[i].crew_client;
+        let player_name = r.members[i].name.clone();
+        let mut page = None;
+        let result = (|| -> Result<(), &'static str> {
+            if !self.crews.enabled() {
+                return Err("unavailable");
+            }
+            if !crew_client {
+                return Err("upgrade");
+            }
+            let owner = owner.as_deref().ok_or("identity")?;
+            if !lock(identities).verified_owner(&player_name, &owner.to_string()) {
+                return Err("identity");
+            }
+            match op {
+                "state" => {}
+                "roster" | "inbox" | "outbox" => {
+                    let offset = m.get("offset").and_then(Value::as_u64).unwrap_or(0).min(usize::MAX as u64) as usize;
+                    let mut p = self.crews.page(owner, op, offset)?;
+                    if op == "roster" {
+                        if let Some(rows) = p["rows"].as_array_mut() {
+                            for row in rows {
+                                let account = row["id"].as_str().unwrap_or("");
+                                let live: Vec<_> = self
+                                    .rooms
+                                    .iter()
+                                    .flat_map(|(room, r)| {
+                                        r.members
+                                            .iter()
+                                            .filter(|p| p.named && p.account.as_deref() == Some(account) && p.out.is_open())
+                                            .map(move |p| (room, p.id))
+                                    })
+                                    .collect();
+                                row["online"] = Value::from(!live.is_empty());
+                                row["sameRoom"] = Value::from(live.iter().any(|(r, _)| r.as_str() == room));
+                            }
+                        }
+                    }
+                    page = Some(p);
+                }
+                _ => {
+                    let target = if op == "invite" {
+                        let n = m.get("name").and_then(Value::as_str).unwrap_or("");
+                        let (o, n) = lock(identities).claimed_owner(n).ok_or("target")?;
+                        Some(self.crews.register(&o, &n)?)
+                    } else {
+                        None
+                    };
+                    self.crews.action(owner, m, target)?;
+                }
+            }
+            Ok(())
+        })();
+        let mut reply = serde_json::json!({"t":"crewctl","q":q,"op":op,"ok":result.is_ok()});
+        if let Err(e) = result {
+            reply["error"] = Value::from(e);
+        }
+        if let Some(p) = page {
+            reply["page"] = p;
+        }
+        out.push(0, text_frame(reply.to_string()));
+        if result.is_ok() {
+            if matches!(op, "roster" | "inbox" | "outbox" | "state") {
+                if let Some(o) = owner {
+                    out.push(0, text_frame(self.crews.summary(&o).to_string()));
+                }
+            } else {
+                self.sync_crews();
+            }
+        }
+    }
+
+    fn sync_crews(&mut self) {
+        if !self.crews.enabled() {
+            return;
+        }
+        for r in self.rooms.values_mut() {
+            let mut changes = Vec::new();
+            for p in r.members.iter_mut().filter(|p| p.named) {
+                let membership = p.owner.as_deref().and_then(|o| self.crews.membership(o));
+                let cid = membership.as_ref().map(|(id, _)| id.clone());
+                let label = membership.map(|(_, name)| name).unwrap_or_default();
+                if p.crew_id != cid || p.crew != label {
+                    p.crew_id = cid;
+                    p.crew = label;
+                    p.crew_key = p.crew_id.clone().unwrap_or_default();
+                    changes.push(text_frame(serde_json::json!({"t":"crew","id":p.id,"crew":p.crew,"crewId":p.crew_id}).to_string()));
+                }
+                if p.crew_client {
+                    if let Some(owner) = &p.owner {
+                        p.out.push(0, text_frame(self.crews.summary(owner).to_string()));
+                    }
+                }
+            }
+            for msg in changes {
+                for p in r.members.iter().filter(|p| p.named) {
+                    p.out.push(0, msg.clone());
+                }
+            }
+        }
+    }
     /// A place in the room, or None when it is full.
     fn admit(&mut self, room: &str, out: Arc<Outbox>) -> Option<u64> {
         if self.rooms.get(room).map_or(0, |r| r.members.len()) >= self.room_max {
@@ -822,12 +999,18 @@ impl Relay {
             name: "Player".into(),
             crew: String::new(),
             crew_key: String::new(),
+            crew_id: None,
+            owner: None,
+            chat_ack: false,
+            account: None,
+            protected: false,
+            crew_client: false,
             named: false,
             physics: false,
             pose: None,
             impact_seq: 0.0,
             receipts: HashMap::new(),
-            buckets: [None; 14],
+            buckets: [None; 15],
             look: None,
             lights: 0,
             out,
@@ -926,7 +1109,7 @@ impl Relay {
     fn handle_binary(&mut self, room: &str, id: u64, data: &[u8]) {
         let Some(r) = self.rooms.get_mut(room) else { return };
         let Some(i) = r.index(id) else { return };
-        if r.members[i].named {
+        if r.members[i].named && r.members[i].out.is_open() {
             if data.first() == Some(&BIN_COPS) {
                 cops(r, i, data, Instant::now());
             } else {
@@ -937,13 +1120,29 @@ impl Relay {
 
     fn handle(&mut self, room: &str, id: u64, text: &str, identities: &Mutex<Claims>) {
         let Ok(Value::Object(m)) = serde_json::from_str::<Value>(text) else { return };
+        if m.get("t").and_then(Value::as_str)==Some("crewctl") {
+            if text.len()<=1024 { self.crew_control(room,id,&m,identities); }
+            return;
+        }
+        if m.get("t").and_then(Value::as_str)==Some("moderation") {
+            if text.len()<=1024 {self.moderation_control(room,id,&m,identities);}
+            return;
+        }
+        let protected = self.crews.enabled();
         let (k, bin) = (self.k, self.bin);
         let Some(r) = self.rooms.get_mut(room) else { return };
         let Some(i) = r.index(id) else { return };
+        if !r.members[i].out.is_open() {return;}
         let now = Instant::now();
         let named = r.members[i].named;
         match m.get("t").and_then(Value::as_str) {
-            Some("hi") => hi(r, i, &m, room, k, bin, identities),
+            Some("hi") => {
+                hi(r, i, &m, room, k, bin, identities, &mut self.crews);
+                if r.members[i].named && r.members[i].out.is_open() {
+                    r.members[i].chat_ack=m.get("chatAck").and_then(Value::as_u64)==Some(1);
+                    r.members[i].out.push(0,text_frame(serde_json::json!({"t":"moderation","k":"state","supported":self.moderation.enabled(),"admin":self.moderation.is_admin(r.members[i].owner.as_deref(),&r.members[i].name),"chatAck":true}).to_string()));
+                }
+            },
             Some("pose") if named => pose(r, i, &m, now),
             Some("follow") if named => follow(r, i, &m, now, k),
             Some("physics") if named => {
@@ -958,17 +1157,43 @@ impl Relay {
                 if let Some(text) = m.get("text").and_then(Value::as_str) {
                     let cleaned: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
                     let text = js_slice(js_trim(&cleaned), 120);
-                    if !text.is_empty() && r.members[i].allow(Limit::Chat, now) {
+                    let muted=self.moderation.muted(r.members[i].owner.as_deref(),&r.members[i].name,crate::crews::now());
+                    let error=if muted.is_some(){Some("muted")}else if crate::moderation::profane(text){Some("profanity")}else{None};
+                    if let Some(error)=error {
+                        r.members[i].out.push(0,text_frame(serde_json::json!({"t":"chat","id":id,"error":error,"until":muted}).to_string()));return;
+                    }
+                    if m.get("to").is_some() {
+                        let target = m.get("to").and_then(Value::as_u64).and_then(|to| {
+                            r.members.iter().position(|p| p.id as u64 == to && p.id != id && p.named && p.out.is_open())
+                        });
+                        if let Some(target) = target.filter(|_| !text.is_empty()) {
+                            if r.members[i].allow(Limit::Chat, now) {
+                                let msg = text_frame(serde_json::json!({"t":"chat", "id":id, "to":r.members[target].id,
+                                    "targetName":r.members[target].name, "text":text}).to_string());
+                                r.members[target].out.push(0, msg.clone());
+                                r.members[i].out.push(0, msg);
+                            } else {
+                                r.members[i].out.push(0, text_frame(serde_json::json!({"t":"chat","id":id,"error":"undelivered"}).to_string()));
+                            }
+                        } else {
+                            r.members[i].out.push(0, text_frame(serde_json::json!({"t":"chat","id":id,"error":"undelivered"}).to_string()));
+                        }
+                    } else if !text.is_empty() && r.members[i].allow(Limit::Chat, now) {
                         let msg = text_frame(format!(r#"{{"t":"chat","id":{id},"text":{}}}"#, json_str(text)));
                         for p in &r.members {
                             if p.id != id && p.named && p.out.is_open() {
                                 p.out.push(0, msg.clone());
                             }
                         }
+                        if r.members[i].chat_ack {r.members[i].out.push(0,text_frame(serde_json::json!({"t":"chat","id":id,"text":text,"ack":true}).to_string()));}
                     }
                 }
             }
             Some("crew") if named => {
+                if protected {
+                    r.members[i].out.push(0,text_frame(serde_json::json!({"t":"crew","id":id,"crew":r.members[i].crew,"crewId":r.members[i].crew_id}).to_string()));
+                    return;
+                }
                 if m.get("crew").is_some_and(Value::is_string) && r.members[i].allow(Limit::Crew, now) {
                     // A player changing crew while driving; everyone else, and the sender, learn the cleaned name.
                     let p = &mut r.members[i];
@@ -1044,6 +1269,18 @@ fn follow(room: &mut Room, i: usize, m: &Map<String, Value>, now: Instant, k: us
 /// the room, the sender too, so a "go" reaches every player, its host included, the same way. k is
 /// a lowercase word of 1-12 letters; the other fields pass as they came, but never another t or id.
 fn race(members: &mut [Member], i: usize, m: &Map<String, Value>, bytes: usize, now: Instant) {
+    if members[i].protected && m.get("k").and_then(Value::as_str) == Some("encounter") {
+        // Gate admission, not an already accepted event's progress or teardown.
+        // The encounter client validates the peer and session for those records.
+        let admission = matches!(m.get("op").and_then(Value::as_str), Some("cap" | "offer" | "accept" | "pick" | "commit" | "ready" | "go"));
+        let p = &members[i];
+        if admission {
+            if !p.crew_client || p.crew_id.is_none() { return; }
+            if let Some(to) = m.get("to").and_then(Value::as_u64) {
+                if !members.iter().any(|q| q.id == to && q.crew_client && q.crew_id.is_some() && q.crew_id != p.crew_id) { return; }
+            }
+        }
+    }
     let kind_ok = m
         .get("k")
         .and_then(Value::as_str)
@@ -1228,7 +1465,16 @@ fn look(room: &mut Room, i: usize, m: &Map<String, Value>, now: Instant) {
     }
 }
 
-fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, bin: usize, identities: &Mutex<Claims>) {
+fn hi(
+    room: &mut Room,
+    i: usize,
+    m: &Map<String, Value>,
+    name: &str,
+    k: usize,
+    bin: usize,
+    identities: &Mutex<Claims>,
+    crews: &mut crate::crews::Crews,
+) {
     let members = &mut room.members;
     let id = members[i].id;
     // JSON objects can shadow toString/valueOf in the Node relay, so it never coerces client
@@ -1241,8 +1487,28 @@ fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, b
         members[i].out.finish(Some(ws::close_frame(1008, "name protected")));
         return;
     }
-    members[i].crew = label(m.get("crew"), "", 16);
-    members[i].crew_key = crew_key(&members[i].crew);
+    members[i].protected = crews.enabled();
+    members[i].crew_client = m.get("crews").and_then(Value::as_u64) == Some(1);
+    members[i].owner = owner.filter(|o| lock(identities).verified_owner(&members[i].name, o));
+    members[i].account = None;
+    if crews.enabled() {
+        if let Some(owner) = &members[i].owner {
+            match crews.register(owner, &members[i].name) {
+                Ok(account) => members[i].account = Some(account),
+                Err(_) => {
+                    members[i].out.finish(Some(ws::close_frame(1011, "crew storage unavailable")));
+                    return;
+                }
+            }
+        }
+        let membership = members[i].owner.as_deref().and_then(|o| crews.membership(o));
+        members[i].crew_id = membership.as_ref().map(|(id, _)| id.clone());
+        members[i].crew = membership.map(|(_, name)| name).unwrap_or_default();
+        members[i].crew_key = members[i].crew_id.clone().unwrap_or_default();
+    } else {
+        members[i].crew = label(m.get("crew"), "", 16);
+        members[i].crew_key = crew_key(&members[i].crew);
+    }
     let physics = number(m.get("physics"));
     members[i].physics = physics == Some(1.0);
     // Compact poses: a page that reads binary poses says which format (1 now); 0 = JSON only.
@@ -1252,10 +1518,9 @@ fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, b
     members[i].cops = members[i].bin != 0 && number(m.get("cops")) == Some(1.0);
     // Driving: controls inside compact poses, so only for a page that also got them.
     members[i].drive = members[i].bin != 0 && number(m.get("drive")) == Some(1.0);
-    let peers: Vec<String> =
-        members.iter().filter(|p| p.id != id && p.named).map(|p| format!("{{{}}}", p.identity())).collect();
+    let peers: Vec<String> = members.iter().filter(|p| p.id != id && p.named).map(|p| format!("{{{}}}", p.identity())).collect();
     let welcome = format!(
-        r#"{{"t":"welcome","id":{id}{}{}{}{}{},"peers":[{}]}}"#,
+        r#"{{"t":"welcome","whispers":1,"id":{id}{}{}{}{}{},"peers":[{}]}}"#,
         if physics == Some(0.0) || physics == Some(1.0) { r#","physics":1"# } else { "" },
         if members[i].bin != 0 { format!(r#","bin":{}"#, members[i].bin) } else { String::new() },
         if members[i].cops { r#","cops":1"# } else { "" },
@@ -1263,7 +1528,25 @@ fn hi(room: &mut Room, i: usize, m: &Map<String, Value>, name: &str, k: usize, b
         if number(m.get("rivals")) == Some(1.0) { r#","rivals":1"# } else { "" },
         peers.join(",")
     );
+    let welcome = if crews.enabled() {
+        let mut v: Value = serde_json::from_str(&welcome).unwrap();
+        v["crews"] = Value::from(1);
+        v["crew"] = Value::from(members[i].crew.clone());
+        v["crewId"] = serde_json::json!(members[i].crew_id);
+        v["account"] = serde_json::json!(members[i].account);
+        v.to_string()
+    } else {
+        welcome
+    };
     members[i].out.push(0, text_frame(welcome));
+    if crews.enabled() {
+        let state = members[i]
+            .owner
+            .as_deref()
+            .map(|o| crews.summary(o))
+            .unwrap_or_else(|| serde_json::json!({"t":"crewstate","account":null,"crew":null,"pending":0}));
+        members[i].out.push(0, text_frame(state.to_string()));
+    }
     if !members[i].out.is_open() {
         return;
     }

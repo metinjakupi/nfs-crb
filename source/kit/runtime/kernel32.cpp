@@ -1,6 +1,7 @@
 #include <atomic>
 #include "seh.h"
 #include "profile.h"
+#include "critsec.h"
 #include "game_config.h"
 // kernel32.cpp - KERNEL32 shims: heap, files, modules, TLS, sync objects,
 // time and the string/locale helpers the CRT startup calls.
@@ -1522,7 +1523,9 @@ static uint32_t native_frame_clock(X86 *c) {
     if (caller != RECOMP_HOOK_FRAME_CLOCK_BEGIN && caller != RECOMP_HOOK_FRAME_CLOCK_WAIT &&
         caller != RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP)
         return 0;
-    if (recomp_env("PIN_CLOCK"))
+    // Pinned (at boot, or part-way through: host_request_pinned_clock), the guest's own waits
+    // run on the pin.
+    if (recomp_env("PIN_CLOCK") || host_time_source_is_pinned())
         return 0;
     const int requested = mods_display_fps();
     if (caller == RECOMP_HOOK_FRAME_CLOCK_BEGIN) { // before 1000 / DrawFrameRateLimit
@@ -1722,23 +1725,17 @@ void k_QueryPerformanceCounter(X86 *c) {
     set_eax(c, 1);
 }
 
+// Host atomics (x86.h, recomp_lock_*): a guest thread running free beside the baton
+// holder may touch the same word with a LOCK instruction. Increment and Decrement return
+// the new value, Exchange the old one, as Windows does.
 void k_InterlockedIncrement(X86 *c) {
-    uint32_t p = arg(c, 0);
-    uint32_t v = rd32(p) + 1;
-    wr32(p, v);
-    set_eax(c, v);
+    set_eax(c, recomp_lock_xadd32(arg(c, 0), 1u) + 1u);
 }
 void k_InterlockedDecrement(X86 *c) {
-    uint32_t p = arg(c, 0);
-    uint32_t v = rd32(p) - 1;
-    wr32(p, v);
-    set_eax(c, v);
+    set_eax(c, recomp_lock_xadd32(arg(c, 0), 0xffffffffu) - 1u);
 }
 void k_InterlockedExchange(X86 *c) {
-    uint32_t p = arg(c, 0), v = arg(c, 1);
-    uint32_t old = rd32(p);
-    wr32(p, v);
-    set_eax(c, old);
+    set_eax(c, recomp_lock_xchg32(arg(c, 0), arg(c, 1)));
 }
 
 // CRITICAL_SECTION is 24 bytes. The fields the guest can read are kept where
@@ -1756,11 +1753,13 @@ void k_InitializeCriticalSection(X86 *c) {
 }
 void k_EnterCriticalSection(X86 *c) {
     imports_call_leaves_surfaces();
+    profile_note_lock(arg(c, 0));
     sched_enter_critsec(arg(c, 0));
     set_eax(c, 0);
 }
 void k_TryEnterCriticalSection(X86 *c) {
     imports_call_leaves_surfaces();
+    profile_note_lock(arg(c, 0));
     set_eax(c, sched_try_critsec(arg(c, 0)) ? 1 : 0);
 }
 void k_LeaveCriticalSection(X86 *c) {
@@ -1990,6 +1989,10 @@ bool g_exit_requested = false; // a guest thread called ExitProcess
 uint32_t g_exit_requested_code = 0;
 uint32_t g_next_thread_id = 2; // 1 is the main thread
 __thread size_t t_self = 0;    // this host thread's index in threads()
+// This host thread's guest thread, for the baton-free shims: set where a worker starts, so
+// they need not index threads(), which the baton holder may grow meanwhile. Null on the main
+// thread, which never runs free.
+__thread GuestThread *t_me = nullptr;
 // Guest-thread identity is REGISTERED, never inferred. t_self is a
 // __thread size_t defaulting to 0, so an unregistered host thread asking
 // "am I a guest thread?" would answer by claiming to be threads()[0]. This
@@ -2567,20 +2570,36 @@ const uint32_t CS_OFF_LOCK_COUNT = 4; // -1 unowned, else recursion - 1
 const uint32_t CS_OFF_RECURSION = 8;
 const uint32_t CS_OFF_OWNER = 12; // owning thread id, 0 unowned
 
+// Threads waiting in the scheduler for a section another thread holds. A leave that frees a
+// section reads it after clearing the owner word, a waiter adds itself before its last try, and both
+// are sequentially consistent: so either the waiter's try finds the section free or the leaver sees
+// the waiter and notifies. Counted, not per section: contention is rare, an extra notify is cheap.
+std::atomic<int> g_critsec_waiters{0};
+
 bool critsec_available(uint32_t cs, uint32_t tid) {
     if (!cs || !gm_valid(cs, 24))
         return true;
-    uint32_t owner = rd32(cs + CS_OFF_OWNER);
+    uint32_t owner = critsec::atomic_ok(cs) ? critsec::owner(cs) : rd32(cs + CS_OFF_OWNER);
     return owner == 0 || owner == tid;
 }
 
-void critsec_take(uint32_t cs, uint32_t tid) {
+// Takes the section for `tid` if it is free or already `tid`'s; false when another thread holds it.
+// A section the atomics can serve is taken with them (critsec.h), so this agrees with the
+// uncontended Enter and Leave that run without g_sched_m. Any other is taken as before, by a
+// caller holding g_sched_m.
+bool critsec_take(uint32_t cs, uint32_t tid) {
     if (!cs || !gm_valid(cs, 24))
-        return;
-    uint32_t rec = rd32(cs + CS_OFF_OWNER) == tid ? rd32(cs + CS_OFF_RECURSION) : 0;
+        return true;
+    if (critsec::atomic_ok(cs))
+        return critsec::try_take(cs, tid);
+    uint32_t owner = rd32(cs + CS_OFF_OWNER);
+    if (owner != 0 && owner != tid)
+        return false;
+    uint32_t rec = owner == tid ? rd32(cs + CS_OFF_RECURSION) : 0;
     wr32(cs + CS_OFF_OWNER, tid);
     wr32(cs + CS_OFF_RECURSION, rec + 1);
     wr32(cs + CS_OFF_LOCK_COUNT, rec); // LockCount is recursion - 1
+    return true;
 }
 
 // Caller holds g_sched_m.  Can this blocked thread's wait complete now?  If it
@@ -2611,9 +2630,9 @@ bool sched_satisfy_locked(GuestThread *t) {
             t->wait_result = (ab ? 0x80u : 0u) + hit;
         }
     } else if (t->wait_kind == W_CRITSEC) {
-        if (!critsec_available(t->wait_cs, t->id))
+        if (!critsec_take(t->wait_cs, t->id))
             return false;
-        critsec_take(t->wait_cs, t->id);
+        g_critsec_waiters.fetch_sub(1, std::memory_order_seq_cst);
         t->wait_result = 0;
     } else if (t->wait_kind == W_NONE && t->has_deadline) {
         return false; // a plain sleep: only time releases it
@@ -3214,6 +3233,23 @@ bool sched_free_running() {
     return t_free_run;
 }
 
+// Parallel guest threads (RECOMP_SCHED=parallel, win32.h): every guest thread but the
+// main one runs its guest code free all the time, as the game's threads ran on Windows,
+// and takes the baton only for an import or a mod hook. The main thread keeps it while
+// it runs, so its many graphics calls stay as they are, and hands it over at its next
+// import whenever another thread asks (g_baton_wanted).
+bool sched_parallel() {
+    static const bool on = [] {
+        const char *e = recomp_env("SCHED");
+        return e && !strcmp(e, "parallel");
+    }();
+    return on;
+}
+void sched_parallel_rejoin() {
+    if (sched_parallel() && !t_free_run && t_is_guest && t_self != 0)
+        sched_free_run_enter(0xffffffffu);
+}
+
 // RECOMP_AUDIO_STATS=1 (dsound.cpp's sound check) also logs, every 5 s, how long free-run
 // threads waited for the baton when they came back: the cost free run adds to the mixer.
 static void free_run_stats(uint64_t waited_ns) {
@@ -3260,7 +3296,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_sched_report(void) {
         for (uint32_t k = 0; k < t->wait_n && k < MAXIMUM_WAIT_OBJECTS_; ++k)
             fprintf(stderr, " %08x", t->wait_h[k]);
         if (t->wait_kind == W_CRITSEC)
-            fprintf(stderr, " cs %08x", t->wait_cs);
+            fprintf(stderr, " cs %08x owner %u rec %u lock %08x", t->wait_cs,
+                    gm_valid(t->wait_cs, 24) ? rd32(t->wait_cs + CS_OFF_OWNER) : 0u,
+                    gm_valid(t->wait_cs, 24) ? rd32(t->wait_cs + CS_OFF_RECURSION) : 0u,
+                    gm_valid(t->wait_cs, 24) ? rd32(t->wait_cs + CS_OFF_LOCK_COUNT) : 0u);
         fprintf(stderr, "\n");
     }
     const uint32_t n = g_handoff_count < 16 ? g_handoff_count : 16;
@@ -3497,9 +3536,13 @@ uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_
 
 void sched_enter_critsec(uint32_t cs) {
     GuestThread *me = cur_thread();
+    // Uncontended (nearly always): one compare-exchange, no scheduler.
+    if (critsec::atomic_ok(cs) && critsec::try_take(cs, me->id))
+        return;
     g_sched_m.lock();
-    if (critsec_available(cs, me->id)) {
-        critsec_take(cs, me->id);
+    g_critsec_waiters.fetch_add(1, std::memory_order_seq_cst);
+    if (critsec_take(cs, me->id)) {
+        g_critsec_waiters.fetch_sub(1, std::memory_order_seq_cst);
         g_sched_m.unlock();
         return;
     }
@@ -3514,10 +3557,10 @@ void sched_enter_critsec(uint32_t cs) {
 
 bool sched_try_critsec(uint32_t cs) {
     GuestThread *me = cur_thread();
+    if (critsec::atomic_ok(cs))
+        return critsec::try_take(cs, me->id);
     g_sched_m.lock();
-    bool got = critsec_available(cs, me->id);
-    if (got)
-        critsec_take(cs, me->id);
+    bool got = critsec_take(cs, me->id);
     g_sched_m.unlock();
     return got;
 }
@@ -3526,6 +3569,23 @@ void sched_leave_critsec(uint32_t cs) {
     if (!cs || !gm_valid(cs, 24))
         return;
     GuestThread *me = cur_thread();
+    if (critsec::atomic_ok(cs)) {
+        const critsec::Left left = critsec::leave(cs, me->id);
+        if (left == critsec::Left::NotOwner) {
+            log_once("critsec-not-owner",
+                     "LeaveCriticalSection(%08x) from thread %u, which does not own it", cs, me->id);
+            return;
+        }
+        // Somebody waits in the scheduler: as before, a baton holder leaves the handoff to recheck
+        // the section; any other thread (one running free) wakes the waiters now.
+        if (left == critsec::Left::Freed && g_critsec_waiters.load(std::memory_order_seq_cst) > 0) {
+            g_sched_m.lock();
+            if (g_baton != me->index)
+                sched_notify_all_locked();
+            g_sched_m.unlock();
+        }
+        return;
+    }
     g_sched_m.lock();
     if (rd32(cs + CS_OFF_OWNER) != me->id) {
         // Leaving a section this thread does not own is a guest bug; Windows
@@ -3588,6 +3648,7 @@ void thread_run_exit_cleanup(GuestThread *t) {
 void *thread_host_main(void *arg) {
     GuestThread *t = (GuestThread *)arg;
     t_self = t->index;
+    t_me = t;
     t_is_guest = true;
     t_ctx = &t->ctx;
     t_id = t->id;
@@ -3628,10 +3689,13 @@ void *thread_host_main(void *arg) {
         param = t->param;
     }
     uint32_t result = 0;
-    if (setjmp(t->exit_jmp) == 0)
+    if (setjmp(t->exit_jmp) == 0) {
+        sched_parallel_rejoin(); // RECOMP_SCHED=parallel: the body runs free
         result = guest_call(&t->ctx, start, param);
-    else
+    } else
         result = t->exit_code;
+    // Back to the baton for the end (an ExitThread import arrives holding it already).
+    sched_free_run_leave();
 
     // Before anything is published: this thread still holds the baton here.
     thread_run_exit_cleanup(t);
@@ -5376,6 +5440,130 @@ void k_SleepEx(X86 *c) {
     set_eax(c, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Baton-free versions (imports.h ImportFreeShim), for a guest thread running free. Each
+// touches only the calling thread's own state (t_me), host atomics, or a clock read with no
+// side effect, and returns false, having changed nothing, when the call needs the baton: a
+// critical section another thread owns is waited for in the scheduler as before.
+// ---------------------------------------------------------------------------
+namespace {
+bool kf_EnterCriticalSection(X86 *c) {
+    const uint32_t cs = arg(c, 0);
+    if (!t_me || !critsec::atomic_ok(cs) || !critsec::try_take(cs, t_me->id))
+        return false;
+    profile_note_lock(cs);
+    set_eax(c, 0);
+    return true;
+}
+bool kf_TryEnterCriticalSection(X86 *c) {
+    const uint32_t cs = arg(c, 0);
+    if (!t_me || !critsec::atomic_ok(cs))
+        return false;
+    profile_note_lock(cs);
+    set_eax(c, critsec::try_take(cs, t_me->id) ? 1 : 0);
+    return true;
+}
+bool kf_LeaveCriticalSection(X86 *c) {
+    const uint32_t cs = arg(c, 0);
+    // Not this thread's: the ordinary shim says so, once.
+    if (!t_me || !critsec::atomic_ok(cs) || critsec::owner(cs) != t_me->id)
+        return false;
+    // A thread running free holds no baton, so it wakes the waiters itself
+    // (sched_leave_critsec).
+    if (critsec::leave(cs, t_me->id) == critsec::Left::Freed &&
+        g_critsec_waiters.load(std::memory_order_seq_cst) > 0) {
+        g_sched_m.lock();
+        sched_notify_all_locked();
+        g_sched_m.unlock();
+    }
+    set_eax(c, 0);
+    return true;
+}
+bool kf_TlsGetValue(X86 *c) {
+    if (!t_me)
+        return false;
+    const uint32_t i = arg(c, 0);
+    set_eax(c, i < TLS_SLOTS ? rd32(t_me->tls + 4 * i) : 0);
+    return true;
+}
+bool kf_TlsSetValue(X86 *c) {
+    if (!t_me)
+        return false;
+    const uint32_t i = arg(c, 0);
+    if (i < TLS_SLOTS)
+        wr32(t_me->tls + 4 * i, arg(c, 1));
+    set_eax(c, i < TLS_SLOTS ? 1 : 0);
+    return true;
+}
+bool kf_GetCurrentThreadId(X86 *c) {
+    if (!t_me)
+        return false;
+    set_eax(c, t_me->id);
+    return true;
+}
+bool kf_InterlockedIncrement(X86 *c) {
+    k_InterlockedIncrement(c);
+    return true;
+}
+bool kf_InterlockedDecrement(X86 *c) {
+    k_InterlockedDecrement(c);
+    return true;
+}
+bool kf_InterlockedExchange(X86 *c) {
+    k_InterlockedExchange(c);
+    return true;
+}
+bool kf_QueryPerformanceFrequency(X86 *c) {
+    k_QueryPerformanceFrequency(c);
+    return true;
+}
+bool kf_QueryPerformanceCounter(X86 *c) {
+    uint32_t now;
+    if (!host_millis_quiet(&now))
+        return false;
+    const uint32_t p = arg(c, 0);
+    if (p) {
+        const uint64_t ticks = (uint64_t)now * 1000ull;
+        wr32(p, (uint32_t)ticks);
+        wr32(p + 4, (uint32_t)(ticks >> 32));
+    }
+    set_eax(c, 1);
+    return true;
+}
+// Nobody waits on a thread running free, so it sleeps on its own host thread instead of
+// in the scheduler. Not INFINITE, not with a sleep trace (that is the main thread's), and
+// not once the process is exiting: the scheduler ends the thread there.
+bool kf_Sleep(X86 *c) {
+    const uint32_t ms = arg(c, 0);
+    if (!t_me || ms == 0xffffffffu || g_exit_requested || sleep_trace_on())
+        return false;
+    os_sleep_us(ms ? (uint64_t)ms * 1000ull : 0);
+    set_eax(c, 0);
+    return true;
+}
+bool kf_SleepEx(X86 *c) {
+    return kf_Sleep(c); // no APCs are ever queued (k_SleepEx); EAX 0 either way
+}
+} // namespace
+
+const ImportFreeShim g_kernel32_free_shims[] = {
+    {"KERNEL32.dll", "EnterCriticalSection", kf_EnterCriticalSection},
+    {"KERNEL32.dll", "TryEnterCriticalSection", kf_TryEnterCriticalSection},
+    {"KERNEL32.dll", "LeaveCriticalSection", kf_LeaveCriticalSection},
+    {"KERNEL32.dll", "TlsGetValue", kf_TlsGetValue},
+    {"KERNEL32.dll", "TlsSetValue", kf_TlsSetValue},
+    {"KERNEL32.dll", "GetCurrentThreadId", kf_GetCurrentThreadId},
+    {"KERNEL32.dll", "InterlockedIncrement", kf_InterlockedIncrement},
+    {"KERNEL32.dll", "InterlockedDecrement", kf_InterlockedDecrement},
+    {"KERNEL32.dll", "InterlockedExchange", kf_InterlockedExchange},
+    {"KERNEL32.dll", "QueryPerformanceFrequency", kf_QueryPerformanceFrequency},
+    {"KERNEL32.dll", "QueryPerformanceCounter", kf_QueryPerformanceCounter},
+    {"KERNEL32.dll", "Sleep", kf_Sleep},
+    {"KERNEL32.dll", "SleepEx", kf_SleepEx},
+};
+const size_t g_kernel32_free_shim_count =
+    sizeof(g_kernel32_free_shims) / sizeof(g_kernel32_free_shims[0]);
+
 const ImportShim g_kernel32_shims[] = {
     // Serial-port ABI only; these unavailable-device calls still log and return FALSE.
     // Counts follow the Win32 stdcall declarations, including OVERLAPPED pointers.
@@ -5600,3 +5788,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetLocaleInfoW", 4, k_GetLocaleInfoW},
 };
 const size_t g_kernel32_shim_count = sizeof(g_kernel32_shims) / sizeof(g_kernel32_shims[0]);
+
+// The guest thread id, for the runtime's thread map (profile.cpp).
+extern "C" uint32_t recomp_guest_thread_id() {
+    return cur_thread_id();
+}

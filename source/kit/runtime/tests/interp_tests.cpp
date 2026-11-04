@@ -23,8 +23,15 @@ uint8_t *g_mem;
 // x86.h's stores record.
 RecompDirty g_dirty[RECOMP_DIRTY_SLOTS];
 uint32_t g_dirty_count;
-uint32_t g_watch_base, g_watch_len; // the memory watch, never armed here
-extern "C" void recomp_watch_hit(uint32_t, uint32_t, uint64_t) {}
+uint32_t g_watch_base, g_watch_len;
+struct WatchedWrite {
+    uint32_t address, size;
+    uint64_t value;
+};
+static std::vector<WatchedWrite> g_writes;
+extern "C" void recomp_watch_hit(uint32_t address, uint32_t size, uint64_t value) {
+    g_writes.push_back({address, size, value});
+}
 
 // The interpreter tests link neither cpu.cpp nor a guest with handlers, so a
 // null dereference has nowhere to raise to: report it and stop, which is what
@@ -47,12 +54,24 @@ static int g_checks = 0, g_failures = 0;
 const uint32_t CODE = 0x01000000, HELPER = 0x01001000, DATA = 0x02000000, STACK = 0x0e000000;
 const uint32_t NATIVE = 0x00401000, RETURN = 0x00400ff0;
 static uint32_t g_native_arg = 0, g_native_calls = 0;
+static bool g_observe_native = false;
+static X86 g_native_entry;
+static uint32_t g_native_return;
 
 // The generated table's stand-in: NATIVE is a "translated" cdecl function
 // that returns its argument plus one; heap addresses go to the interpreter.
 extern "C" void recomp_call(X86 *c, uint32_t target) {
     if (target == NATIVE) {
         ++g_native_calls;
+        if (g_observe_native) {
+            g_native_entry = *c;
+            g_native_return = rd32(c->r[R_ESP]);
+            // Deliberately change a pointer and flags. The caller must see
+            // the actual callee state, not cached pre-call values.
+            c->r[R_ESI] += 4;
+            c->eflags_cf = c->eflags_of = c->eflags_sf = 1;
+            c->eflags_zf = c->eflags_af = c->eflags_pf = 0;
+        }
         g_native_arg = rd32(c->r[R_ESP] + 4);
         c->r[R_EAX] = g_native_arg + 1;
         c->eip = rd32(c->r[R_ESP]);
@@ -264,6 +283,156 @@ static void test_step_budget() {
     CHECK(c.r[R_EAX] == 8 && c.eip == RETURN);
 }
 
+static void copy_word(std::vector<uint8_t> &code, bool store, int32_t displacement) {
+    code.push_back(store ? 0x89 : 0x8b);
+    code.push_back(0x86); // EAX <-> [ESI+disp32]
+    for (unsigned i = 0; i < 4; ++i)
+        code.push_back(uint8_t(uint32_t(displacement) >> (8 * i)));
+}
+
+static void test_parameter_copy_runs() {
+    // Copy raw bits in order, including reading a word written earlier in the
+    // same run. MOV must retain flags and the normal write notifications.
+    std::vector<uint8_t> code = {0x8b, 0x06, 0x89, 0x46, 0x04, 0x8b,
+                                 0x46, 0x04, 0x89, 0x46, 0x08, 0xc3};
+    put(CODE, code);
+    X86 c = fresh();
+    c.r[R_ESI] = DATA;
+    c.eflags_cf = c.eflags_of = c.eflags_sf = c.eflags_af = 1;
+    wr32(c.r[R_ESP], RETURN);
+    wr32(DATA, 0x7fc01234);
+    g_dirty_count = 1;
+    g_dirty[0] = {DATA, 64, UINT32_MAX, 0};
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(c.r[R_EAX] == 0x7fc01234 && rd32(DATA + 4) == 0x7fc01234 && rd32(DATA + 8) == 0x7fc01234);
+    CHECK(c.eflags_cf && c.eflags_of && c.eflags_sf && c.eflags_af && !c.eflags_zf && !c.eflags_pf);
+    CHECK(g_dirty[0].lo == DATA + 4 && g_dirty[0].hi == DATA + 12);
+    CHECK(c.eip == RETURN && c.r[R_ESP] == STACK - 0x100 + 4);
+    g_dirty_count = 0;
+
+    // Reusing executable memory must rebuild the plan, not reuse its old
+    // destination. The later read still observes the untouched old word.
+    code[4] = 12;
+    put(CODE, code);
+    wr32(DATA, 0x13572468);
+    wr32(DATA + 4, 0x77777777);
+    c = fresh();
+    c.r[R_ESI] = DATA;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(rd32(DATA + 12) == 0x13572468 && rd32(DATA + 4) == 0x77777777 &&
+          rd32(DATA + 8) == 0x77777777);
+
+    // Jump directly into the middle of a copy run. The skipped load and
+    // store must not execute, even though they are in the decoded routine.
+    put(CODE, {0xeb, 0x05, 0x8b, 0x06, 0x89, 0x46, 0x04, 0x89, 0x46, 0x08, 0x89, 0x46, 0x0c, 0xc3});
+    c = fresh();
+    c.r[R_ESI] = DATA;
+    c.r[R_EAX] = 0xfeedbeef;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(rd32(DATA + 4) == 0x77777777 && rd32(DATA + 8) == 0xfeedbeef &&
+          rd32(DATA + 12) == 0xfeedbeef);
+
+    // A later bad write must retain earlier writes and the same fault/return
+    // boundary. It must not write any bytes beyond the validated arena.
+    code.clear();
+    for (unsigned i = 0; i < 3; ++i)
+        copy_word(code, true, int32_t(i * 4));
+    copy_word(code, true, int32_t(GUEST_SIZE - 2 - DATA));
+    code.push_back(0xc3);
+    put(CODE, code);
+    c = fresh();
+    c.r[R_ESI] = DATA;
+    c.r[R_EAX] = 0x12345678;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(rd32(DATA) == 0x12345678 && rd32(DATA + 4) == 0x12345678 && rd32(DATA + 8) == 0x12345678);
+    CHECK(c.r[R_EAX] == 0 && c.eip == RETURN && c.r[R_ESP] == STACK - 0x100 + 4);
+    CHECK(strstr(interp_last_error(), "write of") != nullptr);
+
+    // Each loop executes 65 original MOVs, INC and JMP. The million-step
+    // budget must stop on the same word, not count a whole run as one step.
+    code.clear();
+    for (unsigned i = 0; i < 65; ++i)
+        copy_word(code, true, int32_t(i * 4));
+    code.push_back(0x40); // inc eax
+    code.push_back(0xe9);
+    const int32_t back = -int32_t(code.size() + 4);
+    for (unsigned i = 0; i < 4; ++i)
+        code.push_back(uint8_t(uint32_t(back) >> (8 * i)));
+    put(CODE, code);
+    c = fresh();
+    c.r[R_ESI] = DATA;
+    c.r[R_EAX] = 1;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    constexpr unsigned complete = (1u << 20) / 67, remainder = (1u << 20) % 67;
+    for (unsigned i = 0; i < 65; ++i)
+        CHECK(rd32(DATA + i * 4) == complete + (i < remainder ? 1u : 0u));
+    char location[32];
+    snprintf(location, sizeof location, "(at %08x)", CODE + remainder * 6);
+    CHECK(strstr(interp_last_error(), location) != nullptr);
+}
+
+static void test_parameter_calls() {
+    // Overflowing ADD must expose all six flags at the call. POP and MOV
+    // after the call must retain the flags and pointer changed by the callee.
+    put(CODE, {0x83, 0xc0, 1, 0x56, 0xe8, 0, 0, 0, 0, 0x59, 0x89, 0x06, 0xc6, 0x46, 4, 0x81, 0x8b,
+               0x06, 0xc3});
+    put_call(CODE + 4, NATIVE);
+    X86 c = fresh();
+    c.r[R_EAX] = UINT32_MAX;
+    c.r[R_ESI] = DATA;
+    wr32(c.r[R_ESP], RETURN);
+    const uint32_t esp = c.r[R_ESP];
+    g_watch_base = DATA;
+    g_watch_len = 16;
+    g_writes.clear();
+    g_observe_native = true;
+    CHECK(interp_call(&c, CODE) == 1);
+    g_observe_native = false;
+    g_watch_len = 0;
+    CHECK(g_native_entry.r[R_EAX] == 0 && g_native_entry.r[R_ESI] == DATA);
+    CHECK(g_native_entry.r[R_ESP] == esp - 8 && g_native_return == CODE + 9);
+    CHECK(g_native_entry.eflags_cf && g_native_entry.eflags_zf && g_native_entry.eflags_af &&
+          g_native_entry.eflags_pf && !g_native_entry.eflags_sf && !g_native_entry.eflags_of);
+    CHECK(c.r[R_ESI] == DATA + 4 && c.r[R_ECX] == DATA && c.r[R_EAX] == DATA + 1);
+    CHECK(c.eflags_cf && c.eflags_of && c.eflags_sf && !c.eflags_zf && !c.eflags_af &&
+          !c.eflags_pf);
+    CHECK(c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+    CHECK(g_writes.size() == 2);
+    if (g_writes.size() == 2) {
+        CHECK(g_writes[0].address == DATA + 4 && g_writes[0].size == 4 &&
+              g_writes[0].value == DATA + 1);
+        CHECK(g_writes[1].address == DATA + 8 && g_writes[1].size == 1 &&
+              g_writes[1].value == 0x81);
+    }
+
+    // Five original instructions per loop. Stop after the final ADD, before
+    // its PUSH/store, even if a compact block spans four of those operations.
+    put(CODE, {0x83, 0xc0, 1, 0x50, 0x59, 0x89, 0x06, 0xeb, 0xf7});
+    c = fresh();
+    c.r[R_ESI] = DATA;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(rd32(DATA) == (1u << 20) / 5);
+    CHECK(strstr(interp_last_error(), "(at 01000003)") != nullptr);
+    CHECK(c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+
+    // A complete byte write at the last guest byte is legal. The following
+    // word read faults; recovery must retain that byte and the prior store.
+    put(CODE, {0x89, 0x06, 0x83, 0xc6, 3, 0xc6, 0x06, 0x7a, 0x8b, 0x06, 0xc3});
+    c = fresh();
+    c.r[R_ESI] = GUEST_SIZE - 4;
+    c.r[R_EAX] = 0x12345678;
+    wr32(c.r[R_ESP], RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(rd32(GUEST_SIZE - 4) == 0x7a345678);
+    CHECK(strstr(interp_last_error(), "read of") != nullptr);
+    CHECK(c.r[R_EAX] == 0 && c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+}
+
 // The state test_interp_unicorn.py mirrors: registers from a fixed table,
 // ESI and EBX pointing into a data page filled with a pattern.
 static int run_hex(const char *hex) {
@@ -304,6 +473,97 @@ extern "C" void watchdog(int) {
 }
 #endif
 
+static void test_pointer_helper_calls() {
+    const uint32_t starts[] = {0, 1, 0xffffffffu, 0x7fffffffu, 0x80000000u, DATA};
+    const int32_t deltas[] = {0, 1, -1, 127, -128, 0x12345678};
+    for (uint32_t start : starts) {
+        for (int32_t delta : deltas) {
+            // Both immediate encodings must expose all ADD flags at CALL.
+            std::vector<uint8_t> code = {0x81, 0xc6, 0, 0, 0, 0,    0x56,
+                                         0xe8, 0,    0, 0, 0, 0x59, 0xc3};
+            if (delta >= -128 && delta <= 127)
+                code = {0x83, 0xc6, uint8_t(delta), 0x56, 0xe8, 0, 0, 0, 0, 0x59, 0xc3};
+            put(CODE, code);
+            const uint32_t call = CODE + (code.size() == 14 ? 7 : 4);
+            if (code.size() == 14)
+                wr32(CODE + 2, uint32_t(delta));
+            put_call(call, NATIVE);
+            X86 c = fresh();
+            const uint32_t esp = c.r[R_ESP], b = uint32_t(delta), res = start + b;
+            c.r[R_ESI] = start;
+            wr32(esp, RETURN);
+            g_observe_native = true;
+            CHECK(interp_call(&c, CODE) == 1);
+            g_observe_native = false;
+            CHECK(!*interp_last_error());
+            CHECK(g_native_arg == res && g_native_return == call + 5);
+            CHECK(g_native_entry.r[R_ESI] == res && g_native_entry.r[R_ESP] == esp - 8);
+            CHECK(g_native_entry.eflags_cf == (uint64_t(start) + b > 0xffffffffu));
+            CHECK(g_native_entry.eflags_of == (((start ^ res) & (b ^ res)) >> 31));
+            CHECK(g_native_entry.eflags_af == (((start ^ b ^ res) >> 4) & 1));
+            CHECK(g_native_entry.eflags_zf == (res == 0));
+            CHECK(g_native_entry.eflags_sf == (res >> 31));
+            CHECK(g_native_entry.eflags_pf == (__builtin_popcount(res & 255) % 2 == 0));
+            CHECK(c.r[R_ESI] == res + 4 && c.r[R_ECX] == res && c.r[R_EAX] == res + 1);
+            CHECK(c.eflags_cf && c.eflags_of && c.eflags_sf && !c.eflags_zf && !c.eflags_af &&
+                  !c.eflags_pf);
+            CHECK(c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+        }
+    }
+    // Enter at PUSH or CALL. The preceding ADD must not run on either path.
+    for (bool at_call : {false, true}) {
+        std::vector<uint8_t> code;
+        if (at_call)
+            code.push_back(0x56);
+        code.insert(code.end(), {0x74, uint8_t(at_call ? 4 : 3), 0x83, 0xc6, 1, 0x56, 0xe8, 0, 0, 0,
+                                 0, 0x59, 0xc3});
+        put(CODE, code);
+        put_call(CODE + (at_call ? 7 : 6), NATIVE);
+        X86 c = fresh();
+        c.r[R_ESI] = DATA;
+        c.eflags_zf = 1;
+        const uint32_t esp = c.r[R_ESP];
+        wr32(esp, RETURN);
+        CHECK(interp_call(&c, CODE) == 1);
+        CHECK(!*interp_last_error());
+        CHECK(g_native_arg == DATA && c.r[R_ESI] == DATA && c.r[R_ECX] == DATA);
+        CHECK(c.eflags_zf && c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+    }
+    // The same total instruction limit stops at each of ADD, PUSH and CALL.
+    for (unsigned prefix : {0u, 1u, 4u}) {
+        std::vector<uint8_t> code(prefix, 0x90);
+        code.insert(code.end(), {0x83, 0xc6, 1, 0x56, 0xe8, 0, 0, 0, 0, 0x59, 0xeb, 0xf4});
+        put(CODE, code);
+        put_call(CODE + prefix + 4, NATIVE);
+        X86 c = fresh();
+        c.r[R_ESI] = DATA;
+        const uint32_t esp = c.r[R_ESP], before = g_native_calls;
+        wr32(esp, RETURN);
+        const uint32_t count = ((1u << 20) - prefix) / 5, remain = ((1u << 20) - prefix) % 5;
+        CHECK(interp_call(&c, CODE) == 1);
+        CHECK(g_native_calls - before == count + (remain >= 3));
+        CHECK(c.r[R_ESI] == DATA + count + (remain >= 1));
+        const uint32_t pc = CODE + prefix + (remain == 0 ? 0 : remain == 1 ? 3 : 4);
+        char expected[32];
+        snprintf(expected, sizeof expected, "(at %08x)", pc);
+        CHECK(strstr(interp_last_error(), expected) != nullptr);
+        CHECK(c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+        CHECK(rd32(esp - 4) == DATA + count + (remain >= 2));
+    }
+    // A nested interpreter consumes the same budget. Outer recovery remains
+    // at the instruction after CALL, with the caller's return intact.
+    put(HELPER, {0xeb, 0xfe});
+    put(CODE, {0x83, 0xc6, 4, 0x56, 0xe8, 0, 0, 0, 0, 0x59, 0xc3});
+    put_call(CODE + 4, HELPER);
+    X86 c = fresh();
+    c.r[R_ESI] = DATA;
+    const uint32_t esp = c.r[R_ESP];
+    wr32(esp, RETURN);
+    CHECK(interp_call(&c, CODE) == 1);
+    CHECK(c.r[R_ESI] == DATA + 4 && c.r[R_ESP] == esp + 4 && c.eip == RETURN);
+    CHECK(strstr(interp_last_error(), "(at 01000009)") != nullptr);
+}
+
 int main(int argc, char **argv) {
     g_mem = (uint8_t *)calloc(GUEST_SIZE, 1);
     if (!g_mem)
@@ -321,6 +581,9 @@ int main(int argc, char **argv) {
     test_tail_call_out();
     test_refusals();
     test_step_budget();
+    test_parameter_copy_runs();
+    test_parameter_calls();
+    test_pointer_helper_calls();
     printf("interp: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

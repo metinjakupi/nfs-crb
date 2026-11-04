@@ -163,6 +163,8 @@ typedef struct RaceShared {
     uint32_t cp, ms; /* checkpoints this lap; the physics clock (mp_ms) of these values */
     uint32_t flow_flags; /* low byte: game flow; 0x100: waiting for measured finishes */
     RaceRow row[RACE_ROWS];
+    uint32_t drift_score; /* v3: banked native drift points, not race progress */
+    uint32_t drift_failed; /* native overboard/too-slow end, not a score loss */
 } RaceShared;
 #define RACE_MAGIC 0x31435243u /* "CRC1" */
 /* The page reads these by offset (web/race.js). */
@@ -170,7 +172,7 @@ _Static_assert(sizeof(RacePeer) == 0x40 && offsetof(RaceShared, page) == 0x0c &&
                    offsetof(RaceShared, page.peers) == 0x60 && offsetof(RaceShared, game_seq) == 0x260 &&
                    offsetof(RaceShared, caught_opts) == 0x278 && offsetof(RaceShared, place) == 0x2a0 &&
                    offsetof(RaceShared, lap_pct) == 0x2c0 && offsetof(RaceShared, row) == 0x2d0 &&
-                   sizeof(RaceShared) == 0x450,
+                   sizeof(RaceShared) == 0x458,
                "RaceShared layout");
 
 typedef struct RaceCar {
@@ -183,7 +185,7 @@ typedef struct RaceCar {
 
 static uint32_t g_race_hooks[12];
 static uint32_t g_race_block, g_race_buf;
-static int g_race_encounter, g_race_aborting;
+static int g_race_encounter, g_race_aborting, g_race_active_seen;
 static int (*g_race_page_source)(RacePage *);
 static void (*g_race_finish_observer)(uint32_t,float);
 static RacePage g_race_page;           /* the last whole copy of the page's part */
@@ -191,6 +193,16 @@ static RaceCar g_race_cars[RACE_PEERS + 1];
 static int g_race_cars_n;
 static uint32_t g_race_session;        /* the session whose race this game launched */
 static uint32_t g_race_launched;       /* the last session launched (never launched twice) */
+static uint32_t g_race_type;
+static int race_is_drift(void);
+static uint32_t race_drift_score(void);
+static int race_drift_failed(void);
+static void race_drift_sync(uint32_t rs);
+static void race_drift_clear(void);
+static void race_drift_results(void);
+static int race_drift_defer_enter(void);
+static int race_drift_waiting(void);
+static void race_drift_finish_local(uint32_t rs,uint32_t player);
 static uint32_t g_race_phase;
 static int g_race_replaying;           /* inside our own call of 007bbed0 */
 static int g_race_no_ai;               /* this race (and its restarts): no AI, no wingman */
@@ -442,10 +454,12 @@ static void race_forget(const char *why) {
             mp_kill(g_race_cars[i].car.simable);
     if (g_race_cars_n || g_race_phase)
         race_log("core.nfsc: race: over (%s)", why);
+    race_drift_clear();
+    g_race_type = 0;
     g_race_cars_n = 0;
     g_race_session = 0;
     g_race_phase = RACE_IDLE;
-    g_race_encounter = g_race_aborting = 0;
+    g_race_encounter = g_race_aborting = g_race_active_seen = 0;
     g_race_loaded_at = 0;
     g_race_finish_sent = 0;
     g_race_result_activity = g_race_result_simable = 0;
@@ -512,7 +526,7 @@ static void race_opponents(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocat
     (void)api;
     (void)inv;
     (void)user;
-    if (g_race_no_ai && cpu->eip > RACE_INIT_RACERS && cpu->eip < RACE_INIT_END)
+    if (g_race_no_ai && ((g_race_page.flags & 4u) || (cpu->eip > RACE_INIT_RACERS && cpu->eip < RACE_INIT_END)))
         cpu->eax = 0;
 }
 
@@ -521,7 +535,7 @@ static void race_wingman(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
     (void)user;
     const uint32_t from = get_u32(cpu->esp);
     if ((g_race_no_ai || (g_race_session && g_race_session == g_race_page.session)) &&
-        (from == RACE_WINGMAN_RET0 || from == RACE_WINGMAN_RET1)) {
+        ((g_race_page.flags & 4u) || from == RACE_WINGMAN_RET0 || from == RACE_WINGMAN_RET1)) {
         api->hook_return(api, cpu, 0, 0);
         return;
     }
@@ -532,6 +546,7 @@ static void race_wingman(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
 static int race_holding(void) {
     if (g_race_phase < RACE_SET_UP || g_race_phase >= RACE_RACING)
         return 0;
+    if(g_race_aborting)return 0;
     if(g_race_encounter)return !g_race_aborting && g_race_page.go != g_race_session;
     if (g_race_loaded_at > 0 && mp_now() - g_race_loaded_at > RACE_HOLD_MAX * 1000.0)
         return 0;
@@ -596,11 +611,14 @@ static uint32_t race_options(uint32_t key, uint32_t *type_out) {
     mp_put(out, 0);
     const uint32_t args[5] = {0xbc3u, out, key, 0xffffffffu, 0xffffffffu};
     mp_call(RACE_DAL_INT, RACE_DAL, args, 5);
-    const uint32_t type = get_u32(out);
+    const uint32_t menu_type = get_u32(out);
+    /* DAL 0xbc3 uses menu categories (drift=5/6), not gameplay types (11/12). */
+    const uint32_t raw = mp_call(0x0061bef0,get_u32(0x00a9828c),&key,1);
+    const uint32_t type = raw ? mp_call(0x006136a0,raw,0,0) : 0xffffffffu;
     const uint32_t zero = 0, profile = mp_call(RACE_PROFILE, get_u32(RACE_FE_DB), &zero, 1);
     if (type_out)
         *type_out = type;
-    return profile && type < 17 ? profile + RACE_QR_BLOCKS + type * 0x28u : 0;
+    return profile && menu_type < 17 && type < 17 ? profile + RACE_QR_BLOCKS + menu_type * 0x28u : 0;
 }
 
 /* The Quick Race Start button: caught while the page hosts. */
@@ -645,6 +663,7 @@ static int race_menu_ready(void) {
 /* From the front end: start the session's race, with the host's options. */
 static void race_launch(void) {
     const RacePage *p = &g_race_page;
+    if (p->flags & 4u) return; /* world-map sessions never launch from the frontend */
     if (!p->launch || p->launch != p->session || p->launch == g_race_launched || !race_menu_ready())
         return;
     g_race_launched = p->launch;
@@ -661,8 +680,9 @@ static void race_launch(void) {
 
     race_forget("a new race");
     g_race_session = p->launch;
+    g_race_type = type;
     g_race_phase = RACE_LAUNCHED;
-    g_race_no_ai = !(p->flags & RACE_KEEP_AI);
+    g_race_no_ai = race_is_drift() || !(p->flags & RACE_KEEP_AI);
     const uint32_t args[2] = {p->launch_key, 7u};
     g_race_replaying = 1;
     mp_call(RACE_START, 0, args, 2);
@@ -709,7 +729,7 @@ static void race_placement(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocat
     (void)inv;
     (void)user;
     const uint32_t simable = get_u32(cpu->esp + 8), player = mp_player();
-    if(g_race_encounter && g_race_aborting) {api->hook_return(api,cpu,0,0);return;}
+    if(g_race_aborting) {api->hook_return(api,cpu,0,0);return;}
     if (g_race_encounter && g_race_session && g_race_session == g_race_page.session) {
         for(int i=0;simable && i<g_race_cars_n;i++)
             if(g_race_cars[i].id && g_race_cars[i].car.simable==simable) {
@@ -725,6 +745,7 @@ static void race_placement(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocat
             if(mine>=0 && race_u8(race_row(rs,(uint32_t)mine)+0x46))
                 g_race_finish_observer(g_race_session,bits_float(get_u32(race_row(rs,(uint32_t)mine)+0x184)));
         }
+        if(race_is_drift())race_drift_finish_local(race_status(),player);
         g_race_result_activity = get_u32(cpu->esp + 4);
         g_race_result_simable = simable;
         race_log("core.nfsc: race: holding local placement %u for shared results", get_u32(cpu->esp + 12));
@@ -758,7 +779,7 @@ static void race_result(uint32_t rs, uint32_t player) {
     }
     const int mine = race_row_of(rs, player + 0x24);
     if (mine < 0 || !race_u8(race_row(rs, (uint32_t)mine) + 0x46)) return;
-    mp_call(RACE_RANK, rs, NULL, 0);
+    if(race_is_drift())race_drift_sync(rs);else mp_call(RACE_RANK, rs, NULL, 0);
     const uint32_t place = get_u32(race_row(rs, (uint32_t)mine) + 0x34);
     const uint32_t args[3] = {g_race_result_activity, g_race_result_simable, place};
     g_race_result_activity = g_race_result_simable = 0;
@@ -993,7 +1014,7 @@ static void race_progress(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocati
         pct = p->pct + p->rate * (float)dt;
         lap_pct = p->lap_pct + p->lap_rate * (float)dt;
         laps = p->laps;
-        cp = p->cp;
+        cp = race_is_drift() ? 0 : p->cp;
     }
     pct = pct < 0 ? 0 : pct > 99.99f ? 99.99f : pct;
     lap_pct = lap_pct < 0 ? 0 : lap_pct > 99.99f ? 99.99f : lap_pct;
@@ -1030,8 +1051,10 @@ static void race_publish(RaceShared *sh, uint32_t rs, uint32_t player) {
      * player entering the front end retains the existing parked-car behavior. */
     if (!racing && !roam && (sh->flow_flags & 0x200u)) racing = 1;
     const int parked = flow == 3 && (sh->flow_flags & 0x800u);
-    sh->flow_flags = flow | (g_race_result_activity ? 0x100u : 0) | 0x400u |
+    sh->flow_flags = flow | ((g_race_result_activity || race_drift_waiting()) ? 0x100u : 0) | 0x400u |
                      (racing ? 0x200u : 0) | ((roam || parked) && !racing ? 0x800u : 0);
+    sh->drift_score = race_drift_score();
+    sh->drift_failed = race_drift_failed();
     sh->session = g_race_session;
     sh->car = player ? mp_model_key(player) : race_menu_ready() ? g_race_car_key : 0;
     sh->loaded = g_race_loaded_at > 0;
@@ -1081,8 +1104,18 @@ static void race_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
     RaceShared *sh = race_shared();
     if (sh)
         race_read_page(sh);
+    if ((g_race_page.flags & 12u) == 12u && g_race_session == g_race_page.session) g_race_aborting = 1;
     const uint32_t rs = race_status(), flow = get_u32(RACE_FLOW), player = mp_player();
-    if (flow == 3 || !rs || ((g_race_phase >= RACE_RACING || (g_race_encounter && g_race_aborting && g_race_phase >= RACE_SET_UP)) && get_u32(rs + 0x6a14) != 1u)) {
+    /* Releasing the loading hold precedes SetActivelyRacing. A world race can
+     * still report roaming in that gap. Observe the active native state before
+     * treating a later roaming state as an exit. */
+    if (rs && g_race_session && get_u32(rs + 0x6a14) == 1u) g_race_active_seen = 1;
+    /* Results also leave play mode 1. Keep ownership until actual free roam. */
+    const int ended = rs && g_race_active_seen && ((g_race_page.flags & 4u)
+        ? !get_u32(rs + 0x6a14) && !get_u32(rs + 0x6a1c)
+        : get_u32(rs + 0x6a14) != 1u);
+    const int abandoned = rs && g_race_aborting && g_race_phase >= RACE_SET_UP && !get_u32(rs + 0x6a1c);
+    if (flow == 3 || !rs || ended || abandoned) {
         /* In the menus, or the race has turned into free roam (play mode 0). */
         if (g_race_cars_n || g_race_phase > RACE_LAUNCHED)
             race_forget(flow == 3 ? "back in the menus" : "left the race");
@@ -1154,6 +1187,7 @@ static void race_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
                      get_u32(race_row(rs, (uint32_t)mine) + 0x34));
         }
     }
+    if(race_is_drift()) {race_drift_sync(rs);race_drift_results();}
     race_result(rs, player);
     if (sh)
         race_publish(sh, rs, player);
@@ -1202,6 +1236,8 @@ static PopModStatus race_hook(uint32_t addr, PopHookFn fn, int32_t mode, int slo
     return s;
 }
 
+#include "drift_race.h"
+
 static void race_install(void) {
     const char *test = getenv("RECOMP_RACE_TEST");
     g_race_test = test && *test ? atoi(test) : 0;
@@ -1235,6 +1271,7 @@ static void race_install(void) {
     race_hook(0x0071b780u, race_view, POP_HOOK_BEFORE, 8);
     race_hook(0x0071b780u, race_view_ready, POP_HOOK_AFTER, 9);
     race_hook(RACE_PLACEMENT, race_placement, POP_HOOK_REPLACE, 11);
+    race_drift_install();
     g_mp_racer = race_owns;
     g_mp_racer_car = race_racer_car;
     if (g_race_test || g_race_pilot)

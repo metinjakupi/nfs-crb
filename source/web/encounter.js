@@ -4,20 +4,19 @@
 (() => {
   if(globalThis.carbonEncounterClient)return;
   globalThis.carbonEncounterClient=true;
-  const VERSION=4, MAGIC=0x314e4343, RP=152, PH={offered:1,selecting:2,chosen:3,running:4,over:5,declined:6,failed:7,prompt:8,accepted:9};
+  const VERSION=5, MAGIC=0x314e4343, RP=152, PH={offered:1,selecting:2,chosen:3,running:4,over:5,declined:6,failed:7,prompt:8,accepted:9};
   let me=0, session=null, command=0, action=0, lastOffer=0, capAt=0, caps=new Map();
   let peopleSource=null,peopleMap=new Map();
   const uint=x=>Number.isInteger(x)&&x>0&&x<=0xffffffff;
   const now=()=>performance.now();
-  const crewKey=value=>window.recompCrewKey?window.recompCrewKey(value):String(value||"").trim().toLowerCase();
-  const rival=id=>{const other=members().get(id);const mine=crewKey(window.recompOnlineState?.crew);const theirs=crewKey(other?.crew);return !!other&&!!mine&&!!theirs&&mine!==theirs;};
+  const rival=id=>{const other=members().get(id);const mine=window.recompOnlineState?.crewId;const theirs=other?.crewId;return !!other&&!!mine&&!!theirs&&mine!==theirs;};
   const members=()=>{const source=window.recompOnlineState?.people;if(source!==peopleSource){peopleSource=source;peopleMap=new Map((source||[]).map(p=>[p.id,p]));}return peopleMap;};
   const send=(op,extra={})=>window.recompOnlineSend?.({t:"race",k:"encounter",v:VERSION,op,...extra});
   const wire=(op,extra={})=>session&&send(op,{s:session.id,to:session.peer,...extra});
   function native() {
     const b=globalThis.carbonEncounterBlock;if(!b)return null;
     const v=new DataView(b.memory.buffer),u=o=>v.getUint32(b.ptr+o,true),f=o=>v.getFloat32(b.ptr+o,true);
-    if(u(0)!==MAGIC||u(4)!==3)return null;
+    if(u(0)!==MAGIC||u(4)!==4)return null;
     const lock=new Int32Array(b.memory.buffer,b.ptr+0x300,1),seq=Atomics.load(lock,0);if(seq&1)return null;
     const g={phase:u(0x304),session:u(0x308),offer:u(0x30c),to:u(0x310),eligible:!!u(0x314),destination:u(0x318),error:u(0x31c),car:u(0x320),
       own:Array.from({length:6},(_,i)=>f(0x324+i*4)),peer:Array.from({length:6},(_,i)=>f(0x33c+i*4)),ownFinish:f(0x354),finishSession:u(0x358),resultWinner:u(0x35c)};
@@ -65,9 +64,10 @@
   function cmd(a){action=a;command=(command+1)>>>0;write();}
   function own(s) {session=s;globalThis.carbonEncounterSession=s.id;dispatchEvent(new CustomEvent("carbon-encounter-session",{detail:true}));write();}
   function make(id,peer,host,car){return {id,peer,host,peerCar:car||0,at:now(),heard:now(),progress:{},lastProgress:0,lastAlive:0,lastFinish:0,lastReady:0};}
-  function cancel(reason="cancelled",notify=true) {
+  function cancel(reason="cancelled",notify=true,dismissed=false) {
     if(!session||session.cancelling||session.clearing)return;
-    if(notify)wire("cancel",{reason});session.cancelling=true;session.cancelAt=now();cmd(3);
+    if(notify)wire(dismissed?"decline":"cancel",{reason});
+    session.cancelling=true;session.cancelAt=now();cmd(dismissed?7:3);
   }
   function clear() {
     session=null;globalThis.carbonEncounterSession=0;action=0;write();
@@ -107,6 +107,7 @@
   }
   function heard(m) {
     if(!m||m.t!=="race"||m.k!=="encounter"||m.v!==VERSION||!uint(m.id))return;
+    const state=window.recompOnlineState;me=uint(state?.me)?state.me:0;
     const active=session;
     if(m.id===me) {
       if(active&&active.host===me&&m.s===active.id&&m.to===active.peer&&active.go) {
@@ -116,6 +117,9 @@
       return;
     }
     if(!members().has(m.id))return;
+    // Capability announcements can arrive while this game's native block is
+    // still loading. Retain them instead of rejecting the first valid offer.
+    if(m.op==="cap"&&uint(m.car)){caps.set(m.id,{at:now(),car:m.car,ready:m.ready===true});return;}
     if(active&&m.id===active.peer&&m.to===me&&m.s===active.id&&active.go&&!active.cancelling&&!active.clearing) {
       if(m.op==="finish"&&finishTime(m.time)) {
         if(active.peerFinish&&!sameTime(active.peerFinish,m.time))return;
@@ -124,21 +128,25 @@
       }
       if(m.op==="result"){active.heard=now();receiveResult(m);return;}
     }
-    const g=native();if(!g)return;
-    if(m.op==="cap"&&uint(m.car)){caps.set(m.id,{at:now(),car:m.car,ready:m.ready===true});return;}
+    const g=native();
     if(m.to!==me||!uint(m.s))return;
     if(m.op==="offer") {
       if(session?.id===m.s&&session.peer===m.id)return;
-      if((g.session&&g.session!==m.s&&!session)||session?.cancelling||session?.clearing){send("decline",{s:m.s,to:m.id});return;}
-      if(!caps.has(m.id)||!rival(m.id)||m.id>me||!g.eligible||(session&&!(session.host===me&&session.peer===m.id&&m.id<me))) {
-        send("decline",{s:m.s,to:m.id});return;
+      if((g?.session&&g.session!==m.s&&!session)||session?.cancelling||session?.clearing){send("cancel",{s:m.s,to:m.id,reason:"busy"});return;}
+      if(!rival(m.id)||m.id>me||!uint(m.car)||(session&&!(session.host===me&&session.peer===m.id&&m.id<me))) {
+        send("cancel",{s:m.s,to:m.id,reason:"not available"});return;
       }
       if(session)wire("cancel",{reason:"crossed offers"});
-      own(make(m.s,m.id,m.id,uint(m.car)?m.car:caps.get(m.id)?.car));cmd(1);return;
+      // A versioned offer with a model is itself a capability announcement.
+      // Waiting for native HUD readiness is not a human choosing Decline.
+      if(!caps.has(m.id))caps.set(m.id,{at:now(),car:m.car,ready:false});
+      own(make(m.s,m.id,m.id,m.car));
+      if(g?.eligible)cmd(1);return;
     }
     const s=session;if(!s||m.s!==s.id||m.id!==s.peer)return;s.heard=now();
-    if(m.op==="cancel"||m.op==="decline"){cancel(m.op,false);return;}
+    if(m.op==="cancel"||m.op==="decline"){cancel(m.op,false,m.op==="decline");return;}
     if(s.cancelling||s.clearing)return;
+    if(!g)return;
     if(m.op==="accept"){s.peerAccepted=true;return;}
     if(m.op==="pick"&&s.host===me&&s.accepted&&s.peerAccepted&&!s.go&&uint(m.destination)&&formation(m.starts)&&uint(m.car)) {
       if(!g.eligible&&!s.launched){cancel("not free roam");return;}
@@ -170,15 +178,17 @@
       if(!session){write();return;}
     }
     if(!offline&&g.car&&now()-capAt>3000){capAt=now();send("cap",{car:g.car,ready:g.phase===0&&g.eligible});}
-    if(!offline&&g.offer!==lastOffer){lastOffer=g.offer;if(g.to&&g.session&&!session){own(make(g.session,g.to,me,caps.get(g.to)?.car));wire("offer",{car:g.car});}}
+    if(!offline&&g.offer!==lastOffer){lastOffer=g.offer;if(g.to&&g.session&&!session){
+      own(make(g.session,g.to,me,caps.get(g.to)?.car));
+      send("cap",{car:g.car,ready:true});wire("offer",{car:g.car});
+    }}
     const s=session;
     if(!s){write();return;}
     if(s.clearing){if(!g.session){clear();return;}if(now()-(s.resetAt||0)>500){s.resetAt=now();cmd(4);}write();return;}
     if(!members().has(s.peer))cancel("player left");
     if(!s.go&&!rival(s.peer))cancel("crews changed");
-    if(s.host!==me&&!s.launched&&g.session!==s.id&&now()-s.at>5000)cancel("encounter unavailable");
-    if(s.host!==me&&!s.launched&&!s.cancelling&&g.session!==s.id&&now()-(s.openAt||0)>500){s.openAt=now();cmd(1);}
-    if(g.session===s.id&&(g.phase===PH.declined||g.phase===PH.failed))cancel("native encounter cancelled");
+    if(s.host!==me&&!s.launched&&!s.cancelling&&g.eligible&&g.session!==s.id&&now()-(s.openAt||0)>500){s.openAt=now();cmd(1);}
+    if(g.session===s.id&&(g.phase===PH.declined||g.phase===PH.failed))cancel("native encounter cancelled",true,g.error===5);
     if(s.cancelling) {
       if(g.phase===PH.declined||g.phase===PH.failed||!g.session||(g.phase===PH.over&&(!r||r.phase===0))) {s.clearing=true;cmd(4);}
       write();return;

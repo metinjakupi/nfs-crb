@@ -139,6 +139,7 @@ typedef struct DrvCar {   /* what this file keeps per car it drives */
     double shift_at, setup_at;
     int setups;           /* attempts in a row that did not give it SuspensionRacer */
     int driven;           /* controls were put in it */
+    int distant;          /* less detail beyond 220 m, restored below 180 m */
 } DrvCar;
 
 static uint32_t g_drv_block;
@@ -394,6 +395,24 @@ static void drive_car(MpCar *c, double play, int late) {
     if (!d)
         return;
     d->frame = g_drv_frame;
+    /* Relay copies retain their body, pose and contacts. Beyond audible close
+     * racing, stop replaying driven effects/rev/gear commands; never touch the
+     * local player, native race racers, police copies or their sound objects. */
+    MpShared *mp = mp_shared();
+    const int native_racer = g_mp_racer_car && g_mp_racer_car(c->simable) == c;
+    if (mp && mp->state == 1 && c->kept && !native_racer) {
+        const MpPose *pose = &c->pose[c->kept - 1];
+        float d2 = 0;
+        for (int k = 0; k < 3; ++k) {
+            const float delta = pose->p[k] - mp->pose.p[k];
+            d2 += delta * delta;
+        }
+        if (isfinite(d2)) {
+            if (!d->distant && d2 > 220.0f * 220.0f) d->distant = 1;
+            else if (d->distant && d2 < 180.0f * 180.0f) d->distant = 0;
+        } else d->distant = 0;
+    } else d->distant = 0;
+    if (d->distant) { drv_release(car, d); return; }
     uint8_t bytes[8];
     DrvCtl ctl;
     const double now = mp_now();

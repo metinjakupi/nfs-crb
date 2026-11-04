@@ -29,6 +29,8 @@
 #include "game_config.h"
 
 #include <deque>
+#include <map>
+#include <mutex>
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -117,6 +119,21 @@ std::vector<uint8_t> &free_run_flags() {
 }
 std::vector<uint8_t> &mod_hooked_flags() {
     static std::vector<uint8_t> v;
+    return v;
+}
+// The callers a function's hooks are limited to (hook_install_at_callsite), so that a call from
+// any other runs the function directly instead of through the dispatch (mods_hook_dispatch):
+// the stance camber hook on _ftol2 serves two callsites, and the game converts a float there
+// some 300,000 times a second. Up to CALLSITE_MAX return addresses, or CALLSITE_ANY when a
+// hook applies to every caller or there are more. Written by publish under the registry lock,
+// the count last with release; sized once, like mod_hooked_flags, before any flag is set.
+constexpr uint8_t CALLSITE_MAX = 4, CALLSITE_ANY = 0xff;
+struct CallsiteFilter {
+    uint8_t n = CALLSITE_ANY;
+    uint32_t pc[CALLSITE_MAX] = {};
+};
+std::vector<CallsiteFilter> &callsite_filters() {
+    static std::vector<CallsiteFilter> v;
     return v;
 }
 bool is_free_run(int32_t index) {
@@ -414,9 +431,106 @@ bool inv_is_live(const PopHookInvocation *inv) {
 }
 } // namespace
 
+static void mods_hook_dispatch_holding(X86 *c, uint32_t index);
+
+// Mod callbacks may touch anything, so they always run holding the baton: a guest thread
+// running free (a free-run function, or any worker under RECOMP_SCHED=parallel) takes it
+// for the whole dispatch and runs free again after.
+// RECOMP_AUDIO_STATS=1: every 5 s, the hooked functions a thread running free called, most
+// frequent first (each one takes the baton for its dispatch).
+static void free_hook_note(uint32_t index) {
+    static const bool on = recomp_env("AUDIO_STATS") != nullptr;
+    if (!on)
+        return;
+    static std::mutex m;
+    static std::map<uint32_t, uint32_t> counts;
+    static uint64_t from = 0;
+    std::lock_guard<std::mutex> g(m);
+    ++counts[recomp_func_addrs[index]];
+    const uint64_t now = os_monotonic_ns();
+    if (!from)
+        from = now;
+    if (now - from < 5000000000ull)
+        return;
+    std::vector<std::pair<uint32_t, uint32_t>> v(counts.begin(), counts.end());
+    std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second > b.second; });
+    char line[512];
+    int n = snprintf(line, sizeof line, "free run: hooked functions taking the baton, last %.1f s:", (now - from) * 1e-9);
+    for (size_t i = 0; i < v.size() && i < 10 && n > 0 && n < (int)sizeof line - 32; ++i)
+        n += snprintf(line + n, sizeof line - n, " %08x %u;", v[i].first, v[i].second);
+    LOGW("%s", line);
+    counts.clear();
+    from = now;
+}
+
+// No hook on this function applies to a call returning to `ret`: its hooks are all limited to
+// other callsites (callsite_filters). RECOMP_HOOK_CALLSITE_FAST=0 (TEST ONLY, for A/B runs) sends
+// every call through the dispatch as before.
+static bool no_hook_for_caller(uint32_t index, uint32_t ret) {
+    static const bool off = [] {
+        const char *e = recomp_env("HOOK_CALLSITE_FAST");
+        return e && !strcmp(e, "0");
+    }();
+    if (off || index >= callsite_filters().size())
+        return false;
+    const CallsiteFilter &f = callsite_filters()[index];
+    const uint8_t n = __atomic_load_n(&f.n, __ATOMIC_ACQUIRE);
+    if (n == CALLSITE_ANY)
+        return false;
+    for (uint8_t k = 0; k < n; ++k)
+        if (__atomic_load_n(&f.pc[k], __ATOMIC_RELAXED) == ret)
+            return false;
+    return true;
+}
+
+static void mods_hook_dispatch(X86 *c, uint32_t index) {
+    // Hooked only for other callers: no callback would run, so the function runs as any guest
+    // code does, on any thread, a thread running free included (it keeps running free).
+    if (no_hook_for_caller(index, gm_valid(c->r[R_ESP], 4) ? rd32(c->r[R_ESP]) : 0u)) {
+        recomp_base_ptrs[index](c);
+        return;
+    }
+    if (RECOMP_UNLIKELY(sched_free_running())) {
+        free_hook_note(index);
+        const uint32_t entry_esp = sched_free_run_leave();
+        mods_hook_dispatch_holding(c, index);
+        if (entry_esp && c->r[R_ESP] < entry_esp)
+            sched_free_run_enter(entry_esp);
+    } else
+        mods_hook_dispatch_holding(c, index);
+    sched_parallel_rejoin();
+}
+
 // Dispatch one guest function through a stable snapshot of its hook chain.
 // Unwind abandoned invocations first; edits made by callbacks affect later calls, not this snapshot.
-static void mods_hook_dispatch(X86 *c, uint32_t index) {
+// RECOMP_HOOK_STATS=1: every 5 s, the hooked functions dispatched and how often (all threads).
+static void hook_stats_note(uint32_t index) {
+    static const bool on = recomp_env("HOOK_STATS") != nullptr;
+    if (!on)
+        return;
+    static std::mutex m;
+    static std::map<uint32_t, uint32_t> counts;
+    static uint64_t from = 0;
+    std::lock_guard<std::mutex> g(m);
+    ++counts[recomp_func_addrs[index]];
+    const uint64_t now = os_monotonic_ns();
+    if (!from)
+        from = now;
+    if (now - from < 5000000000ull)
+        return;
+    std::vector<std::pair<uint32_t, uint32_t>> v(counts.begin(), counts.end());
+    std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second > b.second; });
+    char line[640];
+    int n = snprintf(line, sizeof line, "hooks: dispatched, last %.1f s:", (now - from) * 1e-9);
+    for (size_t i = 0; i < v.size() && i < 14 && n > 0 && n < (int)sizeof line - 32; ++i)
+        n += snprintf(line + n, sizeof line - n, " %08x %u;", v[i].first, v[i].second);
+    LOGW("%s", line);
+    counts.clear();
+    from = now;
+}
+
+static void mods_hook_dispatch_holding(X86 *c, uint32_t index) {
+    hook_stats_note(index);
     // A guest longjmp may have jumped over invocations left on this thread.
     mods_hooks_unwind_to_esp(c->r[R_ESP]);
     if (t_stack.depth >= MODS_MAX_DEPTH) {
@@ -571,6 +685,32 @@ void publish(int32_t index) {
     if (mod_hooked_flags().size() < (size_t)recomp_func_count)
         mod_hooked_flags().resize(recomp_func_count);
     __atomic_store_n(&mod_hooked_flags()[index], (uint8_t)any, __ATOMIC_RELEASE);
+    if (callsite_filters().size() < (size_t)recomp_func_count)
+        callsite_filters().resize(recomp_func_count);
+    {
+        CallsiteFilter &f = callsite_filters()[index];
+        __atomic_store_n(&f.n, CALLSITE_ANY, __ATOMIC_RELEASE);
+        uint8_t n = 0;
+        for (const std::vector<Hook> *chain : {&e.before, &e.after, &e.replace})
+            for (const Hook &h : *chain) {
+                if (!h.return_pc || n == CALLSITE_ANY) {
+                    n = CALLSITE_ANY;
+                    continue;
+                }
+                bool seen = false;
+                for (uint8_t k = 0; k < n; ++k)
+                    seen |= __atomic_load_n(&f.pc[k], __ATOMIC_RELAXED) == h.return_pc;
+                if (seen)
+                    continue;
+                if (n == CALLSITE_MAX) {
+                    n = CALLSITE_ANY;
+                    continue;
+                }
+                __atomic_store_n(&f.pc[n++], h.return_pc, __ATOMIC_RELAXED);
+            }
+        if (any && n != CALLSITE_ANY)
+            __atomic_store_n(&f.n, n, __ATOMIC_RELEASE);
+    }
     if (any || is_free_run(index)) {
         // Pointer first, then the flag, both with release: a call site that
         // sees the flag is guaranteed to see the pointer.

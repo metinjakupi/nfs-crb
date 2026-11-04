@@ -38,7 +38,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde::{Serialize, Serializer};
+use serde_json::Value;
 
 use crate::ea::{user_id, Packet};
 use crate::messenger::KeyDigest;
@@ -221,7 +222,7 @@ impl Stat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct Person {
     name: String,
     /// the first 16 hex digits of the latest browser key's SHA-256, when supplied
@@ -371,6 +372,34 @@ pub struct Stats {
     file: Option<PathBuf>,
 }
 
+// Borrow the live store while encoding its existing version-1 schema. Building a
+// second tree of Values here paused all sockets for hundreds of milliseconds.
+#[derive(Serialize)]
+struct Snapshot<'a> {
+    people: SavedPeople<'a>,
+    version: u8,
+}
+
+struct SavedPeople<'a>(&'a BTreeMap<String, Person>);
+
+impl Serialize for SavedPeople<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().filter(|(_, p)| !p.stats.is_empty()))
+    }
+}
+
+impl Serialize for Stat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Periods<'a>(&'a [(Period, u32, f64, String)]);
+        impl Serialize for Periods<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_seq(self.0.iter().map(|(kind, n, v, t)| (kind.code(), n, v, t)))
+            }
+        }
+        (self.v, &self.t, u8::from(self.low), Periods(&self.p)).serialize(serializer)
+    }
+}
+
 fn low(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -437,24 +466,17 @@ impl Stats {
         }
     }
 
-    fn to_json(&self) -> Value {
-        let mut people = Map::new();
-        for (k, p) in self.people.iter().filter(|(_, p)| !p.stats.is_empty()) {
-            let mut stats = Map::new();
-            for (key, s) in &p.stats {
-                let periods: Vec<Value> = s.p.iter().map(|(kind, n, v, t)| json!([kind.code(), n, v, t])).collect();
-                stats.insert(key.clone(), json!([s.v, s.t, u8::from(s.low), periods]));
-            }
-            people.insert(k.clone(), json!({ "name": p.name, "key": p.key, "seen": p.seen, "stats": stats }));
-        }
-        json!({ "version": 1, "people": people })
-    }
-
     /// Written at once, whole, through a temporary file (a crash leaves the old one).
     fn save(&self) {
         let Some(file) = &self.file else { return };
         let tmp = file.with_extension("json.tmp");
-        let text = serde_json::to_string(&self.to_json()).unwrap_or_default();
+        let text = match serde_json::to_vec(&Snapshot { people: SavedPeople(&self.people), version: 1 }) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("stats: cannot encode {}: {e}", file.display());
+                return;
+            }
+        };
         if let Err(e) = fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, file)) {
             eprintln!("stats: cannot write {}: {e}", file.display());
         }

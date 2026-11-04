@@ -2316,8 +2316,15 @@ bool dirty_open(const ComObj *s) {
     RecompDirty &d = g_dirty[g_dirty_count++];
     d.base = s->pixels;
     d.len = s->pixels_bytes;
+#if RECOMP_GUEST_DIAGNOSTICS
     d.lo = 0xffffffffu;
     d.hi = 0;
+#else
+    // No store reports a range here (x86.h, RECOMP_GUEST_DIAGNOSTICS): the whole surface
+    // counts as written, so the Unlock compares all of it.
+    d.lo = d.base;
+    d.hi = d.base + d.len;
+#endif
     return true;
 }
 // Closes one range a lock opened and says what was written in it. False when

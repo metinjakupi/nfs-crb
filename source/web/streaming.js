@@ -4,6 +4,21 @@
 (() => {
   'use strict';
   if (!window.recompStream) return;
+  const readiness = new BroadcastChannel('recomp-stream'), requests = new Map();
+  const session = Math.random().toString(36).slice(2);
+  let requestId = 0;
+  window.recompStream.waitForModel = key => new Promise(resolve => {
+    const request = session + ':' + (++requestId);
+    const timer = setTimeout(() => { requests.delete(request); resolve(false); }, 1500);
+    requests.set(request, { resolve, timer });
+    readiness.postMessage({ type: 'prefetch-models', keys: [key], request });
+  });
+  readiness.onmessage = ({data}) => {
+    if (data?.type !== 'model-ready') return;
+    const pending = requests.get(data.request);
+    if (!pending) return;
+    clearTimeout(pending.timer); requests.delete(data.request); pending.resolve(data.ready === true);
+  };
   function view(block, magic) {
     if (!block?.memory || !block.ptr) return null;
     const words = new Uint32Array(block.memory.buffer);
@@ -51,6 +66,10 @@
     if (unique.length) window.recompStream.prepareModels(unique);
   }
   const timer = setInterval(prepare, 500);
-  addEventListener('pagehide', () => clearInterval(timer), { once: true });
+  addEventListener('pagehide', () => {
+    clearInterval(timer); readiness.close();
+    for (const pending of requests.values()) { clearTimeout(pending.timer); pending.resolve(false); }
+    requests.clear();
+  }, { once: true });
   prepare();
 })();

@@ -24,6 +24,7 @@ test('prepares stable own, approaching, and race car keys without modifying game
   const context = { Uint32Array, Atomics, Set, Math,
     window: { recompStream: { prepareModels: keys => calls.push(Array.from(keys)) } },
     carbonMpBlock: { memory, ptr: mp }, carbonLookBlock: { memory, ptr: look }, carbonRaceBlock: { memory, ptr: race },
+    BroadcastChannel: class { postMessage() {} close() {} },
     setInterval: fn => { tick = fn; return 1; }, clearInterval: () => { cleared = true; },
     addEventListener: (type, fn) => { if (type === 'pagehide') hidden = fn; },
   };
@@ -35,4 +36,20 @@ test('prepares stable own, approaching, and race car keys without modifying game
   assert.ok(calls[1].includes(0xdeadbeef), 'the completed peer update is now available');
   hidden();
   assert.equal(cleared, true);
+});
+
+test('model readiness accepts only its response and resolves bounded waits on timeout or page exit', async () => {
+  const source = await readFile(new URL('../../source/web/streaming.js', import.meta.url), 'utf8');
+  const channels=[], timers=new Map();let next=0,hidden;
+  const context={window:{recompStream:{prepareModels(){}}},
+    BroadcastChannel:class{constructor(){channels.push(this);}postMessage(m){this.sent=m;}close(){this.closed=true;}},
+    setInterval:()=>99,clearInterval(){},setTimeout:fn=>{timers.set(++next,fn);return next;},clearTimeout:id=>timers.delete(id),
+    addEventListener:(t,fn)=>{if(t==='pagehide')hidden=fn;},Uint32Array,Atomics,Set,Math};
+  vm.runInNewContext(source,context);
+  const channel=channels[0],stream=context.window.recompStream;
+  const first=stream.waitForModel(123);let settled=false;first.then(()=>settled=true);
+  channel.onmessage({data:{type:'model-ready',request:'other-page',ready:true}});await Promise.resolve();assert.equal(settled,false);
+  channel.onmessage({data:{type:'model-ready',request:channel.sent.request,ready:true}});assert.equal(await first,true);
+  const second=stream.waitForModel(456);[...timers.values()][0]();assert.equal(await second,false);
+  const third=stream.waitForModel(789);hidden();assert.equal(await third,false);assert.equal(channel.closed,true);
 });

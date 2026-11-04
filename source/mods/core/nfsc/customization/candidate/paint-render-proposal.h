@@ -85,10 +85,17 @@ static void cust_paint_wheel_begin(uint32_t render,uint32_t wheel,uint32_t model
  const uint32_t solid=get_u32(model+0xcu);if(!solid)return;
  const uint32_t table=get_u32(solid+0x3cu),count=(get_u32(solid+0x18u)>>16u)&255u;
  if(!table||count>127u)return;restore->table=table;restore->count=count;
+ /* Map reads only, and only during this loop. Low addresses keep the
+  * scalar API's optional null-fault behavior. Stores retain wr32 hooks. */
+ void *mapped=NULL;
+ if(count && table>=0x10000u && g_api->guest_ptr(g_api,table,count*8u,&mapped)!=POP_OK)mapped=NULL;
  for(uint32_t i=0;i<count;++i){
-  const uint32_t hash=get_u32(table+i*8u),ptr=get_u32(table+i*8u+4u);restore->values[i]=ptr;
-  if(rim&&hash==cust_hash("MAGLIP"))g_api->guest_write_u32(g_api,table+i*8u+4u,rim);
-  if(paint&&(hash==cust_hash("MAGSILVER")||hash==cust_hash("MAGCHROME")||hash==cust_hash("MAGMATTE")))g_api->guest_write_u32(g_api,table+i*8u+4u,paint);
+  uint32_t hash,ptr;
+  if(mapped){memcpy(&hash,(const unsigned char*)mapped+i*8u,4u);memcpy(&ptr,(const unsigned char*)mapped+i*8u+4u,4u);}
+  else{hash=get_u32(table+i*8u);ptr=get_u32(table+i*8u+4u);}
+  restore->values[i]=ptr;
+  if(rim&&hash==0x6b637059u)g_api->guest_write_u32(g_api,table+i*8u+4u,rim);
+  if(paint&&(hash==0x22719fa9u||hash==0xfd102a92u||hash==0xd20ebc2fu))g_api->guest_write_u32(g_api,table+i*8u+4u,paint);
  }
 }
 static void cust_paint_wheel_end(CustPaintDrawRestore*restore){for(uint32_t i=0;i<restore->count;++i)g_api->guest_write_u32(g_api,restore->table+i*8u+4u,restore->values[i]);}

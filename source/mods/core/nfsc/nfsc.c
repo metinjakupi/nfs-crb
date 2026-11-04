@@ -144,11 +144,13 @@ static void log_line(const char *text) {
 #include "bmw.h" /* local custom BMW boost */
 #include "pursuit.h" /* one police chase shared by friends in free roam (plans/shared-pursuit.md) */
 #include "police.h" /* be the police in free roam (plans/shared-pursuit.md) */
-#include "streetrace.h" /* flash a friend to race to a common GPS finish */
+#include "encounter_support.h" /* shared HUD and compatibility helpers for crew rivals */
 #include "encounter.h" /* native Crew Challenge with online opponents */
+#include "maprace.h"
 #include "ai_fixes.h"
 #include "photo_zoom.h"
 #include "autosculpt.h" /* balance native model buffer locks */
+#include "cockpit.h" /* local driver-seat camera and native wheel animation */
 #include "custom_hud.h" /* local World HUD; original gauges remain the default */
 
 /* ---- the resolution list --------------------------------------------------
@@ -613,12 +615,14 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     bmw_install();
     pursuit_install();
     police_install();
-    streetrace_install();
+    encounter_support_install();
     encounter_install();
+    maprace_install();
     sculpt_install();
     custom_hud_install();
     ai_fixes_install();
     photo_zoom_install();
+    cockpit_install();
     /* Match the effect-render caller patched by XenonEffectFix.ixx, rather
      * than changing blending for every use of this shared setup routine. */
     if (setting("xenon_effects", 1) && api->hook_install_at_callsite &&

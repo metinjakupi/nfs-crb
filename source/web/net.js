@@ -74,12 +74,30 @@
     let relay = "", name = "", crew = "", claim = "", legacy = "", memory = null, ptr = 0, views = null, ws = null, me = 0;
     let latest = null, sentMs = -1, sentMode = -1, sentAt = 0, told = "", ghost = false, hidden = false;
     let physics = false, serverPhysics = false;
+    let whispersOk = false, moderationOk = false, admin = false, chatAckOk = false;
+    let crewsOk = false, crewId = null, account = null;
     // Compact poses (tools/carbon-net-relay.mjs, "Compact poses"): the format this page reads and
     // writes; bin is what the relay's welcome agreed to (0: JSON).
     const BIN = 1, BIN_POSE = 1, BIN_WHERE = 2, POSE_BYTES = 46;
     const SCALE = [32767, 32767, 32767, 32767, 1000, 1000, 1000, 100, 100, 100, 500, 500, 500];
     let bin = 0;
     const players = new Map(); // id -> {id, name, crew, key, mode, heard, slot, at, pos, vel, last}
+    // Prepare a newly announced model before slot selection and native construction.
+    // Bound deduplication; background fetches retain the streamer's two-download limit.
+    const preparedModels = new Map();
+    function prepareModel(key) {
+      key >>>= 0;
+      if (!key || preparedModels.has(key)) return;
+      if (preparedModels.size >= 64) preparedModels.delete(preparedModels.keys().next().value);
+      const record = { at: performance.now(), ready: false };
+      preparedModels.set(key, record);
+      setTimeout(() => {
+        if (preparedModels.get(key) !== record) return;
+        record.ready = true;
+        for (const p of players.values()) if (p.key === key && p.slot >= 0 && p.last && memory) put(p);
+      }, 1500);
+      postMessage({ t: "prepare-model", key });
+    }
     const owners = new Array(SLOTS).fill(0);
     const slotAt = new Array(SLOTS).fill(-Infinity); // when each slot last changed hands
     let self = null;          // this car: {at, vel} from its newest pose
@@ -193,11 +211,12 @@
       const state = {
         open: !!ws && ws.readyState === WebSocket.OPEN,
         names: [...players.values()].filter((p) => p.name).map((p) => p.name),
-        people: [...players].filter(([, p]) => p.name).map(([id, p]) => ({ id, name: p.name, crew: p.crew, activity: p.activity || "unknown" })),
+        people: [...players].filter(([, p]) => p.name).map(([id, p]) => ({ id, name: p.name, crew: p.crew, crewId: p.crewId || null, account: p.account || null, activity: p.activity || "unknown" })),
         slots: owners.map((id) => (id ? players.get(id)?.name || "Player" : "")),
         slotIds: owners.slice(),
         slotModes: owners.map((id) => (id ? players.get(id)?.mode ?? 0 : -1)),
         crew,
+        crewId, account, crewsOk, whispersOk, moderationOk, admin, chatAckOk,
         me, // our relay id (race.js tells its own messages from others' by it)
       };
       const text = JSON.stringify(state);
@@ -254,7 +273,6 @@
     }
 
     // ---- Who gets a slot ----
-    const crewKey = (c) => String(c || "").toLowerCase().replace(/\s+/g, "");
     const capped = (x, y, z) => {
       const n = Math.sqrt(x * x + y * y + z * z);
       return n > TOP_SPEED ? [x * (TOP_SPEED / n), y * (TOP_SPEED / n), z * (TOP_SPEED / n)] : [x, y, z];
@@ -272,8 +290,7 @@
           if (e < d) d = e;
         }
       }
-      const mine = crewKey(crew);
-      return { p, group: racers.has(p.id) || (streetOpp && p.id === streetOpp) ? 0 : mine && crewKey(p.crew) === mine && d <= CREW_NEAR ? 1 : 2, d };
+      return { p, group: racers.has(p.id) || (streetOpp && p.id === streetOpp) ? 0 : crewId && p.crewId === crewId && d <= CREW_NEAR ? 1 : 2, d };
     }
     const order = (a, b) => a.group - b.group || (a.d < b.d ? -1 : a.d > b.d ? 1 : 0) || a.p.id - b.p.id;
     // Whether waiting player w may take holder h's slot: a better group, or clearly nearer.
@@ -282,6 +299,8 @@
     // p's newest pose into its slot.
     function put(p, now = performance.now()) {
       if (!visible(p)) { park(p); return; }
+      const preparing = preparedModels.get(p.key);
+      if (preparing && !preparing.ready && now - preparing.at < 1500) return;
       const l = p.last;
       writeSlot(p.slot, p.id, p.key, p.mode, l.ms, l.s, l.contacts, l.ack, l.drive);
       p.applied = now;
@@ -345,7 +364,7 @@
     // The racers to the relay, when they change (and on each new connection).
     function follow() {
       const ids = [...racers];
-      if (streetOpp && !racers.has(streetOpp) && ids.length < 8) ids.push(streetOpp); // streetrace.h's other player
+      if (streetOpp && !racers.has(streetOpp) && ids.length < 8) ids.push(streetOpp); // compatibility peer (zero with the retired flash race removed)
       const text = JSON.stringify(ids);
       if (!me || ws?.readyState !== WebSocket.OPEN || text === followSent) return;
       followSent = text;
@@ -617,14 +636,23 @@
     }
 
     function receive(m) {
+      if (m.t === "moderation") {
+        if (m.k === "state") {moderationOk = m.supported === true; admin = m.admin === true; chatAckOk = m.chatAck === true; tell();}
+        postMessage({t:"moderation-message",m}); return;
+      }
       if (m.t === "welcome") {
         me = m.id;
+        whispersOk = m.whispers === 1;
+        crewsOk = m.crews === 1;
+        crewId = crewsOk ? m.crewId || null : null;
+        account = crewsOk ? m.account || null : null;
+        crew = crewId ? m.crew || "" : "";
         serverPhysics = m.physics === 1;
         bin = m.bin === 1 ? 1 : 0; // a relay from before compact poses says nothing: JSON
         copsOk = bin === 1 && m.cops === 1; // nor does one from before police chases
         driveOk = bin === 1 && m.drive === 1; // nor one from before driving
         driveLinked();
-        for (const peer of m.peers || []) Object.assign(player(peer.id), { name: peer.name, crew: peer.crew || "", physics: peer.physics === 1 });
+        for (const peer of m.peers || []) Object.assign(player(peer.id), { name: peer.name, crew: crewsOk && peer.crewId ? peer.crew || "" : "", crewId: crewsOk ? peer.crewId || null : null, account: crewsOk ? peer.account || null : null, physics: peer.physics === 1 });
         linked();
         lookDue = !!lookNewest; // a new connection: the relay has not seen this car's look
         lookSentAt = -Infinity;
@@ -632,8 +660,11 @@
         follow();
         activitySent = ""; activityAt = -Infinity; activityOut(true);
       } else if (m.t === "join") {
-        Object.assign(player(m.id), { name: m.name, crew: m.crew || "", physics: m.physics === 1 });
+        Object.assign(player(m.id), { name: m.name, crew: crewsOk && m.crewId ? m.crew || "" : "", crewId: crewsOk ? m.crewId || null : null, account: crewsOk ? m.account || null : null, physics: m.physics === 1 });
         activityOut(true);
+      } else if (m.t === "crewstate" || m.t === "crewctl") {
+        if (crewsOk) postMessage({ t: "crew-message", m });
+        return;
       } else if (m.t === "physics") {
         if (m.id !== me) player(m.id).physics = m.on === true;
       } else if (m.t === "impact") {
@@ -688,19 +719,21 @@
         const p = m.id === me ? null : players.get(m.id);
         postMessage({ t: "msg", m: { ...m, name: m.id === me ? name : p?.name || "Player", crew: m.id === me ? crew : p?.crew || "" } });
         return;
-      } else if ((m.t === "chat" || m.t === "horn") && m.id !== me) {
+      } else if ((m.t === "chat" || m.t === "horn") && (m.id !== me || m.to || m.error || m.ack)) {
         // For the page (chat.js): who, their crew, and where their car last was.
-        const p = player(m.id);
-        postMessage({ t: "msg", m: { ...m, name: p.name || "Player", crew: p.crew, at: p.at } });
+        const p = m.id === me ? {crew, at:null} : player(m.id);
+        postMessage({ t: "msg", m: { ...m, name: m.id === me ? name : p.name || "Player", crew: p.crew, at: p.at } });
         return;
       } else if (m.t === "crew" && typeof m.crew === "string") {
         // A player changed crew while driving (the relay's cleaned name); this
         // player's own change comes back the same way. Others' changes also go
         // to the page as {t:"crew", id, name, crew, was, at}.
-        if (m.id === me) crew = m.crew;
+        if (!crewsOk) return;
+        if (m.id === me) { crewId = m.crewId || null; crew = crewId ? m.crew : ""; }
         else {
           const p = player(m.id), was = p.crew;
-          p.crew = m.crew;
+          p.crewId = m.crewId || null;
+          p.crew = p.crewId ? m.crew : "";
           tell(); // first, so the message finds the room's new colours
           if (p.name && was !== m.crew) postMessage({ t: "msg", m: { t: "crew", id: m.id, name: p.name, crew: m.crew, was, at: p.at } });
           return;
@@ -710,6 +743,7 @@
         let bytes = null;
         try { bytes = typeof m.data === "string" ? Uint8Array.from(atob(m.data), (c) => c.charCodeAt(0)) : null; } catch {}
         if (!bytes || bytes.length > LOOK_SPACE || !Number.isInteger(m.k)) return;
+        prepareModel(m.k);
         looks.set(m.id, { k: m.k >>> 0, bytes });
         lookPut(m.id, m.k, bytes);
         return;
@@ -725,7 +759,7 @@
         pursuitPut(m);
         return;
       } else if (m.t === "street" && m.id !== me) {
-        streetPut(m); // a street race's record (streetrace.h)
+        streetPut(m); // compatibility record; native support refuses retired race starts
         return;
       } else if (m.t === "pong") {
         // The relay's answer to one of this link's pings; it answers in order, so older pings
@@ -750,6 +784,7 @@
           resumed = true;
         }
         const recovered = p.heard > 0 && now - p.heard > POSE_RECOVER_MS;
+        prepareModel(m.k);
         p.key = m.k >>> 0;
         p.mode = m.m | 0;
         p.physics = m.physics === 1;
@@ -795,15 +830,16 @@
     function connect() {
       ws = new WebSocket(relay);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1 })); tell(); };
+      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew: "", crews: 1, chatAck: 1, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1 })); tell(); };
       ws.onmessage = (e) => {
         try {
           const m = typeof e.data === "string" ? JSON.parse(e.data) : unpack(e.data);
           if (m) receive(m);
         } catch (error) { console.warn("[online]", error); }
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         me = 0;
+        whispersOk = false; moderationOk = false; admin = false; chatAckOk = false; crewsOk = false; crewId = null; account = null; crew = "";
         serverPhysics = false;
         bin = 0;
         copsOk = false;
@@ -819,7 +855,8 @@
         }
         for (const id of new Set([...players.keys(), ...looks.keys()])) drop(id);
         tell();
-        setTimeout(connect, 2000);
+        if (event.code === 1008) postMessage({t:"moderation-message",m:{t:"moderation",k:"disconnect",text:event.reason || "Disconnected by the server."}});
+        else setTimeout(connect, 2000);
       };
     }
 
@@ -828,27 +865,26 @@
       if (m.t === "start") {
         relay = m.relay;
         name = m.name;
-        crew = m.crew || "";
+        crew = "";
         claim = m.claim || "";
         legacy = m.legacy || "";
         ghost = !!m.ghost;
         hidden = !!m.hidden;
         connect();
         tell();
+      } else if (m.t === "model-ready") {
+        const record = preparedModels.get(m.key);
+        if (record && m.ready) {
+          record.ready = true;
+          for (const p of players.values()) if (p.key === m.key && p.slot >= 0 && p.last && memory) put(p);
+        }
       } else if (m.t === "visibility") {
         hidden = !!m.hidden;
       } else if (m.t === "send") {
         // From the page: chat and horn only; the relay checks them again.
-        if ((m.m?.t === "chat" || m.m?.t === "horn" || m.m?.t === "race") && me && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m.m));
+        if ((m.m?.t === "chat" || m.m?.t === "horn" || m.m?.t === "race" || m.m?.t === "crewctl" && crewsOk || m.m?.t === "moderation" && moderationOk) && me && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m.m));
       } else if (m.t === "crew" && typeof m.crew === "string") {
-        // From the page (menu.js): this player's new crew. Linked, the relay
-        // cleans it and tells everyone, this player too (receive); otherwise the
-        // next hi carries it.
-        if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "crew", crew: m.crew }));
-        else {
-          crew = m.crew;
-          tell();
-        }
+        // Legacy name setters cannot mutate protected membership.
       } else if (m.t === "racers" && Array.isArray(m.ids)) {
         // From the page: whom this player races with now (race.js's race, read from race.h's block).
         racers = new Set(m.ids.filter((id) => Number.isInteger(id) && id > 0).slice(0, 8));
@@ -961,7 +997,7 @@
       lightsSentAt = now;
     }, 50);
 
-    // Flash to race (mods/core/nfsc/streetrace.h SrShared, a block of its own; the relay header's
+    // Crew-rival HUD/legacy compatibility mailbox (encounter_support.h SrShared; the relay header's
     // "Street races"): magic, version, me (+0x08: our relay id, 0 unlinked), opp (+0x0c: the other
     // player of the game's challenge or race now, 0 none), ping (+0x10: the median round trip, ms),
     // phase, races, wins, then tx head/tail and rx head/tail (+0x20..+0x2c), 8 records to send from
@@ -1182,8 +1218,8 @@
     setInterval(() => arrange(performance.now()), PICK_MS);
   }
 
-  // Crews. Players who type the same crew name are a crew; case and spaces do
-  // not count ("Night Owls" = "nightowls"), as on nfsu2.xyz. Six colours that
+  // Crew names are display labels supplied by the protected registry. Only
+  // crewId establishes membership. Six colours that
   // read well on the dark menus and stay clear of the interface's own cyan
   // (#5fe4f2). Which crew wears which is worked out from the crews in the room
   // alone, so every computer in the room shows the same colours without the
@@ -1204,7 +1240,7 @@
     for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 0x01000193);
     return (h >>> 0) % CREW_COLORS.length;
   }
-  let crew = crewName((given && given.crew) || params.get("crew")), myCrew = crewKey(crew);
+  let crew = "", myCrew = "";
   let state = { open: false, names: [], slots: [], people: [] };
   let colors = new Map(), colorsFor = null; // crew key -> colour; the crews here they were worked out for
   let paint = 0; // counts changes of colours or of this player's crew: badge and tags dress again
@@ -1237,8 +1273,55 @@
   window.recompCrewColor = crewColor;
 
   const worker = new Worker(URL.createObjectURL(new Blob([`"use strict";(${link})();`], { type: "text/javascript" })));
+  const crewCalls = new Map();
+  let crewQuery = 0;
+  window.recompCrews = { supported: false, account: null, crew: null, pending: 0 };
+  window.recompCrewRequest = (op, fields = {}) => new Promise((resolve, reject) => {
+    if (!state.open || !state.crewsOk) { reject(new Error("unavailable")); return; }
+    const q = ++crewQuery;
+    const timer = setTimeout(() => { crewCalls.delete(q); reject(new Error("timeout")); }, 8000);
+    crewCalls.set(q, { resolve, reject, timer });
+    worker.postMessage({ t: "send", m: { ...fields, t: "crewctl", op, q } });
+  });
+  const moderationCalls = new Map();
+  let moderationQuery = 0;
+  window.recompModerationRequest = (op, fields = {}) => new Promise((resolve, reject) => {
+    if (!state.open || !state.moderationOk) {reject(new Error("unavailable")); return;}
+    const q = ++moderationQuery;
+    const timer = setTimeout(() => {moderationCalls.delete(q); reject(new Error("timeout"));}, 8000);
+    moderationCalls.set(q, {resolve, reject, timer});
+    worker.postMessage({t:"send",m:{...fields,t:"moderation",op,q}});
+  });
   window.recompOnlinePing = null; // online, round trip not known yet: the performance box shows "PING --"
   worker.onmessage = (e) => {
+    if (e.data.t === "prepare-model") {
+      const key = e.data.key, stream = window.recompStream;
+      if (stream?.waitForModel) stream.waitForModel(key).then(ready => worker.postMessage({ t: "model-ready", key, ready }), () => {});
+      else {
+        stream?.prepareModels([key]);
+        worker.postMessage({ t: "model-ready", key, ready: !stream });
+      }
+      return;
+    }
+    if (e.data.t === "moderation-message") {
+      const m = e.data.m;
+      if (m.q) {
+        const call = moderationCalls.get(m.q);
+        if (call) {clearTimeout(call.timer); moderationCalls.delete(m.q); m.ok ? call.resolve(m) : call.reject(new Error(m.error || "failed"));}
+      } else if (m.k === "announcement" || m.k === "disconnect") dispatchEvent(new CustomEvent("recomp-online-message",{detail:m}));
+      return;
+    }
+    if (e.data.t === "crew-message") {
+      const m = e.data.m;
+      if (m.t === "crewstate") {
+        window.recompCrews = { supported: true, account: m.account || null, crew: m.crew || null, pending: m.pending || 0 };
+        dispatchEvent(new CustomEvent("recomp-crews", { detail: window.recompCrews }));
+      } else {
+        const call = crewCalls.get(m.q);
+        if (call) { clearTimeout(call.timer); crewCalls.delete(m.q); m.ok ? call.resolve(m) : call.reject(new Error(m.error || "failed")); }
+      }
+      return;
+    }
     if (e.data.t === "msg") { dispatchEvent(new CustomEvent("recomp-online-message", { detail: e.data.m })); return; }
     if (e.data.t === "where") {
       // For the world map (worldmap.js): {at: this page's clock, p: [[id, x, z, heading], ...]},
@@ -1256,6 +1339,16 @@
     if (e.data.t === "police") { police = new Set(e.data.ids); return; } // their name tags say so
     if (e.data.t !== "state") return;
     state = e.data;
+    if (!state.open || !state.moderationOk) {
+      for (const call of moderationCalls.values()) {clearTimeout(call.timer); call.reject(new Error("disconnected"));}
+      moderationCalls.clear();
+    }
+    if (!state.open || !state.crewsOk) {
+      window.recompCrews = { supported: false, account: null, crew: null, pending: 0 };
+      for (const call of crewCalls.values()) { clearTimeout(call.timer); call.reject(new Error("disconnected")); }
+      crewCalls.clear();
+      dispatchEvent(new CustomEvent("recomp-crews", { detail: window.recompCrews }));
+    }
     if (typeof state.crew === "string" && state.crew !== crew) {
       // This player changed crew (recompOnlineCrew): the start page shows it next time.
       crew = state.crew;
@@ -1281,25 +1374,8 @@
   // as "recomp-online-message" events ({t, id, name, crew, text | on, at: [x, y, z] or null}).
   // race.js sends {t:"race", k, ...} the same way; those come back from everyone, us too.
   window.recompOnlineSend = (m) => worker.postMessage({ t: "send", m });
-  // For the in-game menu: change this player's crew while driving ("" = none).
-  // The relay cleans the name and tells everyone, this player too; then
-  // recompOnlineState.crew, the badge and the tags follow. It allows a burst of
-  // 3 changes, then one per 5 s (tools/carbon-net-relay.mjs LIMITS), counted
-  // here too so the menu can say how long to wait. Returns {ok: true, crew}
-  // (the cleaned name asked for) or {ok: false, wait: seconds}.
-  const crewLimit = { tokens: 3, at: performance.now() };
-  window.recompOnlineCrew = (c) => {
-    const next = crewName(c);
-    if (state.open) {
-      const now = performance.now();
-      crewLimit.tokens = Math.min(3, crewLimit.tokens + (now - crewLimit.at) / 5000);
-      crewLimit.at = now;
-      if (crewLimit.tokens < 1) return { ok: false, wait: Math.ceil((1 - crewLimit.tokens) * 5) };
-      crewLimit.tokens -= 1;
-    }
-    worker.postMessage({ t: "crew", crew: next });
-    return { ok: true, crew: next };
-  };
+  // A legacy caller cannot turn a display name into protected membership.
+  window.recompOnlineCrew = () => ({ ok: false, error: "Use My crew to create a crew or accept an invitation." });
   // Where this player's car is now (physics space, metres), or null.
   window.recompOnlineSelf = () => {
     if (!block) return null;
@@ -1467,7 +1543,7 @@
   addEventListener("carbon-lights", () => attachLights(globalThis.carbonLightsBlock));
   attachLights(globalThis.carbonLightsBlock);
 
-  // The street races' block (streetrace.h), handed over the same way.
+  // The native encounter support mailbox, handed over the same way.
   let streetBlock = null;
   function attachStreet(b) {
     if (!b || streetBlock) return;
@@ -1559,8 +1635,8 @@
   const canvas = document.getElementById("canvas");
   const tags = [];
   let views = null, crewsOf = null, crews = new Map(); // player id -> crew, from state.people
-  function dress(el, c) {
-    const color = crewColor(c), mate = !!myCrew && crewKey(c) === myCrew;
+  function dress(el, c, mate) {
+    const color = crewColor(c);
     el.crew = c;
     el.paint = paint;
     el.mate = mate;
@@ -1577,7 +1653,7 @@
     if (!block) return;
     if (crewsOf !== state) {
       crewsOf = state;
-      crews = new Map((state.people || []).map((p) => [p.id, p.crew || ""]));
+      crews = new Map((state.people || []).map((p) => [p.id, p]));
     }
     const buf = block.memory.buffer;
     if (!views || views.buf !== buf) views = { buf, f32: new Float32Array(buf) };
@@ -1607,8 +1683,9 @@
         el.crew = null;
         document.body.append(el);
       }
-      const c = crews.get(state.slotIds?.[i]) || "";
-      if (el.crew !== c || el.paint !== paint) dress(el, c);
+      const peer = crews.get(state.slotIds?.[i]), c = peer?.crew || "";
+      const mate = !!state.crewId && peer?.crewId === state.crewId;
+      if (el.crew !== c || el.paint !== paint || el.mate !== mate) dress(el, c, mate);
       const isPolice = police.has(state.slotIds?.[i]);
       el.badge.style.display = isPolice ? "inline-block" : "none";
       const paused = state.slotModes?.[i] === 0;

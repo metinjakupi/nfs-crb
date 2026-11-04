@@ -21,6 +21,9 @@ void profile_stop();
 // guest_ms_per_frame is omitted; enabled reporting averages the supplied frames.
 // This does not measure time or change guest/scheduler state.
 void profile_note_guest_ms(double milliseconds);
+// The thread map (RECOMP_PROFILE=1; profile.cpp recomp_profile_threads_dump).
+void profile_note_lock(uint32_t critical_section);
+void profile_note_import(uint32_t index);
 extern "C" {
 extern const int recomp_profile_enabled;
 void recomp_profile_push(uint32_t index);

@@ -6,7 +6,8 @@
 #define CC_MAP_PTR 0x00a97b60u
 #define CC_MAP_VT 0x009d2e10u
 enum { CC_IDLE, CC_OFFERED, CC_SELECTING, CC_CHOSEN, CC_RUNNING, CC_OVER, CC_DECLINED, CC_FAILED, CC_PROMPT, CC_ACCEPTED };
-enum { CC_OPEN=1, CC_LAUNCH, CC_CANCEL, CC_RESET, CC_MAP, CC_RESULT };
+enum { CC_OPEN=1, CC_LAUNCH, CC_CANCEL, CC_RESET, CC_MAP, CC_RESULT, CC_DISMISS };
+#define CC_ERROR_DISMISSED 5u
 typedef struct CcPage {
     uint32_t command, action, peer, session, me, destination, caps_n, caps[16];
     float starts[12]; /* global grid order: position and direction for each car */
@@ -29,7 +30,7 @@ static uint32_t g_cc_block, g_cc_event, g_cc_hooks[8], g_cc_command;
 static CcPage g_cc_page;
 static struct {
     uint32_t phase, session, peer, map, destination, error, offer_count, offer_to;
-    int in_init, replaying, cancelling, abandoned_loaded, selector, hud_owned;
+    int in_init, replaying, cancelling, abandoned_loaded, selector, hud_owned, dismissed;
     uint32_t hud, activity, race_activity, result_winner, result_params;
     int result_posted;
     float own_finish;
@@ -59,19 +60,16 @@ static MpCar *cc_friend(uint32_t id) {
 static int cc_near(uint32_t id) {
     uint32_t player=mp_player();MpCar *peer=cc_friend(id);float a[3],b[3];
     if(!player||!peer||!sr_where(player+0x24,a,0)||!sr_where(peer->simable,b,0))return 0;
-    float dx=a[0]-b[0],dz=a[2]-b[2];
-    return dx*dx+dz*dz<=SR_REACH*SR_REACH&&fabsf(a[1]-b[1])<=10;
-}
-static int cc_auto_near(uint32_t id) {
-    uint32_t player=mp_player();MpCar *peer=cc_friend(id);float a[3],b[3];
-    if(!player||!peer||!sr_where(player+0x24,a,0)||!sr_where(peer->simable,b,0))return 0;
-    float dx=a[0]-b[0],dz=a[2]-b[2],d=dx*dx+dz*dz;
-    return d>=25.0f&&d<=SR_REACH*SR_REACH&&fabsf(a[1]-b[1])<=10;
+    /* AIGoal encounter update 00432490 compares real 3D distance against
+     * this stock 25 m constant. Remote humans need no artificial 5 m minimum.
+     * Retain the bridge's vertical guard against cars on different road levels. */
+    float dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2],reach=bits_float(get_u32(0x009c2928u));
+    return isfinite(reach)&&reach>0&&dx*dx+dy*dy+dz*dz<=reach*reach&&fabsf(dy)<=10;
 }
 static int cc_eligible(void) {
     uint32_t player=mp_player();
     return sr_free_roam(player)&&!g_race_session&&!g_pu_police&&!g_pu_mine&&!sr_busted(player)&&
-           g_sr.phase==SR_IDLE&&!(mp_call(MP_IS_PAUSED,0,0,0)&0xffu)&&!get_u32(CC_MAP_PTR);
+           !(mp_call(MP_IS_PAUSED,0,0,0)&0xffu)&&!get_u32(CC_MAP_PTR);
 }
 static int cc_linked(void) {
     SrShared *sh=sr_shared();return sh&&sh->me&&sh->me==g_cc_page.me;
@@ -98,7 +96,7 @@ static int cc_owns_hud(uint32_t ui) {
     return g_cc.hud_owned&&ui&&ui==g_cc.hud&&get_u32(ui+0x10)==g_cc.activity&&get_u32(ui+0x18)==1;
 }
 static int cc_can_offer(void) {
-    if(!cc_eligible())return 0;
+    if(!cc_eligible()||(g_race_page.flags&4u))return 0;
     uint32_t ui=cc_hud();return ui&&!get_u32(ui+0x18)&&!cc_ai_active();
 }
 static void cc_hide_prompt(void) {
@@ -134,18 +132,24 @@ static void cc_accept(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *in
     }
     api->call_original(api,cpu->target,cpu);
 }
-static struct {uint32_t id;double until;} g_cc_cool[16];
+/* An AI rival drives away after dismissal. A human may stay parked: wait for
+ * that pair to separate instead of repeatedly prompting or imposing a timer.
+ * Technical cancellation never consumes the next proximity encounter. */
+static uint32_t g_cc_away[16];
 static double g_cc_auto_at;
 static int g_cc_offer_ready;
-static int cc_cooling(uint32_t id,double now) {
-    for(int i=0;i<16;i++)if(g_cc_cool[i].id==id)return now<g_cc_cool[i].until;
+static int cc_waiting_away(uint32_t id) {
+    for(int i=0;i<16;i++)if(g_cc_away[i]==id)return 1;
     return 0;
 }
-static void cc_cool(uint32_t id,double now) {
-    int at=0;for(int i=0;i<16;i++){if(g_cc_cool[i].id==id){at=i;break;}if(g_cc_cool[i].until<g_cc_cool[at].until)at=i;}
-    g_cc_cool[at].id=id;g_cc_cool[at].until=now+120000;
+static void cc_wait_away(uint32_t id) {
+    if(!id||cc_waiting_away(id))return;
+    for(int i=0;i<16;i++)if(!g_cc_away[i]){g_cc_away[i]=id;return;}
+    g_cc_away[0]=id;
 }
-static int cc_ignore_flash(uint32_t id,const char *name,double now) {(void)id;(void)name;(void)now;return 1;}
+static void cc_rearm(void) {
+    for(int i=0;i<16;i++)if(g_cc_away[i]&&!cc_near(g_cc_away[i]))g_cc_away[i]=0;
+}
 static int cc_offer(uint32_t id,const char *name,double now) {
     cc_read();
     if(g_cc.session || g_cc_page.session || !cc_can_offer())return 1;
@@ -156,11 +160,6 @@ static int cc_offer(uint32_t id,const char *name,double now) {
     g_cc.session=session?session:1;g_cc.peer=id;g_cc.phase=CC_OFFERED;g_cc.began=now;
     g_cc.offer_to=id;g_cc.offer_count++;g_cc.error=0;
     (void)name;return 1;
-}
-static int cc_legacy(const SrRec *r,uint32_t player,double now) {
-    (void)player;(void)now;
-    if(r->k!=SR_CHALLENGE)return 0;
-    sr_send_race(r->id,r->r,SR_BUSY,3);return 1;
 }
 static int cc_owns_map(uint32_t map) {
     return map && map==g_cc.map && get_u32(map)==CC_MAP_VT && get_u32(map+8)==3;
@@ -312,24 +311,34 @@ static void cc_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
                     g_cc.replaying=1;g_cc.phase=CC_RUNNING;g_cc.began=mp_now();
                     mp_call(0x00649b80u,get_u32(0x00a982b8u),&g_cc_page.destination,1);g_cc.replaying=0;
                 }
+            } else if(g_cc_page.action==CC_DISMISS) {
+                g_cc.dismissed=1;g_cc.error=CC_ERROR_DISMISSED;cc_abort();
             } else if(g_cc_page.action==CC_CANCEL)cc_abort();
             else if(g_cc_page.action==CC_RESET&&(!g_race_encounter||g_race_session!=g_cc.session)&&!cc_owns_map(get_u32(CC_MAP_PTR))) {
-                cc_cool(g_cc.peer,mp_now());uint32_t offers=g_cc.offer_count;memset(&g_cc,0,sizeof g_cc);g_cc.offer_count=offers;
+                if(g_cc.dismissed||g_cc.phase==CC_OVER)cc_wait_away(g_cc.peer);
+                uint32_t offers=g_cc.offer_count;memset(&g_cc,0,sizeof g_cc);g_cc.offer_count=offers;
             }
         }
     }
     const double now=mp_now();
     if(!g_cc.session&&!g_cc_page.session&&cc_linked()&&now-g_cc_auto_at>250) {
         g_cc_auto_at=now;g_cc_offer_ready=cc_can_offer();
+        cc_rearm();
         if(g_cc_offer_ready)for(uint32_t i=0;i<g_cc_page.caps_n;i++) {
             uint32_t id=g_cc_page.caps[i];
-            if(id>g_cc_page.me&&!cc_cooling(id,now)&&cc_auto_near(id)){cc_offer(id,"online rival",now);break;}
+            if(id>g_cc_page.me&&!cc_waiting_away(id)&&cc_near(id)){cc_offer(id,"online rival",now);break;}
         }
     }
     if(g_cc.phase==CC_OFFERED&&!g_cc.hud_owned&&g_cc_page.session==g_cc.session&&g_cc_page.peer==g_cc.peer) {
         if(!cc_show_prompt())cc_fail(3);
     }
-    if(g_cc.hud_owned&&(g_cc.phase==CC_OFFERED||g_cc.phase==CC_PROMPT)&&!cc_owns_hud(cc_hud()))cc_abort();
+    if(g_cc.hud_owned&&(g_cc.phase==CC_OFFERED||g_cc.phase==CC_PROMPT)&&!cc_owns_hud(cc_hud())) {
+        uint32_t ui=cc_hud();
+        if(ui&&!get_u32(ui+0x18)&&cc_eligible()&&cc_near(g_cc.peer)&&!cc_ai_active()) {
+            g_cc.dismissed=1;g_cc.error=CC_ERROR_DISMISSED;
+        }
+        cc_abort();
+    }
     if(g_cc.session&&(g_cc.phase==CC_OFFERED||g_cc.phase==CC_PROMPT||g_cc.phase==CC_ACCEPTED)&&
        (!cc_eligible()||!cc_near(g_cc.peer)||cc_ai_active()))cc_abort();
     if(g_cc.session&&!cc_linked())cc_abort();
@@ -357,9 +366,8 @@ static void cc_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
     __atomic_fetch_add(&sh->game_seq,1,__ATOMIC_RELEASE);
 }
 static void encounter_install(void) {
-    g_sr_native_offer=cc_ignore_flash;g_sr_native_receive=cc_legacy;
     if(!g_sr_block||g_api->guest_alloc(g_api,sizeof(CcShared)+64,&g_cc_block)!=POP_OK)return;
-    CcShared *sh=cc_shared();memset(sh,0,sizeof *sh);sh->magic=CC_MAGIC;sh->version=3;
+    CcShared *sh=cc_shared();memset(sh,0,sizeof *sh);sh->magic=CC_MAGIC;sh->version=4;
     g_cc_event=g_cc_block+sizeof(CcShared);
     uint32_t addr[]={MP_FE_SERVICE,0x005b2fd0u,0x00649b80u,RACE_INIT_RACERS,0x006510c0u,0x00694830u,0x00629710u,RACE_RANK};
     PopHookFn fn[]={cc_service,cc_returned,cc_selected,cc_init,cc_register,cc_accept,cc_activity,cc_ranked};
@@ -373,7 +381,7 @@ static void encounter_install(void) {
             for(uint32_t j=0;j<i;j++)g_api->hook_remove(g_api,g_cc_hooks[j]);return;
         }
     }
-    g_race_page_source=cc_page;g_race_finish_observer=cc_finished;g_sr_native_offer=cc_ignore_flash;g_sr_native_receive=cc_legacy;
+    g_race_page_source=cc_page;g_race_finish_observer=cc_finished;
 #ifdef __EMSCRIPTEN__
     MAIN_THREAD_ASYNC_EM_ASM({var b={};b.memory=wasmMemory;b.ptr=$0;globalThis.carbonEncounterBlock=b;globalThis.dispatchEvent(new Event("carbon-encounter"));},(uint32_t)(uintptr_t)sh);
 #endif

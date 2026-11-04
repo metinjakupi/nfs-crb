@@ -78,23 +78,22 @@
     const feed = window.recompOnlineWhere;
     const fresh = feed && Array.isArray(feed.p) && performance.now() - feed.at <= FEED_FRESH;
     const me = window.recompOnlineSelf?.() || null;
-    const key = (c) => (window.recompCrewKey ? window.recompCrewKey(c) : String(c || "").toLowerCase().replace(/\s+/g, ""));
-    const mine = key(s?.crew ?? window.recompOnline?.crew ?? "");
+    const mine = s?.crewId;
     const all = new Map();
     for (const e of fresh ? feed.p : []) {
       const id = e[0] >>> 0, p = people.get(id);
       if (!p) continue; // not (or no longer) in the room as far as net.js knows
       const d = me ? Math.hypot(e[1] - me[0], e[2] - me[2]) : Infinity;
-      all.set(id, { id, name: p.name, crew: p.crew, x: e[1], z: e[2], h: e[3], d });
+      all.set(id, { id, name: p.name, crew: p.crew, crewId: p.crewId, x: e[1], z: e[2], h: e[3], d });
     }
     // In a slot but not (yet) in the feed: near, and the game has its car.
     for (const id of slots) {
       const p = people.get(id);
-      if (p && !all.has(id)) all.set(id, { id, name: p.name, crew: p.crew, x: NaN, z: NaN, h: 0, d: 0 });
+      if (p && !all.has(id)) all.set(id, { id, name: p.name, crew: p.crew, crewId: p.crewId, x: NaN, z: NaN, h: 0, d: 0 });
     }
     const list = [...all.values()];
     for (const p of list) {
-      p.mate = !!mine && key(p.crew) === mine;
+      p.mate = !!mine && p.crewId === mine;
       p.rank = listed.has(p.id) ? p.d * KEEP : p.d;
     }
     list.sort((a, b) => b.mate - a.mate || (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0) || a.id - b.id);

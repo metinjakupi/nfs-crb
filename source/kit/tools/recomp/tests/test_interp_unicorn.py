@@ -97,6 +97,10 @@ def run_unicorn(code):
     uc.mem_map(DATA, 0x1000)
     uc.mem_map(STACK - 0x1000, 0x1000)
     uc.mem_map(RETURN & ~0xFFF, 0x1000)
+    # Same translated helper contract as interp_tests: return arg + 1,
+    # preserve flags (LEA), and pop only the return address.
+    uc.mem_map(0x00401000, 0x1000)
+    uc.mem_write(0x00401000, bytes.fromhex("8b4424048d4001c3"))
     uc.mem_write(CODE, code)
     uc.mem_write(DATA, bytes((i * 37 + 11) & 0xFF for i in range(0x1000)))
     for reg, value in zip(UC_REGS, REGS):
@@ -123,3 +127,55 @@ def test_random_routines_match_unicorn():
         want = run_unicorn(code)
         got = subprocess.run([str(BINARY), "--run", code.hex()], capture_output=True, text=True).stdout
         assert got == want, "routine %d: %s" % (i, code.hex())
+
+
+@pytest.mark.skipif(not BINARY.exists(), reason="interp_tests is not built")
+def test_parameter_callbacks_match_unicorn():
+    """Memory aliases, pointer/flag changes, calls and branches in bank-shaped code."""
+    rng = random.Random(20261103)
+    for trial in range(300):
+        code = bytearray()
+        for _ in range(rng.randrange(5, 25)):
+            disp = rng.randrange(-32, 32) & 255
+            choice = rng.randrange(6)
+            if choice == 0:
+                code += bytes([0x8b, 0x46, disp, 0x89, 0x46, disp ^ 4,
+                               0xc6, 0x46, disp, rng.randrange(256)])
+            elif choice == 1:
+                code += bytes([0x83, 0xc6, rng.choice([4, 8, 252, 248]),
+                               0x8b, 0x06, 0x89, 0x46, 4])
+            elif choice == 2:
+                code += b"\x05" + struct.pack("<I", rng.getrandbits(32))
+                code += b"\x56\xe8" + struct.pack("<i", 0x00401000 - (CODE + len(code) + 6))
+                code += b"\x59\x89\x46\x0c"
+            elif choice == 3:
+                # Alternate supported shapes with a general arithmetic path.
+                code += b"\x8b\x06\x83\xc0\x01\x50\x59\x31\xd2"
+            elif choice == 4:
+                # A branch enters a straight-line sequence after its first store.
+                code += b"\x85\xc0\x75\x03\x89\x46\x10\x8b\x06\x89\x46\x14\x83\xc6\x04"
+            else:
+                code += b"\x56\x8b\x74\x24\x00\x8b\x06\x5e"
+        code += b"\xc3"
+        want = run_unicorn(bytes(code))
+        got = subprocess.run([str(BINARY), "--run", code.hex()], capture_output=True, text=True)
+        assert got.returncode == 0 and not got.stderr, got.stderr
+        assert got.stdout == want, "parameter callback %d: %s" % (trial, code.hex())
+
+
+@pytest.mark.skipif(not BINARY.exists(), reason="interp_tests is not built")
+def test_pointer_helper_calls_match_unicorn():
+    """Immediate ESI adjustments must retain their flags and stack arguments."""
+    rng = random.Random(2026110317)
+    for trial in range(300):
+        code = bytearray()
+        for _ in range(rng.randrange(1, 16)):
+            delta = rng.choice([0, 1, -1, 4, -4, 32, -32])
+            code += bytes([0x83, 0xc6, delta & 255])
+            code += b"\x56\xe8" + struct.pack("<i", 0x00401000 - (CODE + len(code) + 6))
+            code += b"\x59\x89\x46\x0c"
+        code += b"\xc3"
+        want = run_unicorn(bytes(code))
+        got = subprocess.run([str(BINARY), "--run", code.hex()], capture_output=True, text=True)
+        assert got.returncode == 0 and not got.stderr, got.stderr
+        assert got.stdout == want, "pointer helper callback %d: %s" % (trial, code.hex())

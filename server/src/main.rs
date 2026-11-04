@@ -34,8 +34,10 @@ mod ea;
 mod host;
 mod http;
 mod identity;
+mod crews;
 mod lan;
 mod messenger;
+mod moderation;
 mod olmsg;
 mod relay;
 mod reports;
@@ -91,6 +93,10 @@ fn main() {
             std::process::exit(1);
         })
     });
+    let moderation = moderation::Moderation::open(
+        env("CARBON_MODERATION_DIR").or_else(|| env("CARBON_MESSENGER_DIR")).map(PathBuf::from),
+        env("CARBON_ADMIN_OWNERS"),
+    ).unwrap_or_else(|e| { eprintln!("carbon-server: cannot open moderation: {e}"); std::process::exit(1); });
     let identities = Arc::new(Mutex::new(
         identity::Claims::open(
             env("CARBON_MESSENGER_DIR").map(PathBuf::from),
@@ -101,10 +107,17 @@ fn main() {
             std::process::exit(1);
         }),
     ));
+    lock_admins(&identities, &moderation.admins);
     let trace = trace::Trace::new(env("CARBON_TRACE_DIR").map(PathBuf::from), identities.clone());
+    let mut crews = crews::Crews::open(env("CARBON_CREWS_DIR").or_else(|| env("CARBON_MESSENGER_DIR")).map(PathBuf::from))
+        .unwrap_or_else(|e| {
+            eprintln!("carbon-server: cannot open protected crews: {e}");
+            std::process::exit(1);
+        });
+    crews.set_admins(moderation.admins.clone());
     let app = Arc::new(App {
         key: env("CARBON_RELAY_KEY").unwrap_or_default(),
-        relay: Mutex::new(relay::Relay::default()),
+        relay: Mutex::new(relay::Relay::with_crews(crews).with_moderation(moderation)),
         identities,
         saves,
         reports,
@@ -169,4 +182,8 @@ async fn serve(app: Arc<App>, host: String, port: u16) {
             }
         }
     }
+}
+
+fn lock_admins(claims: &Mutex<identity::Claims>, admins: &std::collections::BTreeSet<String>) {
+    util::lock(claims).set_admins(admins.clone());
 }

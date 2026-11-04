@@ -8,6 +8,7 @@
 #define PHOTO_ZOOM_FRONTEND_CAMERA 0x00ab0478u
 #define PHOTO_ZOOM_FRONTEND_ACTIVE 0x00a5ec7cu
 #define PHOTO_ZOOM_MAX 0x009c7364u
+#include "photo_capture.h"
 static uint32_t g_photo_zoom_hook;
 static void photo_zoom_update(const PopModApi *api, pop_cpu_v1 *cpu,
                               PopHookInvocation *inv, void *user) {
@@ -27,11 +28,13 @@ static void photo_zoom_update(const PopModApi *api, pop_cpu_v1 *cpu,
         api->guest_write_u32(api, PHOTO_ZOOM_MAX, saved);
 }
 static void photo_zoom_install(void) {
+    photo_capture_install();
     if (g_api->hook_install(g_api, PHOTO_ZOOM_UPDATE, photo_zoom_update,
                             POP_HOOK_WRAP, NULL, &g_photo_zoom_hook) != POP_OK)
         log_line("core.nfsc: extended native Photo Mode zoom unavailable");
 }
 static void photo_zoom_shutdown(void) {
+    photo_capture_shutdown();
     if (g_photo_zoom_hook) {
         g_api->hook_remove(g_api, g_photo_zoom_hook);
         g_photo_zoom_hook = 0;

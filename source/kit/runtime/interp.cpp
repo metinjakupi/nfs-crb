@@ -35,6 +35,8 @@ enum Op : uint8_t {
     // A JMP whose target is a translated entry: a tail call out of this
     // routine, which the address table places rather than this interpreter.
     JMPOUT,
+    // An immediate pointer adjustment followed by PUSH ESI and a direct CALL.
+    ADD_PUSH_CALL,
 };
 
 // A register or memory operand. kind 0: none, 1: register, 2: memory,
@@ -59,6 +61,8 @@ struct Ins {
     uint32_t target_index = 0; // JMP, Jcc: `target`'s index in Routine::code
     bool indirect = false;
     uint16_t ret_pop = 0;
+    uint32_t move_offset = 0;
+    uint8_t move_count = 0;
 };
 
 // How far the decoder reads before it gives up looking for the last RET.
@@ -379,10 +383,18 @@ bool decode(uint32_t a, Ins &in) {
     return true;
 }
 
+// Compact execution plan for EAX <-> [ESI+disp] runs. Original instructions
+// remain intact so branches into a run still use their exact entry point.
+struct MoveWord {
+    int32_t disp;
+    uint32_t pc_and_store;
+};
+static_assert(sizeof(MoveWord) == 8);
 struct Routine {
     uint32_t start = 0;
     std::vector<uint8_t> bytes; // the code as decoded, to notice a rewrite
     std::vector<Ins> code;
+    std::vector<MoveWord> moves;
     std::unordered_map<uint32_t, uint32_t> at; // address -> index into code
 };
 
@@ -438,6 +450,52 @@ std::shared_ptr<Routine> build(uint32_t start) {
             return nullptr;
         }
         in.target_index = it->second;
+    }
+    // Only the two simple word-copy shapes qualify. ESI and flags never
+    // change inside a run; unsupported forms retain the ordinary interpreter.
+    auto move_kind = [](const Ins &in) -> int {
+        if (in.op != MOV)
+            return -1;
+        if (in.dst.kind == 1 && in.dst.reg == R_EAX && in.src.kind == 2 && in.src.base == R_ESI &&
+            in.src.index < 0)
+            return 0;
+        if (in.src.kind == 1 && in.src.reg == R_EAX && in.dst.kind == 2 && in.dst.base == R_ESI &&
+            in.dst.index < 0)
+            return 1;
+        return -1;
+    };
+    for (size_t first = 0; first < r->code.size();) {
+        size_t end = first;
+        while (end < r->code.size() && end - first < 64 && move_kind(r->code[end]) >= 0)
+            ++end;
+        if (end - first < 3) {
+            ++first;
+            continue;
+        }
+        Ins &head = r->code[first];
+        head.move_offset = (uint32_t)r->moves.size();
+        head.move_count = (uint8_t)(end - first);
+        for (size_t i = first; i < end; ++i) {
+            const Ins &in = r->code[i];
+            const int store = move_kind(in);
+            r->moves.push_back({store ? in.dst.disp : in.src.disp,
+                                ((in.addr - head.addr) << 1u) | (uint32_t)store});
+        }
+        first = end;
+    }
+    // Audio parameter routines repeatedly adjust ESI, pass it, and call a
+    // helper. Keep the original PUSH and CALL entries so branches into the
+    // middle still execute the ordinary instructions.
+    for (size_t i = 0; i + 2 < r->code.size(); ++i) {
+        Ins &add = r->code[i];
+        const Ins &arg = r->code[i + 1], &call = r->code[i + 2];
+        if (add.op == ADD && add.dst.kind == 1 && add.dst.reg == R_ESI && add.src.kind == 3 &&
+            arg.op == PUSH && arg.src.kind == 1 && arg.src.reg == R_ESI && call.op == CALL &&
+            !call.indirect) {
+            add.op = ADD_PUSH_CALL;
+            add.target = call.target;
+            i += 2;
+        }
     }
     r->bytes.assign(g_mem + start, g_mem + a);
     return r;
@@ -703,7 +761,37 @@ void run(X86 *c, const Routine &r) {
         case NOP:
             break;
         case MOV:
-            store(c, in.dst, load(c, in.src));
+            if (in.move_count) {
+                const MoveWord *moves = r.moves.data() + in.move_offset;
+                const uint32_t base = c->r[R_ESI];
+                for (uint32_t i = 0; i < in.move_count; ++i) {
+                    const MoveWord &move = moves[i];
+                    // The outer loop already charged the first instruction.
+                    // Charge every later MOV at its original PC, even when a
+                    // previous word faulted or the shared nested budget ends.
+                    if (i) {
+                        if (!g_steps_left) {
+                            snprintf(g_error, sizeof g_error,
+                                     "no RET within %u instructions (at %08x)", kMaxSteps,
+                                     in.addr + (move.pc_and_store >> 1u));
+                            throw Fault{};
+                        }
+                        --g_steps_left;
+                    }
+                    const uint32_t address = base + (uint32_t)move.disp;
+                    if (!readable(address, 4)) {
+                        snprintf(g_error, sizeof g_error, "%s of %08x outside guest memory",
+                                 (move.pc_and_store & 1u) ? "write" : "read", address);
+                        throw Fault{};
+                    }
+                    if (move.pc_and_store & 1u)
+                        wr32(address, c->r[R_EAX]);
+                    else
+                        c->r[R_EAX] = rd32(address);
+                }
+                next = ip + in.move_count;
+            } else
+                store(c, in.dst, load(c, in.src));
             break;
         case MOV8: {
             uint32_t a = address_of(c, in.dst);
@@ -786,6 +874,27 @@ void run(X86 *c, const Routine &r) {
         case POP: {
             uint32_t v = pop(c);
             store(c, in.dst, v);
+            break;
+        }
+        case ADD_PUSH_CALL: {
+            const uint32_t a = c->r[R_ESI], b = (uint32_t)in.src.disp, res = a + b;
+            f = Flags{ADD, a, b, res, 0, 0};
+            c->r[R_ESI] = res;
+            // The ADD was charged by the outer loop. Charge each remaining
+            // instruction before its effects, preserving partial execution
+            // and the original fault PC when the shared budget runs out.
+            for (unsigned i = 1; i <= 2; ++i) {
+                if (!g_steps_left) {
+                    snprintf(g_error, sizeof g_error, "no RET within %u instructions (at %08x)",
+                             kMaxSteps, ip[i].addr);
+                    throw Fault{};
+                }
+                --g_steps_left;
+                push(c, i == 1 ? res : ip[2].addr + ip[2].len);
+            }
+            flags_settle(c, f);
+            recomp_call(c, in.target);
+            next = ip + 3;
             break;
         }
         case CALL: {

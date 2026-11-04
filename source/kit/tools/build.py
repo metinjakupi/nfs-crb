@@ -336,7 +336,7 @@ def publish_generated(build_root, translate):
 
 
 def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modules=(),
-                   allow_unmodelled=None, discovered=None, forget=None):
+                   allow_unmodelled=None, discovered=None, forget=None, register_locals="off"):
     """Translate the image into `stage`, then each auxiliary module (game.toml
     [modules.aux.<key>]) into `stage/aux-<key>`, which cmake/Translate.cmake
     compiles into its own library. A module is translated under the same
@@ -354,6 +354,22 @@ def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modul
     if forget:
         command += ["--forget", forget]
     subprocess.run(command, cwd=ROOT, check=True)
+    if register_locals != "off":
+        # game.toml [translate] register_locals: the image's chunks rewritten to keep registers
+        # and flags in locals (tools/recomp/regloc.py), in place in the stage. The pass reads
+        # the x86.h the chunks will compile against; publish_generated copies the same one.
+        shutil.copy(ROOT / "runtime/x86.h", Path(stage) / "x86.h")
+        rewritten = Path(stage).parent / (Path(stage).name + ".regloc")
+        shutil.rmtree(rewritten, ignore_errors=True)
+        try:
+            pass_args = [sys.executable, str(ROOT / "tools/recomp/regloc.py"), str(stage), str(rewritten)]
+            if register_locals == "regs-only":
+                pass_args.append("regs-only")
+            subprocess.run(pass_args, cwd=ROOT, check=True)
+            for f in rewritten.iterdir():
+                shutil.copy(f, Path(stage) / f.name)
+        finally:
+            shutil.rmtree(rewritten, ignore_errors=True)
     for key in aux_modules:
         out = Path(stage) / ("aux-" + key)
         out.mkdir()
@@ -463,7 +479,8 @@ def main():
                                                                args.allow_table_gaps,
                                                                [m["key"] for m in cfg["aux_modules"]],
                                                                args.allow_unmodelled,
-                                                               args.discovered, args.forget))
+                                                               args.discovered, args.forget,
+                                                               cfg["translate"]["register_locals"]))
             # Generated sources include the adjacent runtime header. Refresh
             # it under the same lock even when their translation is unchanged.
             header = args.build_root / "recomp/gen/x86.h"

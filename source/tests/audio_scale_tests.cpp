@@ -10,6 +10,8 @@
 extern "C" uint8_t *harness_mem(void);
 extern "C" void fn_008ad12e(X86 *);
 extern "C" void nfsc_audio_scale(X86 *);
+extern "C" void fn_008ad305(X86 *);
+extern "C" void nfsc_audio_mix(X86 *);
 extern "C" {
 uint32_t recomp_frame_watch = 0;
 void recomp_frame_changed(X86 *, uint32_t, uint32_t, uint32_t) { std::abort(); }
@@ -26,9 +28,10 @@ void recomp_seh_intercept(X86 *, uint32_t) { std::abort(); }
 }
 static constexpr uint32_t sp = 0x08001000u, data = 0x07000000u;
 static unsigned checks, failures;
+static bool mix;
 static void compare(X86 entry, uint32_t dst, uint32_t src, uint32_t count,
                     uint32_t gain) {
-  uint8_t stack[256], wantstack[256], input[16384], output[16384];
+  uint8_t stack[256], wantstack[256], input[65536], output[65536];
   for (unsigned i = 0; i < 256; ++i)
     g_mem[sp - 128 + i] = uint8_t(i * 17);
   wr32(sp, GUEST_RETURN_SENTINEL);
@@ -39,13 +42,13 @@ static void compare(X86 entry, uint32_t dst, uint32_t src, uint32_t count,
   memcpy(stack, g_mem + sp - 128, sizeof stack);
   memcpy(input, g_mem + data, sizeof input);
   X86 original = entry;
-  fn_008ad12e(&original);
+  (mix ? fn_008ad305 : fn_008ad12e)(&original);
   memcpy(wantstack, g_mem + sp - 128, sizeof stack);
   memcpy(output, g_mem + data, sizeof output);
   memcpy(g_mem + sp - 128, stack, sizeof stack);
   memcpy(g_mem + data, input, sizeof input);
   X86 candidate = entry;
-  nfsc_audio_scale(&candidate);
+  (mix ? nfsc_audio_mix : nfsc_audio_scale)(&candidate);
   ++checks;
   if (memcmp(&candidate, &original, sizeof original) ||
       memcmp(output, g_mem + data, sizeof output) ||
@@ -69,42 +72,48 @@ int main() {
   entry.r[4] = sp;
   entry.fpu_tag = 0xffff;
   entry.fpu_cw = 0x027f;
-  const uint32_t counts[] = {0, 1, 3, 15, 16, 17, 31, 32, 64, 256, 1024};
+  const uint32_t counts[] = {0,  1,  3,   15,   16,   17,  31,
+                             32, 64, 256, 1024, 4096, 4097};
   const uint16_t modes[] = {0x023f, 0x027f, 0x037f, 0x007f,
                             0x067f, 0x0a7f, 0x0e7f};
   const uint32_t special[] = {0,          0x80000000, 1,          0x007fffff,
                               0x00800000, 0x3f800000, 0x7f7fffff, 0x7f800000,
                               0xff800000, 0x7fc01234, 0x7fa00001};
-  for (unsigned k = 0; k < 2400; ++k) {
-    for (unsigned i = 0; i < 4096; ++i)
-      wr32(data + i * 4, k < 77 ? special[(k + i) % 11] : rng());
-    for (unsigned i = 0; i < 8; ++i) {
-      entry.r[i] = rng();
-      entry.st[i] = double(int(rng()));
-      entry.st_bits[i] = rng();
-      entry.st_exact[i] = uint8_t(i & 1);
+  for (unsigned operation = 0; operation < 2; ++operation) {
+    mix = operation != 0;
+    for (unsigned k = 0; k < 2400; ++k) {
+      for (unsigned i = 0; i < 4096; ++i)
+        wr32(data + i * 4, k < 77 ? special[(k + i) % 11] : rng());
+      for (unsigned i = 0; i < 8; ++i) {
+        entry.r[i] = rng();
+        entry.st[i] = double(int(rng()));
+        entry.st_bits[i] = rng();
+        entry.st_exact[i] = uint8_t(i & 1);
+      }
+      entry.r[4] = sp;
+      entry.fpu_cw = modes[k % 7];
+      entry.fpu_top = k % 8;
+      entry.fpu_tag = uint16_t(rng());
+      entry.fpu_sw = uint16_t(rng());
+      entry.eflags_cf = k & 1;
+      entry.eflags_of = (k >> 1) & 1;
+      entry.eflags_af = 1;
+      uint32_t src = data + 4096, dst = data + 8192;
+      if (k % 5 == 1)
+        dst = src;
+      else if (k % 5 == 2)
+        dst = src + 16;
+      else if (k % 5 == 3)
+        dst = src - 16;
+      if (k % 11 == 0) {
+        src += 4;
+        dst += 4;
+      }
+      compare(entry, dst, src, counts[k % 13],
+              k < 77 ? special[k % 11] : rng());
     }
-    entry.r[4] = sp;
-    entry.fpu_cw = modes[k % 7];
-    entry.fpu_top = k % 8;
-    entry.fpu_tag = uint16_t(rng());
-    entry.fpu_sw = uint16_t(rng());
-    entry.eflags_cf = k & 1;
-    entry.eflags_of = (k >> 1) & 1;
-    entry.eflags_af = 1;
-    uint32_t src = data + 4096, dst = data + 8192;
-    if (k % 5 == 1)
-      dst = src;
-    else if (k % 5 == 2)
-      dst = src + 16;
-    else if (k % 5 == 3)
-      dst = src - 16;
-    if (k % 11 == 0) {
-      src += 4;
-      dst += 4;
-    }
-    compare(entry, dst, src, counts[k % 11], k < 77 ? special[k % 11] : rng());
   }
+  mix = false;
   // Independent sample values: 0, 0.5, -1 and 2 multiplied by 0.25.
   entry = {};
   entry.r[4] = sp;
@@ -127,7 +136,25 @@ int main() {
   }
   compare(entry, sp - 64, data, 16,
           0x3f000000); // scratch-stack alias retains the original path
-  printf("Audio scale: %u comparisons, %u failures\n", checks, failures);
+  mix = true;
+  // Independent mixed values: existing 1 plus [0, 0.5, -1, 2] * 0.25.
+  for (unsigned i = 0; i < 16; ++i) {
+    wrf32(data + i * 4, i % 4 == 0   ? 0.0f
+                        : i % 4 == 1 ? 0.5f
+                        : i % 4 == 2 ? -1.0f
+                                     : 2.0f);
+    wrf32(data + 4096 + i * 4, 1.0f);
+  }
+  compare(entry, data + 4096, data, 16, 0x3e800000);
+  for (unsigned i = 0; i < 16; ++i) {
+    ++checks;
+    const float expected[] = {1.0f, 1.125f, 0.75f, 1.5f};
+    if (rdf32(data + 4096 + i * 4) != expected[i % 4])
+      ++failures;
+  }
+  compare(entry, sp - 64, data, 16, 0x3f000000);
+  compare(entry, data, sp - 64, 16, 0x3f000000);
+  printf("Audio scale/mix: %u comparisons, %u failures\n", checks, failures);
   if (failures)
     return 1;
   for (unsigned i = 0; i < 256; ++i)
@@ -138,14 +165,17 @@ int main() {
   wr32(sp + 12, 0x3f000000);
   wr32(sp + 16, 256);
   for (unsigned repeat = 0; repeat < 4; ++repeat)
-    for (unsigned which = 0; which < 2; ++which) {
+    for (unsigned step = 0; step < 2; ++step) {
+      const unsigned which = (repeat & 1u) ? 1u - step : step;
+      for (unsigned i = 0; i < 256; ++i)
+        wrf32(data + 4096 + i * 4, 0.0f);
       const auto start = std::chrono::steady_clock::now();
       for (unsigned i = 0; i < 50000; ++i) {
         X86 c = entry;
         if (which)
-          nfsc_audio_scale(&c);
+          nfsc_audio_mix(&c);
         else
-          fn_008ad12e(&c);
+          fn_008ad305(&c);
       }
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - start)

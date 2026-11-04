@@ -25,8 +25,48 @@
 //                     {t:"cophit", id, c, seq, k, ts, s}  a cops frame  {t:"lights", id, s}
 //                     {t:"pong", n}  {t:"street", id, k, r, a, f}
 //   plus plain HTTP GET /stats, the start page's player count.
-// crew is a short shared name ("" for none): players who give the same one
+// Legacy crew is a short shared name ("" for none): players who give the same one
 // are a crew (case and spaces do not count: "Night Owls" = "nightowls").
+//
+// Private chat: welcome.whispers=1 advertises support. {t:"chat",to:relayId,text}
+// reaches only that named online recipient in the same room and the sender.
+// Both receive {t:"chat",id:senderId,to:recipientId,targetName,text}. Invalid,
+// self, cross-room or rate-limited targets return {t:"chat",id,error:"undelivered"}
+// only to the sender. Presence of any invalid `to` never falls back to room chat.
+// Uses the existing 120-character cleaning and Chat bucket (burst5, then0.5/s).
+// Clients must not send private chat without the welcome capability.
+//
+// Admin moderation (Rust only): {t:"moderation",q,op,name?,text?,minutes?,offset?}
+// -> private {t:"moderation",q,op,ok,data?,error?}. Ops: mute (default10 minutes,
+// max10080), unmute, muted, kick, announce, reports; any player may report.
+// Requires configured protected owner AND exact Admin nickname. No crew grants
+// authority. Requests <=1024 bytes; CrewRead burst12 then2/s. Reports additionally
+// max3 per actor/10min. Pages:50 mutes or25 reports; owner digests never returned.
+// Server sends private {t:"moderation",k:"state",supported,admin,chatAck:true}.
+// Node advertises supported:false and refuses all moderation. Both relays reserve
+// Admin labels and reject common English profanity in room/private chat. Rejected
+// chat -> {t:"chat",id,error:"profanity"|"muted",until?}. hi.chatAck=1 opts into
+// successful public-chat receipts {t:"chat",id,text,ack:true}. Admin announcements
+// -> {t:"moderation",k:"announcement",text} across rooms, generated only by Rust.
+//
+// Protected crews (Rust server only, with persistent crew storage):
+// hi {crews:1, claim} negotiates welcome.crews=1. The server derives crew/crewId
+// and an opaque account from an explicitly claimed player name; supplied crew text
+// and legacy {t:"crew"} setters never grant membership. Welcome/join include
+// {crewId,account}; crew updates include crewId. All crew privileges use crewId.
+// {t:"crewctl",q,op,...} -> {t:"crewctl",q,op,ok,error?,page?}.
+// Ops: create/rename {name}; invite {name:protectedPlayerName}; accept/decline/
+// revoke {invite}; leave/disband; kick/transfer {member:accountId}; state;
+// roster/inbox/outbox {offset}. Leader actions and leave require {crew,revision}.
+// Requests <=1024 bytes; reads burst12 then 2/s per connection, mutations burst12
+// then 0.5/s per account across reconnects. Replies page at most50 entries, with
+// {kind,offset,total,rows}; pagination is not a member cap. No crew member cap.
+// Private {t:"crewstate",account,crew:{id,name,leader,revision,count}|null,pending}
+// updates go only to that account's connections, across rooms. Invites expire in
+// seven days; membership persists. IDs contain no owner proof or cloud-save ID.
+// Rust without storage and this Node relay advertise no protected capability and
+// answer crewctl with error:"unavailable". New clients disable protected features
+// there, never falling back to tag-derived membership or rival eligibility.
 // chat text is at most 120 characters, horn on is true while the player holds
 // the horn; both are limited per player (see LIMITS).
 // k is the car's model key, s the 13 pose numbers (quaternion, position,
@@ -210,6 +250,16 @@
 //   They add nothing to the limits: they only travel inside poses.
 //
 // Racing together (source/web/race.js; the game side is mods/core/nfsc/race.h):
+// World-map lobby/start/join fields use world:true on the existing race channel.
+// Race Together rv:3 uses actual gameplay type IDs (not DAL menu categories).
+// CRC1 v3 appends banked drift score at 0x450. Drift progress/finish messages
+// carry score: integer 0..2147483647 and dnf:boolean for native failure. CRC1
+// appends the native failure flag at 0x454. The peer cp slot carries points
+// with its high bit marking DNF
+// only for drift (never written as native checkpoint count). All players reload.
+// Native CRC1 v3 and explicit free-roam acceptance are required. World sessions
+// cannot queue a launch from the frontend. After Start, a participant loss cancels
+// the practice race; late messages cannot revive retired sessions. No relay change.
 // Activity uses the existing bounded race channel: {t:"race", k:"presence", v:1,
 // a:"roam"|"race"|"away", s:uint32 session, ts:uint32 owner physics time}.
 // Clients publish changes and one heartbeat per second, and answer joins (at
@@ -836,6 +886,18 @@ function streetMessage(peer, m) {
   send(target, { t: "street", id: peer.id, k: m.k, r: m.r, a: m.a, f: m.f });
 }
 
+function reservedAdmin(name) { return name.normalize("NFKC").toLowerCase().replace(/[4@]/g,"a").replace(/[1!]/g,"i").replace(/[^a-z0-9]/g, "").includes("admin"); }
+const profanityWords = ["fuck", "fucks", "fucked", "fucker", "fuckers", "fucking", "motherfucker", "motherfuckers", "motherfucking", "shit", "shits", "shitty", "bullshit", "bitch", "bitches", "asshole", "assholes", "bastard", "bastards", "cunt", "cunts", "dick", "dicks", "cock", "cocks", "pussy", "pussies", "nigger", "niggers", "nigga", "niggas", "fag", "fags", "faggot", "faggots"];
+function profane(text) {
+  const raw = Array.from(text.replace(/[\u200b-\u200d\ufeff]/g, "")).map(c => c >= "！" && c <= "～" ? String.fromCharCode(c.charCodeAt(0) - 0xfee0).toLowerCase() : c.toLowerCase());
+  const alpha = c => !!c && /[a-z0-9]/.test(c);
+  const chars = raw.map((c,i) => ({0:"o",1:"i",3:"e",4:"a",5:"s",7:"t"}[c] ||
+    ((c === "!" || c === "|") && alpha(raw[i-1]) && alpha(raw[i+1]) ? "i" :
+      c === "@" && /[a-z]/.test(raw[i+1] || "") ? "a" : c === "$" && /[a-z]/.test(raw[i+1] || "") ? "s" : c)));
+  const textValue=chars.join("");
+  return profanityWords.some(word => new RegExp("(^|[^a-z0-9])" + word.split("").join("[^a-z0-9]*") + "($|[^a-z0-9])").test(textValue));
+}
+
 function handle(peer, text) {
   let m;
   try { m = JSON.parse(text); } catch { return; }
@@ -843,7 +905,9 @@ function handle(peer, text) {
   if (m.t === "hi") {
     // JSON objects can shadow toString/valueOf, so do not coerce client fields.
     peer.name = label(m.name, "Player", 20);
-    peer.crew = label(m.crew, "", 16);
+    if (reservedAdmin(peer.name)) {peer.socket.end(frame(Buffer.from([0x03,0xf0,...Buffer.from("name reserved")]),8));leave(peer);return;}
+    peer.chatAck = m.chatAck === 1;
+    peer.crew = reservedAdmin(label(m.crew, "", 16)) ? "" : label(m.crew, "", 16);
     peer.crewKey = crewKey(peer.crew);
     peer.physics = m.physics === 1;
     // Compact poses: a page that reads binary poses says which format (1 now); 0 = JSON only.
@@ -852,11 +916,12 @@ function handle(peer, text) {
     peer.cops = !!peer.bin && m.cops === 1;
     // Driving: controls inside compact poses, so only for a page that also got them.
     peer.drive = !!peer.bin && m.drive === 1;
-    send(peer, { t: "welcome", id: peer.id, ...(m.rivals === 1 ? {rivals: 1} : {}), ...(m.physics === 0 || m.physics === 1 ? { physics: 1 } : {}),
+    send(peer, { t: "welcome", id: peer.id, whispers: 1, ...(m.rivals === 1 ? {rivals: 1} : {}), ...(m.physics === 0 || m.physics === 1 ? { physics: 1 } : {}),
       ...(peer.bin ? { bin: peer.bin } : {}), ...(peer.cops ? { cops: 1 } : {}), ...(peer.drive ? { drive: 1 } : {}),
       peers: [...rooms.get(peer.room)].filter((p) => p !== peer && p.named).map(identity) });
     if (peer.closed) return;
     peer.named = true;
+    send(peer,{t:"moderation",k:"state",supported:false,admin:false,chatAck:true});
     others(peer, { t: "join", ...identity(peer) });
     if (peer.closed) return;
     // The cars it gets, at once: their looks (so they are built in them from the start) and poses.
@@ -890,13 +955,29 @@ function handle(peer, text) {
     copHit(peer, m);
   } else if (m.t === "chat" && peer.named && typeof m.text === "string") {
     const text = m.text.replace(/\p{Cc}/gu, " ").trim().slice(0, 120);
-    if (text && allow(peer, "chat")) {
+    if (profane(text)) {send(peer,{t:"chat",id:peer.id,error:"profanity"});return;}
+    if (Object.hasOwn(m, "to")) {
+      const target = Number.isSafeInteger(m.to) && m.to > 0 && m.to !== peer.id
+        ? [...rooms.get(peer.room) ?? []].find(p => p.id === m.to && p.named && !p.closed) : null;
+      if (text && target && allow(peer, "chat")) {
+        const message = {t:"chat", id:peer.id, to:target.id, targetName:target.name, text};
+        const bytes = frame(JSON.stringify(message));
+        write(target, bytes); write(peer, bytes);
+      } else send(peer, {t:"chat", id:peer.id, error:"undelivered"});
+    } else if (text && allow(peer, "chat")) {
       const bytes = frame(JSON.stringify({ t: "chat", id: peer.id, text }));
       for (const p of rooms.get(peer.room) ?? []) if (p !== peer && p.named && !p.closed) write(p, bytes);
+      if (peer.chatAck) send(peer,{t:"chat",id:peer.id,text,ack:true});
     }
+  } else if (m.t === "moderation" && peer.named && allow(peer,"crew")) {
+    send(peer,{t:"moderation",q:Number.isSafeInteger(m.q)?m.q:0,ok:false,error:"unavailable"});
+  } else if (m.t === "crewctl" && peer.named && allow(peer, "crew")) {
+    // Protected crews require the Rust server's verified identity and persistent registry.
+    // No capability is advertised here; new clients must never fall back to shared tags.
+    send(peer, { t: "crewctl", q: Number.isSafeInteger(m.q) ? m.q : 0, op: typeof m.op === "string" ? m.op : "", ok: false, error: "unavailable" });
   } else if (m.t === "crew" && peer.named && typeof m.crew === "string" && allow(peer, "crew")) {
     // A player changing crew while driving; everyone else, and the sender, learn the cleaned name.
-    peer.crew = label(m.crew, "", 16);
+    peer.crew = reservedAdmin(label(m.crew, "", 16)) ? "" : label(m.crew, "", 16);
     peer.crewKey = crewKey(peer.crew);
     send(peer, { t: "crew", id: peer.id, crew: peer.crew });
     others(peer, { t: "crew", id: peer.id, crew: peer.crew });

@@ -618,6 +618,17 @@ void apply_motion(int32_t x, int32_t y, double drawable_dx, double drawable_dy) 
 
 // Where the pointer is right now, in window points.
 bool pointer_in_window_points(double *px, double *py) {
+    // Browsers have canvas-local mouse coordinates, not a desktop window origin.
+    // Subtracting SDL's emulated window position makes captured motion jump.
+    if (!g_window)
+        return false;
+    if (strcmp(SDL_GetCurrentVideoDriver(), "emscripten") == 0) {
+        float x, y;
+        SDL_GetMouseState(&x, &y);
+        *px = x;
+        *py = y;
+        return true;
+    }
     float gx, gy;
     SDL_GetGlobalMouseState(&gx, &gy);
     int wx, wy;

@@ -9,6 +9,12 @@
 #include <mutex>
 #include <thread>
 #include "../platform/os.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#define PROFILE_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define PROFILE_EXPORT __attribute__((used, visibility("default")))
+#endif
 
 extern "C" const int recomp_profile_enabled = [] {
     const char *value = recomp_env("PROFILE");
@@ -22,9 +28,36 @@ namespace {
 struct ThreadState {
     ProfileSlot slot;
     std::vector<uint32_t> stack;
+    // The thread map (recomp_profile_threads_dump): every function this thread entered and how
+    // often, the critical sections it entered (guest address) and the imports it called (index).
+    // Written by the thread itself under `m`; the dump reads them under it too.
+    std::mutex m;
+    std::vector<uint32_t> calls;
+    uint32_t first = PROFILE_IDLE;
+    std::map<uint32_t, uint64_t> locks, imports;
+    uint32_t tid = 0; // the guest's thread id (GetCurrentThreadId), from the first note
 };
 // Intentionally process-lifetime: a sampler snapshot can outlive thread exit.
 thread_local ThreadState *local = nullptr;
+std::mutex g_threads_m;
+// kernel32.cpp's; 0 in runtime-only tests that do not link it.
+extern "C" __attribute__((weak)) uint32_t recomp_guest_thread_id() {
+    return 0;
+}
+std::vector<ThreadState *> &all_threads() {
+    static auto *v = new std::vector<ThreadState *>;
+    return *v;
+}
+ThreadState *thread_state() {
+    if (!local) {
+        local = new ThreadState;
+        local->tid = recomp_guest_thread_id();
+        sched_register_profile_slot(&local->slot);
+        std::lock_guard<std::mutex> lock(g_threads_m);
+        all_threads().push_back(local);
+    }
+    return local;
+}
 struct State {
     std::atomic<bool> stop{false};
     std::thread sampler;
@@ -67,6 +100,11 @@ void report() {
         fprintf(stderr, "profile: guest_ms_per_frame omitted: no phase stats supplied\n");
 }
 void start() {
+#ifdef __EMSCRIPTEN__
+    // No sampler thread on the web: a new pthread started from a guest thread can wait forever for a
+    // worker (the pool is sized for the game). The thread map needs only the push counts.
+    return;
+#endif
     static const bool started = [] {
         std::atexit(report);
         state().sampler = std::thread([] {
@@ -106,9 +144,16 @@ extern "C" void recomp_profile_push(uint32_t index) {
     if (!recomp_profile_enabled)
         return;
     if (!local) {
-        local = new ThreadState;
-        sched_register_profile_slot(&local->slot);
+        thread_state();
         start();
+    }
+    {
+        std::lock_guard<std::mutex> lock(local->m);
+        if (local->first == PROFILE_IDLE)
+            local->first = index;
+        if (index >= local->calls.size())
+            local->calls.resize(index + 1024);
+        ++local->calls[index];
     }
     local->stack.push_back(index);
     local->slot.top.store(index, std::memory_order_relaxed);
@@ -145,4 +190,74 @@ std::vector<ProfileSample> profile_snapshot() {
         return a.samples != b.samples ? a.samples > b.samples : a.index < b.index;
     });
     return rows;
+}
+
+// The thread map: per guest thread, the functions entered, critical sections entered and imports
+// called since the start, as JSON in `path` (on the web the page reads it back from the file
+// system). Profiling (RECOMP_PROFILE=1) must be on; otherwise the file holds an empty list.
+extern "C" __attribute__((weak)) const char *imports_tramp_name(uint32_t) {
+    return nullptr;
+}
+// RECOMP_THREAD_MAP=1 turns on just these two counters (cheap, no change to how calls are made); the
+// per-function counts need RECOMP_PROFILE=1, which routes every call through recomp_call.
+static bool thread_map_on() {
+    static const bool on = recomp_profile_enabled || (recomp_env("THREAD_MAP") && !strcmp(recomp_env("THREAD_MAP"), "1"));
+    return on;
+}
+void profile_note_lock(uint32_t critical_section) {
+    if (!thread_map_on())
+        return;
+    ThreadState *t = thread_state();
+    std::lock_guard<std::mutex> lock(t->m);
+    ++t->locks[critical_section];
+}
+void profile_note_import(uint32_t index) {
+    if (!thread_map_on())
+        return;
+    ThreadState *t = thread_state();
+    std::lock_guard<std::mutex> lock(t->m);
+    ++t->imports[index];
+}
+extern "C" PROFILE_EXPORT int recomp_profile_threads_dump(const char *path) {
+    if (!path)
+        path = "/tmp/recomp-threads.json"; // what the page reads back
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return 0;
+    std::lock_guard<std::mutex> list(g_threads_m);
+    fprintf(f, "[");
+    for (size_t i = 0; i < all_threads().size(); ++i) {
+        ThreadState *t = all_threads()[i];
+        std::lock_guard<std::mutex> lock(t->m);
+        const char *first = t->first == PROFILE_IDLE ? nullptr : recomp_profile_name(t->first);
+        fprintf(f, "%s\n{\"thread\":%zu,\"tid\":%u,\"first\":\"%s\",\"functions\":{", i ? "," : "", i, t->tid,
+                first ? first : "");
+        bool comma = false;
+        for (size_t k = 0; k < t->calls.size(); ++k)
+            if (t->calls[k]) {
+                const char *name = recomp_profile_name(uint32_t(k));
+                if (name)
+                    fprintf(f, "%s\"%s\":%u", comma ? "," : "", name, t->calls[k]);
+                else
+                    fprintf(f, "%s\"#%zu\":%u", comma ? "," : "", k, t->calls[k]);
+                comma = true;
+            }
+        fprintf(f, "},\"locks\":{");
+        comma = false;
+        for (auto &l : t->locks) {
+            fprintf(f, "%s\"%08x\":%llu", comma ? "," : "", l.first, (unsigned long long)l.second);
+            comma = true;
+        }
+        fprintf(f, "},\"imports\":{");
+        comma = false;
+        for (auto &m : t->imports) {
+            const char *n = imports_tramp_name(m.first);
+            fprintf(f, "%s\"%s\":%llu", comma ? "," : "", n ? n : "?", (unsigned long long)m.second);
+            comma = true;
+        }
+        fprintf(f, "}}");
+    }
+    fprintf(f, "\n]\n");
+    fclose(f);
+    return 1;
 }

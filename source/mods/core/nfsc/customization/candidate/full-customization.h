@@ -7,7 +7,7 @@
  * 008426a0 is StandardSelectablePart::GetPrice (part pointer at +0x10).
  * Menu runtime verification and rear-slot mapping remain pending.
  */
-static uint32_t g_cust_hooks[35];
+static uint32_t g_cust_hooks[37];
 static int g_cust_neon_render_ready,g_cust_neon_as_ready;
 static int g_cust_stance_ready;
 static int g_cust_plate_ready;
@@ -839,7 +839,10 @@ static void customization_install(void) {
         {0x007e55e0u, cust_tire_ctor, POP_HOOK_WRAP},
         {0x007d5280u, cust_tire_dtor, POP_HOOK_WRAP},
         {0x007d9e20u, cust_tire_update, POP_HOOK_WRAP},
-        {0x007ae210u, cust_tire_wheel3, POP_HOOK_WRAP},
+        /* Only these three native draws use the wheel3 callback. */
+        {0x007ae210u, cust_tire_wheel3, POP_HOOK_WRAP, 0x007dfefcu, 0},
+        {0x007ae210u, cust_tire_wheel3, POP_HOOK_WRAP, 0x007e009du, 1},
+        {0x007ae210u, cust_tire_wheel3, POP_HOOK_WRAP, 0x007e029au, 1},
         /* Wheel four and both brake draws share eModel::Render. Keep one
          * broad callback on older hosts; modern hosts filter before snapshots. */
         {0x00729320u, cust_tire_wheel4, POP_HOOK_WRAP, 0x007e0516u, 0},

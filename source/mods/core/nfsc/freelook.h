@@ -1,3 +1,5 @@
+static int cockpit_requested(void);
+static int cockpit_look(const PopModApi *,pop_cpu_v1 *,float,float);
 /* freelook.h - free look for the chase camera (core.nfsc).
  *
  * The right stick swings the chase camera around the car: full left or right
@@ -94,16 +96,22 @@ static void fl_look(const PopModApi *api, pop_cpu_v1 *cpu) {
     if (now - g_fl_seen_ms > 250)
         fl_reset(); /* a new race, or the chase camera back after a menu or a movie */
     const uint32_t view = mover ? get_u32(mover + FL_VIEW) : 0;
-    const int chase = mode > 0 && mover && from && to && (view == 2 || view == 3 || view == 4) &&
-                      !(get_u32(mover + FL_LOOK_BACK) & 0xffu);
-    if (!chase) {
+    const int usable = mover && from && to && !(get_u32(mover + FL_LOOK_BACK) & 0xffu);
+    const int chase = mode > 0 && (view == 2 || view == 3 || view == 4);
+    if (!usable || (!chase && !cockpit_requested())) {
         fl_reset();
         atomic_store(&g_fl_drag, 0);
         return;
     }
     uint32_t paused = 0;
     if (api->guest_call(api, FL_IS_PAUSED, 0, NULL, 0, &paused) == POP_OK && (paused & 0xffu))
-        return; /* the game's camera as it is; the look carries on after the pause */
+        return;
+    if (!chase) {
+        fl_reset();
+        atomic_store(&g_fl_drag, 0);
+        if (cockpit_look(api, cpu, 0.0f, 0.0f)) g_fl_seen_ms = now;
+        return;
+    }
     g_fl_seen_ms = now;
 
     const float t[3] = {fl_float(to), fl_float(to + 4), fl_float(to + 8)};
@@ -150,6 +158,7 @@ static void fl_look(const PopModApi *api, pop_cpu_v1 *cpu) {
             log_line(line);
         }
     }
+    if (cockpit_look(api,cpu,g_fl_yaw,g_fl_pitch)) return;
     if (g_fl_yaw == 0.0f && g_fl_pitch == 0.0f)
         return; /* exactly the game's camera */
     if (!g_fl_logged) {

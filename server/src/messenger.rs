@@ -50,8 +50,10 @@ const MAX_BLOCKED: usize = 100;
 /// Names kept at most (about 100 bytes each in messenger.json, which is written whole on each
 /// change). When full, a new name makes room by taking the place of the longest-unseen name
 /// that holds nothing (no recent browser-key metadata, friends, requests or blocks); when
-/// there is none, it signs in without being kept.
-const MAX_PEOPLE: usize = 10_000;
+/// there is none, Login returns an error rather than signing in an unsearchable name.
+/// The original 10,000-name directory filled on the public server. Keep its records
+/// and browser-key migration metadata intact while allowing further registrations.
+const MAX_PEOPLE: usize = 100_000;
 /// A name's last sign-in is written at most once a day (it counts for metadata retention),
 /// so signing in does not rewrite the file each time.
 const SEEN_STEP_SECS: u64 = 24 * 3600;
@@ -194,12 +196,12 @@ impl Store {
 
     /// Remember a display name and its latest browser-key digest, when supplied. Browser keys
     /// are metadata only: changing or losing one never blocks sign-in or removes relationships.
-    pub fn use_name(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) {
+    pub fn use_name(&mut self, name: &str, key: Option<&KeyDigest>, now: u64) -> bool {
         let k = low(name);
         let key = key.map(hex);
         let new = !self.people.contains_key(&k);
         if new && self.people.len() >= MAX_PEOPLE && !self.make_room(now) {
-            return;
+            return false;
         }
         let p = self.people.entry(k).or_insert(Person { name: name.to_string(), key: None, seen: now });
         let changed = new || p.name != name || (key.is_some() && key != p.key) || now.saturating_sub(p.seen) >= SEEN_STEP_SECS;
@@ -211,6 +213,7 @@ impl Store {
             p.seen = now;
             self.save();
         }
+        true
     }
 
     /// The store is full: forgets the longest-unseen name that holds nothing (no recent key
@@ -528,21 +531,31 @@ impl Messenger {
             }
             b"SEND" => {
                 let ok = self.online.get_mut(&me).is_some_and(|o| o.chat.take(now, CHAT_BURST, CHAT_PER_MS));
-                // Too fast: the game says "You cannot send a message that often." (0x8335e0).
-                out.push((conn, Packet::new(b"SEND", if ok { 0 } else { u32::from_be_bytes(*b"rate") }).with("ID", &id)));
-                if ok && self.store.are_friends(&me, &other) && !self.store.blocked.contains(&(other.clone(), me.clone())) {
-                    if let Some(c) = self.conn_of(&other) {
-                        let name = self.store.display(&me);
-                        out.push((
-                            c,
-                            Packet::new(b"RECV", 0)
-                                .with("TYPE", if p.get("TYPE") == Some("A") { "A" } else { "C" })
-                                .with("USER", user_full(&name))
-                                .with("TIME", now / 1000)
-                                .with("SUBJ", clean_text(p.get("SUBJ").unwrap_or("")))
-                                .with("BODY", clean_text(p.get("BODY").unwrap_or(""))),
-                        ));
-                    }
+                let body = clean_text(p.get("BODY").unwrap_or(""));
+                let recipient = self.conn_of(&other).filter(|_| {
+                    self.store.are_friends(&me, &other)
+                        && !self.store.blocked.contains(&(other.clone(), me.clone()))
+                        && !self.store.blocked.contains(&(me.clone(), other.clone()))
+                });
+                // 008335e0 maps `rate` to the native rate-limit message and other
+                // nonzero errors to its error popup. Success means a RECV was queued;
+                // chat is live-only, so an offline friend cannot silently accept it.
+                let error = if !ok { Some(*b"rate") }
+                    else if body.trim().is_empty() { Some(*b"text") }
+                    else if recipient.is_none() { Some(*b"user") }
+                    else { None };
+                out.push((conn, Packet::new(b"SEND", error.map_or(0, u32::from_be_bytes)).with("ID", &id)));
+                if error.is_none() {
+                    let name = self.store.display(&me);
+                    out.push((
+                        recipient.expect("validated above"),
+                        Packet::new(b"RECV", 0)
+                            .with("TYPE", if p.get("TYPE") == Some("A") { "A" } else { "C" })
+                            .with("USER", user_full(&name))
+                            .with("TIME", now / 1000)
+                            .with("SUBJ", clean_text(p.get("SUBJ").unwrap_or("")))
+                            .with("BODY", body),
+                    ));
                 }
             }
             b"GINV" => {
@@ -602,7 +615,10 @@ impl Messenger {
         if to == me {
             return Some(*b"user");
         }
-        if to.is_empty() || self.store.are_friends(me, to) {
+        if to.is_empty() {
+            return Some(*b"exst");
+        }
+        if self.store.are_friends(me, to) {
             return None;
         }
         // asked by the other side already: that is a yes
@@ -615,7 +631,7 @@ impl Messenger {
         }
         if !self.store.known(to) {
             // an EA account had to exist; here, a name someone has signed in with
-            return None;
+            return Some(*b"exst");
         }
         // A player who blocked `me` never hears of it, now or at a later sign-in: nothing is
         // kept, and `me` reads it as declined.
@@ -845,6 +861,7 @@ mod tests {
         m.sign_in(C, "Ada", 1);
         let out = m.handle(A, &pk(b"SEND", &[("TYPE", "C"), ("USER", "Jan"), ("BODY", "hi"), ("ID", "9")]), 50);
         assert!(to(&out, B).is_empty(), "not friends yet");
+        assert!(out.iter().any(|(c, p)| *c == A && p.kind == *b"SEND" && p.id != 0), "undeliverable chat must not be acknowledged as sent");
         friends(&mut m);
         let out = m.handle(A, &pk(b"SEND", &[("TYPE", "C"), ("USER", "Jan"), ("BODY", "hi \"there\""), ("ID", "9")]), 60);
         let b = to(&out, B);
@@ -864,6 +881,12 @@ mod tests {
         // Ada is nobody's friend: nothing reaches her
         let out = m.handle(A, &pk(b"GINV", &[("USER", "Ada"), ("SESS", "1"), ("ID", "11")]), 72);
         assert!(to(&out, C).is_empty());
+        let out = m.handle(A, &pk(b"SEND", &[("TYPE", "C"), ("USER", "Jan"), ("BODY", ""), ("ID", "12")]), 10_000);
+        assert!(to(&out, B).is_empty(), "an empty native text field must not deliver a blank message");
+        assert!(out.iter().any(|(c, p)| *c == A && p.kind == *b"SEND" && p.id != 0));
+        m.closed(B);
+        let out = m.handle(A, &pk(b"SEND", &[("TYPE", "C"), ("USER", "Jan"), ("BODY", "hi"), ("ID", "13")]), 20_000);
+        assert!(out.iter().any(|(c, p)| *c == A && p.kind == *b"SEND" && p.id != 0), "an offline friend cannot receive live-only chat");
     }
 
     #[test]
@@ -881,15 +904,29 @@ mod tests {
     #[test]
     fn a_full_store_makes_room_only_from_names_that_hold_nothing() {
         let mut s = Store::default();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         for i in 0..MAX_PEOPLE {
-            s.use_name(&format!("p{i}"), Some(&digest(&format!("k{i}"))), 1000 + i as u64);
+            s.use_name(&format!("p{i}"), Some(&digest(&format!("k{i}"))), now + i as u64);
         }
         // recent browser-key metadata keeps each otherwise empty name for now
-        s.use_name("Late", Some(&digest("late")), 5000);
+        assert!(!s.use_name("Late", Some(&digest("late")), now));
         assert!(!s.known("late") && s.people.len() == MAX_PEOPLE);
+        // Registration failure must reach the native sign-in boundary instead of
+        // handing out a login key for a name Messenger can never discover.
+        let mut hub = crate::ea::Hub::default();
+        hub.messenger.store = s;
+        let mut session = crate::ea::Session::new(crate::ea::Service::Fesl, A);
+        let login = |name: &str| Packet::new(b"acct", 1).with("TXN", "Login").with("name", name).encode();
+        let events = session.feed(&login("Late"), &mut hub).unwrap();
+        let reply = events.iter().find_map(|e| match e { crate::ea::Event::Out(raw, _) => Some(Packet::decode(raw)), _ => None }).unwrap();
+        assert_eq!(reply.get("errorCode"), Some("99"));
+        assert!(reply.get("lkey").is_none());
+        let events = session.feed(&login("p0"), &mut hub).unwrap();
+        assert!(events.iter().any(|e| matches!(e, crate::ea::Event::Out(raw, _) if Packet::decode(raw).get("lkey").is_some())), "existing names must still sign in when the directory is full");
+        let mut s = hub.messenger.store;
         // a month on, old metadata no longer keeps the longest-unseen empty name
         s.friends.insert(pair("p0", "p1"));
-        let later = 1000 + KEY_RETENTION_SECS + MAX_PEOPLE as u64;
+        let later = now + KEY_RETENTION_SECS + MAX_PEOPLE as u64;
         s.use_name("Late", Some(&digest("late")), later);
         assert!(s.known("late") && s.known("p0") && s.known("p1") && !s.known("p2"));
         assert_eq!(s.people.len(), MAX_PEOPLE);
@@ -935,5 +972,26 @@ mod tests {
         let a = to(&out, A);
         assert_eq!(a[0], "USCH 0x00000000 {ID=6, SIZE=1}");
         assert!(a[1].contains("USER=Jan"));
+        let out = m.handle(A, &pk(b"RADM", &[("USER", "UnknownName"), ("ID", "7")]), 2);
+        assert!(out.iter().any(|(c, p)| *c == A && p.kind == *b"RADM" && p.id != 0), "unknown names must not appear to accept a friend request");
+    }
+
+    #[test]
+    fn native_friends_remain_discoverable_after_ten_thousand_names() {
+        let mut m = two();
+        friends(&mut m);
+        for i in 0..9_998 {
+            m.store.use_name(&format!("old{i}"), Some(&digest("recent-browser")), 1000);
+        }
+        m.store.use_name("NewFriend", Some(&digest("new-browser")), 1001);
+        m.sign_in(C, "NewFriend", 1_001_000);
+        let out = m.handle(A, &pk(b"USCH", &[("USER", "NewFriend"), ("ID", "10")]), 1_001_001);
+        assert!(out.iter().any(|(c, p)| *c == A && p.kind == *b"USER" && p.get("USER") == Some("NewFriend")), "a newly signed-in name must remain searchable after the old directory limit");
+        let out = m.handle(A, &pk(b"RADM", &[("USER", "NewFriend"), ("ID", "11")]), 1_001_002);
+        assert!(out.iter().any(|(c, p)| *c == C && p.kind == *b"RNOT" && p.get("ATTR") == Some("RT")), "a friend request must reach the new name");
+        m.handle(C, &pk(b"RRSP", &[("USER", "Metin"), ("ANSW", "Y")]), 1_001_003);
+        assert!(m.store.are_friends("metin", "newfriend"));
+        assert!(m.store.are_friends("metin", "jan"), "existing friendships must be preserved");
+        assert_eq!(m.store.people["metin"].key, Some(hex(&digest("a"))), "existing name metadata must be preserved");
     }
 }

@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::host::{Expected, Host};
 use crate::identity::{Claims, Owner};
@@ -598,6 +598,9 @@ pub struct Games {
     last_gid: u32,
     /// PlayNow session ids handed out.
     last_session: u32,
+    /// Last offer of a served room. Unused offers expire so repeated Custom Match
+    /// creation cannot fill the fixed game-port range permanently.
+    served_offers: BTreeMap<u32, Instant>,
 }
 
 impl Games {
@@ -647,18 +650,22 @@ impl Games {
         self.by_gid.insert(TRACE_GID, g);
     }
 
-    /// An open game of the server's own (CARBON_HOST_GAME) for a player to join: the first
-    /// with room, else a new one, with its race host. Its tunnel key is random, as EA's were.
-    fn served_game(&mut self, hosts: &mut BTreeMap<u32, Host>, ekey: String) -> u32 {
-        // A room whose race is on cannot take a player (its host would refuse it): the
-        // player gets a room of its own instead, and waits there as its leader.
-        let open = |g: &Game| {
-            g.served && hosts.get(&g.gid).is_some_and(|h| !h.in_race()) && hosts.get(&g.gid).map_or(0, |h| h.players()) + g.joining() < g.max_players as usize
-        };
-        if let Some(g) = self.by_gid.values().find(|g| open(g)) {
-            return g.gid;
+    /// Allocate a separate server-hosted room. Matchmaking already chose whether an
+    /// existing room was suitable; reusing one here would undo Custom Match's choice.
+    fn served_game(&mut self, hosts: &mut BTreeMap<u32, Host>, ekey: String) -> Option<u32> {
+        let expired: Vec<u32> = self.served_offers.iter().filter_map(|(&gid, offered)| {
+            let game = self.by_gid.get(&gid)?;
+            let host = hosts.get(&gid)?;
+            (offered.elapsed() >= Duration::from_secs(300) && game.members.is_empty()
+                && host.players() == 0 && !host.in_race()).then_some(gid)
+        }).collect();
+        for gid in expired {
+            self.by_gid.remove(&gid);
+            hosts.remove(&gid);
+            self.served_offers.remove(&gid);
         }
-        let n = (0..1000u32).find(|n| !self.by_gid.contains_key(&(SERVED_GID + n))).unwrap_or(0);
+        // Exhaustion must not overwrite a room that other players are using.
+        let n = (0..1000u32).find(|n| !self.by_gid.contains_key(&(SERVED_GID + n)))?;
         let gid = SERVED_GID + n;
         let port = SERVED_PORT + n as u16;
         let host = User { name: SERVED_HOST.into(), id: user_id(SERVED_HOST), lkey: String::new() };
@@ -689,7 +696,8 @@ impl Games {
         }
         hosts.insert(gid, Host::new(gid, port, host.id as u64, &ekey));
         self.by_gid.insert(gid, g);
-        gid
+        self.served_offers.insert(gid, Instant::now());
+        Some(gid)
     }
 }
 
@@ -861,7 +869,10 @@ impl Session {
                     return;
                 }
                 let key = hub.player_keys.get(&self.key.0).copied();
-                hub.messenger.store.use_name(&name, key.as_ref(), unix_secs());
+                if !hub.messenger.store.use_name(&name, key.as_ref(), unix_secs()) {
+                    Self::send(ev, error(p, &txn, "The online name directory is full. Please try again later."));
+                    return;
+                }
                 let user = hub.logins.login(&name);
                 ev.push(Event::Note(format!("{} logged in (userId {})", user.name, user.id)));
                 hub.stats.signed_in(&user.name, key.as_ref(), unix_secs());
@@ -902,17 +913,31 @@ impl Session {
                     }
                     hub.races.insert(kind, list);
                 }
-                if hub.host_game && playnow_status(p, id, self.user.as_ref(), &hub.games, &hub.hosts).get("props.{resultType}") != Some("JOIN") {
+                // Captured native Custom Match asks for a one-player pool with
+                // matchmaking disabled. Quick Match enables matchmaking. Both join a
+                // dedicated host; the client's CREATE callback does not host a race.
+                let custom = p.get("players.0.props.{filter-matchmaking_state}") == Some("0")
+                    && p.get("players.0.props.{poolMaxPlayers}") == Some("1");
+                let mut status = playnow_status(p, id, self.user.as_ref(), &hub.games, &hub.hosts);
+                if hub.host_game && (custom || status.get("props.{resultType}") != Some("JOIN")) {
                     let ekey = base64(&hub.bytes(16)).replace('=', "%3d");
                     let gid = hub.games.served_game(&mut hub.hosts, ekey);
-                    if let Some(h) = hub.hosts.get_mut(&gid) {
-                        for (k, v) in &hub.races {
-                            h.races.entry(k.clone()).or_insert_with(|| v.clone());
+                    if let Some(gid) = gid {
+                        if let Some(h) = hub.hosts.get_mut(&gid) {
+                            for (k, v) in &hub.races {
+                                h.races.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
                         }
+                        ev.push(Event::Note(format!("PlayNow: the race host's game {gid} has room")));
                     }
-                    ev.push(Event::Note(format!("PlayNow: the race host's game {gid} has room")));
+                    // Return the allocated room, not another search which could select
+                    // someone else's lower-id room again.
+                    status = playnow_result(id, gid.and_then(|gid| hub.games.by_gid.get(&gid)));
                 }
-                let status = playnow_status(p, id, self.user.as_ref(), &hub.games, &hub.hosts);
+                if let Some(offered) = status.get("props.{games}.0.gid").and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|gid| hub.games.served_offers.get_mut(&gid)) {
+                    *offered = Instant::now();
+                }
                 ev.push(Event::Note(format!("PlayNow session {id}: {}", status.get("props.{resultType}").unwrap_or("?"))));
                 Self::send(ev, status);
             }
@@ -1453,6 +1478,10 @@ fn playnow_status(p: &Packet, id: u32, user: Option<&User>, games: &Games, hosts
                 || g.served
                 || g.attrs.iter().find(|(k, _)| k == "B-U-game_type").map_or(true, |(_, v)| game_type.split('|').any(|t| t == v)))
     });
+    playnow_result(id, open)
+}
+
+fn playnow_result(id: u32, open: Option<&Game>) -> Packet {
     let base = Packet::new(b"pnow", 0x8000_0000)
         .with("TXN", "Status")
         .with("id.id", id)
@@ -1577,6 +1606,45 @@ clientPlatform=PC\nclientVersion=2.0\nSDKVersion=2.9.7.1.0\nprotocolVersion=2.0\
 
     fn out(events: &[Event]) -> Vec<Packet> {
         events.iter().filter_map(|e| if let Event::Out(raw, _) = e { Some(Packet::decode(raw)) } else { None }).collect()
+    }
+
+    #[test]
+    fn native_custom_match_gets_its_own_room_and_quick_match_reuses_one() {
+        let mut hub = Hub { host_game: true, ..Hub::default() };
+        let mut a = Session::new(Service::Fesl, (0x0a4d_0010, 50000, FESL_PORT, 1));
+        let mut b = Session::new(Service::Fesl, (0x0a4d_0011, 50001, FESL_PORT, 2));
+        for (s, name) in [(&mut a, "MatchA"), (&mut b, "MatchB")] {
+            s.feed(&Packet::new(b"acct", 1).with("TXN", "Login").with("name", name).encode(), &mut hub).unwrap();
+        }
+        // Native Custom Match: one-player pool and matchmaking disabled. Quick Match
+        // enables matchmaking instead. Both still use the client's JOIN response.
+        let start = |mode: &str| Packet::new(b"pnow", 2).with("TXN", "Start")
+            .with("players.0.props.{sessionType}", "resetServer")
+            .with("players.0.props.{filter-matchmaking_state}", mode)
+            .with("players.0.props.{poolMaxPlayers}", if mode == "0" { "1" } else { "8" });
+        let first = out(&a.feed(&start("0").encode(), &mut hub).unwrap()).pop().unwrap();
+        let second = out(&b.feed(&start("0").encode(), &mut hub).unwrap()).pop().unwrap();
+        assert_eq!(first.get("props.{resultType}"), Some("JOIN"));
+        assert_eq!(second.get("props.{resultType}"), Some("JOIN"));
+        assert_ne!(first.get("props.{games}.0.gid"), second.get("props.{games}.0.gid"), "Custom Match must not join someone else's open room");
+        let quick = out(&b.feed(&start("1").encode(), &mut hub).unwrap()).pop().unwrap();
+        assert_eq!(quick.get("props.{games}.0.gid"), first.get("props.{games}.0.gid"), "Quick Match must still join an available room");
+
+        let first_gid: u32 = first.get("props.{games}.0.gid").unwrap().parse().unwrap();
+        let second_gid: u32 = second.get("props.{games}.0.gid").unwrap().parse().unwrap();
+        let old_key = hub.games.by_gid[&second_gid].ekey.clone();
+        // A pending Theater join reserves its room even if its offer is old. An
+        // abandoned, empty room can be reset for a new Custom Match after five minutes.
+        hub.games.by_gid.get_mut(&first_gid).unwrap().members.push(Member {
+            pid: 2, user: a.user.clone().unwrap(), conn: a.key, ticket: String::new(), entered: false,
+        });
+        for offered in hub.games.served_offers.values_mut() {
+            *offered = Instant::now() - Duration::from_secs(301);
+        }
+        let next = out(&b.feed(&start("0").encode(), &mut hub).unwrap()).pop().unwrap();
+        assert_eq!(next.get("props.{games}.0.gid"), Some(second_gid.to_string().as_str()));
+        assert_ne!(hub.games.by_gid[&second_gid].ekey, old_key, "an expired room gets a fresh host and tunnel key");
+        assert_eq!(hub.games.by_gid[&first_gid].joining(), 1, "an in-flight join must survive cleanup");
     }
 
     #[test]

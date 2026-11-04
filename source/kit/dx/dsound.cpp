@@ -21,6 +21,8 @@
 #include <string.h>
 #include <time.h>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 #include "../platform/os.h"
 #include "../platform/ab_phase.h"
 #include <math.h>
@@ -93,9 +95,26 @@ ComObj *this_dsound(X86 *c) {
     ComObj *o = com_this_arg(c);
     return (o && o->kind == K_DSOUND) ? o : nullptr;
 }
+// The sound thread may run free (game.toml / RECOMP_FREE_RUN). Then the three calls it makes
+// hundreds of times a second - GetCurrentPosition, Lock and Unlock - run without the baton
+// (dsound_register: imports_register_baton_free_method), and every DirectSound shim holds
+// g_ds_m (imports_serialize_dll), so those three never meet another DirectSound call halfway;
+// the host mixer has its own lock. The COM tables are not theirs to read without the baton (the
+// holder may be adding Direct3D objects), so they find their buffer in g_ds_known, filled here
+// by a call made holding the baton and emptied when the buffer is destroyed, and a pointer not
+// in it sends the call back to the baton.
+std::recursive_mutex g_ds_m;
+std::unordered_map<uint32_t, ComObj *> g_ds_known;
+thread_local ComObj *t_ds_this = nullptr;
+
 ComObj *this_buffer(X86 *c) {
+    if (t_ds_this)
+        return t_ds_this;
     ComObj *o = com_this_arg(c);
-    return (o && o->kind == K_DSBUFFER) ? o : nullptr;
+    if (!o || o->kind != K_DSBUFFER)
+        return nullptr;
+    g_ds_known[arg(c, 0)] = o;
+    return o;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +148,7 @@ struct NotifyPos {
 
 struct NotifyRecord {
     uint32_t obj_id = 0;
+    ComObj *obj = nullptr; // the buffer, found when the record is made (this_buffer)
     std::vector<NotifyPos> pos;
     uint32_t last = 0;     // where the play cursor was last seen
     bool tracking = false; // false until the first service after a Play
@@ -147,6 +167,7 @@ NotifyRecord *notify_for(uint32_t id, bool create = false) {
         return nullptr;
     notifies().push_back(NotifyRecord{});
     notifies().back().obj_id = id;
+    notifies().back().obj = com_get(id);
     return &notifies().back();
 }
 
@@ -284,7 +305,7 @@ void service_notifications() {
     for (NotifyRecord &n : notifies()) {
         if (n.pos.empty())
             continue;
-        ComObj *b = com_get(n.obj_id);
+        ComObj *b = n.obj;
         if (!b || b->kind != K_DSBUFFER)
             continue;
 
@@ -1795,6 +1816,9 @@ ComObj *dsbuffer_qi(ComObj *self, ComIface want) {
 }
 
 void dsbuffer_destroy(ComObj *b) {
+    std::lock_guard<std::recursive_mutex> held(g_ds_m);
+    for (auto it = g_ds_known.begin(); it != g_ds_known.end();)
+        it = it->second == b ? g_ds_known.erase(it) : std::next(it);
     for (size_t i = 0; i < notifies().size(); ++i) {
         if (notifies()[i].obj_id != b->id)
             continue;
@@ -1845,11 +1869,39 @@ void dsound_pump() {
     service_notifications();
 }
 
+// The baton-free calls (g_ds_m above): the buffer from g_ds_known, then the shim itself.
+bool ds_free_call(X86 *c, void (*shim)(X86 *)) {
+    std::lock_guard<std::recursive_mutex> held(g_ds_m);
+    auto it = g_ds_known.find(arg(c, 0));
+    if (it == g_ds_known.end() || !it->second->alive)
+        return false;
+    t_ds_this = it->second;
+    shim(c);
+    t_ds_this = nullptr;
+    return true;
+}
+bool dsf_GetCurrentPosition(X86 *c) {
+    return ds_free_call(c, Buffer_GetCurrentPosition);
+}
+bool dsf_Lock(X86 *c) {
+    return ds_free_call(c, Buffer_Lock);
+}
+bool dsf_Unlock(X86 *c) {
+    return ds_free_call(c, Buffer_Unlock);
+}
+
 void dsound_register() {
     static bool done = false;
     if (done)
         return;
     done = true;
+
+    imports_serialize_dll("DSOUND.dll", &g_ds_m);
+    imports_register_baton_free_method("DSOUND.dll", "IDirectSoundBuffer::GetCurrentPosition",
+                                       dsf_GetCurrentPosition, Buffer_GetCurrentPosition);
+    imports_register_baton_free_method("DSOUND.dll", "IDirectSoundBuffer::Lock", dsf_Lock, Buffer_Lock);
+    imports_register_baton_free_method("DSOUND.dll", "IDirectSoundBuffer::Unlock", dsf_Unlock,
+                                       Buffer_Unlock);
 
     com_define(IF_DSOUND, "DSOUND.dll", "IDirectSound", g_dsound, std::size(g_dsound));
     com_define(IF_DSBUFFER, "DSOUND.dll", "IDirectSoundBuffer", g_dsbuffer, std::size(g_dsbuffer));

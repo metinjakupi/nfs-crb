@@ -484,7 +484,11 @@ fn the_key_is_checked_and_the_relay_still_answers() {
     let mut room = room.unwrap();
     room.send(1, br#"{"t":"hi","name":"Bob"}"#);
     let Msg::Text(welcome) = room.read() else { panic!() };
-    assert_eq!(welcome, r#"{"t":"welcome","id":1,"peers":[]}"#);
+    // Capabilities can be added without changing authentication or room admission.
+    let welcome: serde_json::Value = serde_json::from_str(&welcome).unwrap();
+    assert_eq!(welcome["t"], "welcome");
+    assert_eq!(welcome["id"], 1);
+    assert_eq!(welcome["peers"], serde_json::json!([]));
 }
 
 #[test]

@@ -1,7 +1,8 @@
 /* lights.h - turn signals (blinkers) and a headlight flash (included by nfsc.c, after mp.h).
  *
  * WHAT THE PLAYER GETS. Q / E (or the d-pad left / right) switch the left / right turn signal on
- * and off: amber lamps at the car's front and rear corners blink 1.5 times a second. A signal
+ * and off. 4 toggles both sides together (hazard lights), without turn auto-off.
+ * Amber lamps at the car's front and rear corners blink 1.5 times a second. A signal
  * switches itself off once the car has turned through a corner and straightened out again
  * (setting turn_signal_auto_off). Holding F (or holding the left stick pressed in, L3) flashes the
  * high beams: a much brighter, bigger, whiter glare at the headlights while held (at least
@@ -144,6 +145,7 @@ static atomic_uint g_lt_keys_pressed; /* presses the frame has not taken yet */
 #define LT_KEY_Q 1u
 #define LT_KEY_E 2u
 #define LT_KEY_F 4u
+#define LT_KEY_4 8u
 static uint32_t g_lt_state;    /* this player's lights */
 static double g_lt_since;      /* when the current turn signal went on (its blink phase) */
 static double g_lt_flash_at;   /* when the last flash started */
@@ -194,7 +196,7 @@ static int32_t lt_key(const PopModApi *api, int32_t dik, int32_t vk, int32_t dow
     (void)api;
     (void)vk;
     (void)user;
-    const unsigned bit = dik == 0x10 ? LT_KEY_Q : dik == 0x12 ? LT_KEY_E : dik == 0x21 ? LT_KEY_F : 0u;
+    const unsigned bit = dik == 0x10 ? LT_KEY_Q : dik == 0x12 ? LT_KEY_E : dik == 0x21 ? LT_KEY_F : dik == 0x05 ? LT_KEY_4 : 0u;
     if (!bit)
         return 0;
     if (down) {
@@ -250,7 +252,7 @@ static void lt_set(uint32_t state) {
 /* A press: that side on (the other off), or off when it was on. */
 static void lt_signal(uint32_t side, double now) {
     uint32_t s = g_lt_state & ~(LT_LEFT | LT_RIGHT);
-    if (!(g_lt_state & side)) {
+    if ((g_lt_state & (LT_LEFT | LT_RIGHT)) != side) {
         s |= side;
         g_lt_since = now;
         g_lt_turned = g_lt_peak = g_lt_rate = 0.0f;
@@ -376,12 +378,15 @@ static void lt_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation 
         lt_signal(LT_LEFT, now);
     if (((pressed & LT_KEY_E) && !lt_bound('E')) || (pad_new & 2u))
         lt_signal(LT_RIGHT, now);
+    if (pressed & LT_KEY_4)
+        lt_signal(LT_LEFT | LT_RIGHT, now);
     const int key_f = !lt_bound('F');
     int flash = lt_flash_button(&g_lt_tap[0], key_f && (pressed & LT_KEY_F), key_f && (down & LT_KEY_F), now);
     flash |= lt_flash_button(&g_lt_tap[1], (pad_new & 4u) != 0, (pad & 4u) != 0, now);
     flash |= now - g_lt_flash_at < LT_FLASH_MIN_MS;
     lt_set((g_lt_state & (LT_LEFT | LT_RIGHT)) | (flash ? LT_FLASH : 0u) | (g_lt_off ? LT_OFF : 0u));
-    if (g_lt_state & (LT_LEFT | LT_RIGHT)) {
+    const uint32_t signals = g_lt_state & (LT_LEFT | LT_RIGHT);
+    if (signals && signals != (LT_LEFT | LT_RIGHT)) {
         lt_heading(player, now);
         if (setting("turn_signal_auto_off", 1) && g_lt_peak > LT_TURNED && g_lt_turned > LT_TURNED * 0.5f &&
             g_lt_rate < LT_STRAIGHT)
@@ -485,14 +490,18 @@ static void lt_draw_car(const LtCar *car, uint32_t state, double since, double n
         lt_corners(ri, front, rear);
         /* straight ahead / back: eRenderLightFlare moves a flare along its direction, so a
          * sideways one would sit beside the car */
-        const float s = (state & LT_LEFT) ? 1.0f : -1.0f;
-        const float fp[3] = {front[0], front[1] * s, front[2]}, rp[3] = {rear[0], rear[1] * s, rear[2]};
-        const float fd[3] = {1.0f, 0.0f, 0.0f}, rd[3] = {-1.0f, 0.0f, 0.0f};
-        const float i = lt_tune(LT_T_INTENSITY), size = lt_tune(LT_T_SIZE);
-        if (!(broken & (s > 0 ? 1u : 2u))) /* a smashed headlight takes its signal with it */
-            lt_draw(car, fp, fd, 1u, 4u, 0, 1, i, size);
-        if (!(broken & (s > 0 ? 8u : 0x10u))) /* and a smashed tail light */
-            lt_draw(car, rp, rd, 1u, 4u, 0, 1, i, size);
+        for (uint32_t side = LT_LEFT; side <= LT_RIGHT; side <<= 1) {
+            if (!(state & side))
+                continue;
+            const float s = side == LT_LEFT ? 1.0f : -1.0f;
+            const float fp[3] = {front[0], front[1] * s, front[2]}, rp[3] = {rear[0], rear[1] * s, rear[2]};
+            const float fd[3] = {1.0f, 0.0f, 0.0f}, rd[3] = {-1.0f, 0.0f, 0.0f};
+            const float i = lt_tune(LT_T_INTENSITY), size = lt_tune(LT_T_SIZE);
+            if (!(broken & (s > 0 ? 1u : 2u))) /* a smashed headlight takes its signal with it */
+                lt_draw(car, fp, fd, 1u, 4u, 0, 1, i, size);
+            if (!(broken & (s > 0 ? 8u : 0x10u))) /* and a smashed tail light */
+                lt_draw(car, rp, rd, 1u, 4u, 0, 1, i, size);
+        }
     }
     if (state & LT_FLASH) {
         const uint32_t head = ri + 0x458;

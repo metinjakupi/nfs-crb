@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "version": "carbon-community-billboards-v1",
+  "path": "TRACKS/STREAML5RA.BUN",
+  "fileBytes": 1238368256,
+  "patches": [
+    {
+      "name": "ADS_AUTOZONEDURALAST_01_D",
+      "key": "513aaa2e",
+      "offset": 17000448,
+      "bytes": 21824,
+      "before": "6dc63ba8a6a8c8e6f687e96b75b62c085583d5ca0800ca7384502280db0ee0cc",
+      "after": "0c0732692471ae80482f7be5ac52c0c5fd9feb0a01be4a7b7da72f553e5b3f45",
+      "asset": "carbon-browser.dxt1",
+      "headerOffset": 14410016,
+      "headerBytes": 116,
+      "headerSha256": "7efb330053189c363b70539d7e0c0b4e3b1c513bc077a55f0c90cf6acfc54996"
+    },
+    {
+      "name": "ADS_FAKE1_01_D",
+      "key": "f7eb7001",
+      "offset": 76212608,
+      "bytes": 21824,
+      "before": "860196e167b74e08ea323a661fb8432c17253723eaf772915b4adebca0f787ae",
+      "after": "0c0732692471ae80482f7be5ac52c0c5fd9feb0a01be4a7b7da72f553e5b3f45",
+      "asset": "carbon-browser.dxt1",
+      "headerOffset": 65889520,
+      "headerBytes": 104,
+      "headerSha256": "9c82d19787f78e82a2bc6bf6eeda7cc1ebee4246f1fe33fb8c6a1a723a3483b5"
+    },
+    {
+      "name": "ADS_FAKE2_01_D",
+      "key": "fa4098a2",
+      "offset": 76234496,
+      "bytes": 21824,
+      "before": "76dd16ca2f5ff880933a6bad58963ac58b5b047fafc8babda8fba8e7fa54b543",
+      "after": "314da1b69c77226a3be38a2d507f864423df130c4d07e99c2d84d0d34e0673f7",
+      "asset": "discord.dxt1",
+      "headerOffset": 65889624,
+      "headerBytes": 104,
+      "headerSha256": "5fd7aeb31091e45ae51bf3ccc4ebfb7de4e1dbd93439f1ceb065c04e55470639"
+    }
+  ]
+}

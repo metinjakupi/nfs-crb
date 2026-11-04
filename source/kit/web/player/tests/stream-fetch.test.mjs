@@ -20,6 +20,7 @@ async function setup(saved = new Map(), fault = '', rangeWait = () => {}, cacheW
     base: '../files/', chunksBase: '../chunks/', files: {
       [assetPath]: { size: data.length, etag: 'v1', blocks: hashes, pieces: pieceNames },
     } };
+  if (assetPath.startsWith('CARS/')) index.models = { 123: assetPath.split('/').slice(0, 2).join('/') + '/' };
   let library;
   const context = {
     Map, Number, String, Error, URL, Response, Uint8Array, AbortSignal, performance, crypto: webcrypto,
@@ -236,3 +237,22 @@ for (const fault of ['short', 'whole', 'version', 'metadata']) {
     assert.equal(s.saved.size, 0);
   });
 }
+
+
+test('model readiness waits for every verified block and reports optional failures without stopping game reads', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const s = await setup(new Map(), '', start => start === 1048576 ? gate : undefined, () => {}, true, () => {}, 'CARS/RX8/GEOMETRY.BIN');
+  try {
+    const preparing = s.channels[0].onmessage({data:{type:'prefetch-models',keys:[123],request:'ready:1'}});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(s.messages.some(m => m.type === 'model-ready'), false, 'queueing a model is not readiness');
+    release(); await preparing;
+    assert.equal(s.messages.find(m => m.type === 'model-ready')?.ready, true);
+    assert.equal(new Set(s.requests.filter(r => r.headers).map(r => r.url + r.headers.Range)).size, 9, 'all nine independently verified blocks completed');
+  } finally { release(); }
+  const bad = await setup(new Map(), 'corrupt', () => {}, () => {}, true, () => {}, 'CARS/RX8/GEOMETRY.BIN');
+  await bad.channels[0].onmessage({data:{type:'prefetch-models',keys:[123],request:'ready:2'}});
+  assert.equal(bad.messages.find(m => m.type === 'model-ready')?.ready, false);
+  assert.equal(bad.messages.some(m => m.type === 'unavailable'), false, 'failed optional preparation must not end gameplay');
+});

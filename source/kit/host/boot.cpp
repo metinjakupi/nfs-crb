@@ -24,6 +24,9 @@
 
 #include <atomic>
 #include <vector>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 namespace {
 
@@ -490,6 +493,7 @@ bool boot_load(const BootOptions &opts) {
         if (*trace)
             host_set_cadence_trace(trace);
     host_set_time_source(boot_time_source);
+    host_set_quiet_time_source(boot_guest_millis); // the same clock without the tick, for threads running free
     host_set_message_waiter(boot_message_waiter);
     // The runtime calls this on the run thread whenever the guest is about to
     // block, so a host that has an event loop gets to run it instead of the
@@ -639,15 +643,30 @@ void boot_present_windows() {
     gdi_present_windows(true);
 }
 
+// Once a thread has presented, only its polls count towards the stall breaker.
+// Every thread reads the clock, and the others read it at their own pace: NFS
+// Carbon's sound thread reads the cycle counter (through this clock when it is
+// pinned) twice per voice per effect stage, on a schedule set by the audio
+// device and not by the game, so counting its reads made the breaker step the
+// clock several times a frame, by an amount that changed from run to run. The
+// wait the breaker exists for is the presenting thread's own (it stops drawing
+// and polls); before anything has presented, every poll still counts.
+static std::atomic<bool> g_presented{false};
+static thread_local bool t_presents = false;
+
 void boot_clock_advance() {
     if (!host_time_source_is_pinned())
         return;
+    t_presents = true;
+    g_presented.store(true, std::memory_order_relaxed);
     g_polls_since_frame.store(0, std::memory_order_relaxed);
     host_pinned_clock_advance();
 }
 
 void boot_clock_poll() {
     if (!host_time_source_is_pinned())
+        return;
+    if (!t_presents && g_presented.load(std::memory_order_relaxed))
         return;
     if (g_polls_since_frame.fetch_add(1, std::memory_order_relaxed) + 1 < kStallPolls)
         return;
@@ -659,6 +678,13 @@ void boot_clock_poll() {
 uint32_t boot_clock_stalls() {
     return g_clock_stalls;
 }
+#ifdef __EMSCRIPTEN__
+// For the page (the benchmark harness): steps the breaker took, so a run can
+// show its clock moved with its frames and nothing else.
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_clock_stalls(void) {
+    return g_clock_stalls;
+}
+#endif
 
 bool boot_clock_pinned() {
     return host_time_source_is_pinned();

@@ -1441,6 +1441,10 @@ class Image(object):
         if words[0] in self.REP_PREFIX:
             rep = self.REP_PREFIX[words[0]]
             words = words[1:]
+        elif words[0] == "lock":
+            # Kept as the listing spells it (XADD.LOCK): locked forms become host atomics.
+            rep = "LOCK"
+            words = words[1:]
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
         ops = [self._op_text(ci, o, mnem) for o in ci.operands]
@@ -2987,6 +2991,16 @@ class Translator(object):
             L.append(write_op(dst, dst.size, val))
             return L
 
+        if m == "XCHG" and (ops[0].kind == "mem" or ops[1].kind == "mem"):
+            # x86 locks every XCHG with memory: a host atomic exchange (x86.h,
+            # recomp_lock_xchg), so a thread running free beside the baton holder sees it whole.
+            size = operand_size(ops)
+            mem, reg = (ops[0], ops[1]) if ops[0].kind == "mem" else (ops[1], ops[0])
+            L.append("uint32_t ad_ = %s;" % addr_expr(mem))
+            L.append("uint32_t t_ = recomp_lock_xchg%d(ad_, (%s)(%s));" % (size, utype(size), read_op(reg, size)))
+            L.append(write_op(reg, size, "t_"))
+            return L
+
         if m == "XCHG":
             size = operand_size(ops)
             a, b = ops
@@ -2996,8 +3010,22 @@ class Translator(object):
             L.append(write_op(b, size, "t_"))
             return L
 
+        if m == "CMPXCHG" and ins.rep == "LOCK" and ops[0].kind == "mem":
+            # A host compare-exchange (x86.h, recomp_lock_cmpxchg): threads running free
+            # beside the baton holder rely on it. Flags come from accumulator - old value.
+            size = operand_size(ops)
+            dst, src = ops
+            L.append("uint32_t ad_ = %s;" % addr_expr(dst))
+            L.append("uint32_t a_ = c->r[0] & %s, s_ = %s;" % (hexlit(mask_of(size)), read_op(src, size)))
+            L.append("uint32_t b_ = recomp_lock_cmpxchg%d(ad_, (%s)a_, (%s)s_);" % (size, utype(size), utype(size)))
+            L.append("uint64_t rf_ = (uint64_t)a_ - b_;")
+            L.append("uint32_t r_ = (uint32_t)rf_ & %s;" % hexlit(mask_of(size)))
+            L.append("if (a_ != b_) { %s }" % write_op(Op("reg", reg=0, size=size, part=None), size, "b_"))
+            L.extend(self.flags_arith("sub", size, live))
+            return L
+
         if m == "CMPXCHG":
-            # The guest is single-threaded, so LOCK needs no host atomic.
+            # Without LOCK no other processor is promised anything: the plain read and write.
             # Flags come from accumulator - destination on either path.
             size = operand_size(ops)
             dst, src = ops
@@ -3020,6 +3048,20 @@ class Translator(object):
             L.append("c->eflags_zf = (expected_ == dst_);")
             L.append("if (c->eflags_zf) { wr64(ad_, ((uint64_t)c->r[1] << 32) | c->r[3]); }")
             L.append("else { c->r[0] = (uint32_t)dst_; c->r[2] = (uint32_t)(dst_ >> 32); }")
+            return L
+
+        if m == "XADD" and ins.rep == "LOCK" and ops[0].kind == "mem":
+            # A host fetch-and-add (x86.h, recomp_lock_xadd): reference counts and queues
+            # the game shares between threads stay whole when one of them runs free.
+            size = operand_size(ops)
+            dst, src = ops
+            L.append("uint32_t ad_ = %s;" % addr_expr(dst))
+            L.append("uint32_t b_ = %s;" % read_op(src, size))
+            L.append("uint32_t a_ = recomp_lock_xadd%d(ad_, (%s)b_);" % (size, utype(size)))
+            L.append("uint64_t rf_ = (uint64_t)a_ + b_;")
+            L.append("uint32_t r_ = (uint32_t)rf_ & %s;" % hexlit(mask_of(size)))
+            L.append(write_op(src, size, "a_"))
+            L.extend(self.flags_arith("add", size, live))
             return L
 
         if m == "XADD":
@@ -5858,17 +5900,17 @@ def main():
         fh.write("extern const uint32_t %sfunc_addrs[];\nextern uint8_t %shooked[];\n"
                  "extern RecompHookFn %shook_ptrs[];\n" % (P, P, P))
         fh.write("#ifdef RECOMP_NO_HOOKS\n"
-                 "#define CALL_FN(a) do { if (recomp_profile_enabled) recomp_call(c, %sfunc_addrs[FIDX(a)]); else FN(a)(c); } while (0)\n"
+                 "#define CALL_FN(a) do { if (RECOMP_PROFILING) recomp_call(c, %sfunc_addrs[FIDX(a)]); else FN(a)(c); } while (0)\n"
                  "#else\n"
                  "#define CALL_FN(a) do {\\\n"
                  "    uint32_t i_ = FIDX(a);\\\n"
-                 "    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;\\\n"
-                 "    if (recomp_profile_enabled) { recomp_call(c, %sfunc_addrs[i_]); break; }\\\n"
+                 "    uint32_t ebp_ = RECOMP_FRAME_WATCHING ? c->r[5] : 0u;\\\n"
+                 "    if (RECOMP_PROFILING) { recomp_call(c, %sfunc_addrs[i_]); break; }\\\n"
                  "    if (__builtin_expect(__atomic_load_n(&%shooked[i_],"
                  " __ATOMIC_ACQUIRE) != 0u, 0))\\\n"
                  "        %shook_ptrs[i_](c, i_);\\\n"
                  "    else FN(a)(c);\\\n"
-                 "    if (recomp_frame_watch && c->r[5] != ebp_)\\\n"
+                 "    if (RECOMP_FRAME_WATCHING && c->r[5] != ebp_)\\\n"
                  "        recomp_frame_changed(c, %sfunc_addrs[i_], ebp_, c->r[5]);\\\n"
                  "} while (0)\n"
                  "#endif\n" % (P, P, P, P, P))
@@ -5885,7 +5927,7 @@ def main():
         # host frames. Keep instrumentation on the existing slow path.
         fh.write("#if defined(__EMSCRIPTEN__) && !defined(RECOMP_NO_HOOKS)\n"
                  "#define TAIL_FN(a) do {\\\n"
-                 "    if (recomp_profile_enabled || recomp_frame_watch ||\\\n"
+                 "    if (RECOMP_PROFILING || RECOMP_FRAME_WATCHING ||\\\n"
                  "        __atomic_load_n(&%shooked[FIDX(a)], __ATOMIC_ACQUIRE)) {\\\n"
                  "        CALL_FN(a); return;\\\n"
                  "    }\\\n"
@@ -6106,16 +6148,23 @@ int recomp_thunk_target_kind(uint32_t target)
 static void recomp_call_inner(X86 *c, uint32_t target);
 void recomp_call(X86 *c, uint32_t target)
 {
-    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;
+    uint32_t ebp_ = RECOMP_FRAME_WATCHING ? c->r[5] : 0u;
     recomp_call_inner(c, target);
-    if (recomp_frame_watch && c->r[5] != ebp_)
+    if (RECOMP_FRAME_WATCHING && c->r[5] != ebp_)
         recomp_frame_changed(c, target, ebp_, c->r[5]);
 }
 static void recomp_call_inner(X86 *c, uint32_t target)
 {
+    /* An import shim first: two compares, where the lookups below would each miss
+     * (no translated function or module lies in the shim range). Every COM method
+     * call - tens of thousands a frame for Direct3D - comes this way. */
+    if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
+        recomp_shim_call(c, target);
+        return;
+    }
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
-        if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
+        if (RECOMP_PROFILING) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
 #else
@@ -6124,7 +6173,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
         else
             recomp_base_ptrs[i](c);
 #endif
-        if (recomp_profile_enabled) recomp_profile_pop();
+        if (RECOMP_PROFILING) recomp_profile_pop();
         return;
     }
     if (recomp_module_call(c, target)) return;
@@ -6140,9 +6189,13 @@ static void recomp_call_inner(X86 *c, uint32_t target)
 void recomp_jump(X86 *c, uint32_t target)
 {
     if (recomp_seh_pending_target()) recomp_seh_intercept(c, target);
+    if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) { /* see recomp_call_inner */
+        recomp_shim_call(c, target);
+        return;
+    }
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
-        if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
+        if (RECOMP_PROFILING) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
 #else
@@ -6151,7 +6204,7 @@ void recomp_jump(X86 *c, uint32_t target)
         else
             recomp_base_ptrs[i](c);
 #endif
-        if (recomp_profile_enabled) recomp_profile_pop();
+        if (RECOMP_PROFILING) recomp_profile_pop();
         return;
     }
     if (recomp_module_call(c, target)) return;

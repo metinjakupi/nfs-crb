@@ -263,6 +263,7 @@
     if (f) head.push(`Failure details: ${diagnosticJson(f)}`);
     if (f?.stack) head.push("Stack:", ...String(f.stack).split("\n").slice(0, 30).map((l) => "  " + l));
     if (window.carbonTestAssets) head.push(`Game files: ${safeJson(window.carbonTestAssets)}`);
+    try { if (window.carbonCockpitDiagnostics) head.push(`Cockpit diagnostics: ${safeJson(window.carbonCockpitDiagnostics())}`); } catch {}
     const race = raceSnapshot();
     if (race) head.push(`Race roster: ${safeJson(race)}`);
     recordRace();

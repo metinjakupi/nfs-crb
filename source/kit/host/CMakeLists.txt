@@ -293,13 +293,19 @@ if(TARGET recomp_gen)
     # saves.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js)
+    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()
     endforeach()
     if(EXISTS ${RECOMP_GAME_DIR}/web/custom-assets/manifest.json)
       file(COPY ${RECOMP_GAME_DIR}/web/custom-assets DESTINATION ${POP_OUT})
+    endif()
+    if(EXISTS ${RECOMP_GAME_DIR}/web/billboard-assets/manifest.json)
+      file(COPY ${RECOMP_GAME_DIR}/web/billboard-assets DESTINATION ${POP_OUT})
+    endif()
+    if(EXISTS ${RECOMP_GAME_DIR}/web/cockpit-assets/R32-TEXTURES.BIN)
+      file(COPY ${RECOMP_GAME_DIR}/web/cockpit-assets DESTINATION ${POP_OUT})
     endif()
     # Browser downloads keep release code without the native DWARF payload.
     # The link needs its own -O: without one Emscripten links at -O0, which

@@ -6,7 +6,7 @@
 #ifndef CUST_NEON_CAR_SUPPORTED
 #define CUST_NEON_CAR_SUPPORTED(car) ((car) == 17u)
 #endif
-static uint32_t g_cust_neon_hooks[2], g_cust_neon_draw_color;
+static uint32_t g_cust_neon_hooks[3], g_cust_neon_draw_color;
 static int g_cust_neon_drawing;
 typedef struct { uint32_t ri, ride, part; float value, direction; } CustNeonPulse;
 static CustNeonPulse g_cust_neon_pulses[32];
@@ -111,7 +111,18 @@ static void cust_neon_shadow(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocat
 }
 static int cust_neon_install(void) {
     if(!cust_pilot_enabled())return 0;
-    if(g_api->hook_install(g_api,0x0070f580u,cust_neon_vertex_color,POP_HOOK_BEFORE,NULL,&g_cust_neon_hooks[0])!=POP_OK)return 0;
-    if(g_api->hook_install(g_api,0x007be4c0u,cust_neon_shadow,POP_HOOK_WRAP,NULL,&g_cust_neon_hooks[1])!=POP_OK){g_api->hook_remove(g_api,g_cust_neon_hooks[0]);g_cust_neon_hooks[0]=0;return 0;}
+    /* The vertex-colour call (0070f580) runs a few hundred times a frame for every
+     * mesh; the callback acts only for the two neon draws. A host with callsite
+     * hooks skips the dispatch for every other caller; older hosts keep one broad hook. */
+    const int filtered=g_api->size>=offsetof(PopModApi,hook_install_at_callsite)+sizeof g_api->hook_install_at_callsite && g_api->hook_install_at_callsite;
+    const PopModStatus first=filtered?
+        g_api->hook_install_at_callsite(g_api,0x0070f580u,0x007beb00u,cust_neon_vertex_color,POP_HOOK_BEFORE,NULL,&g_cust_neon_hooks[0]):
+        g_api->hook_install(g_api,0x0070f580u,cust_neon_vertex_color,POP_HOOK_BEFORE,NULL,&g_cust_neon_hooks[0]);
+    if(first!=POP_OK)return 0;
+    if(filtered && g_api->hook_install_at_callsite(g_api,0x0070f580u,0x007beb20u,cust_neon_vertex_color,POP_HOOK_BEFORE,NULL,&g_cust_neon_hooks[2])!=POP_OK){g_api->hook_remove(g_api,g_cust_neon_hooks[0]);g_cust_neon_hooks[0]=0;return 0;}
+    if(g_api->hook_install(g_api,0x007be4c0u,cust_neon_shadow,POP_HOOK_WRAP,NULL,&g_cust_neon_hooks[1])!=POP_OK){
+        for(unsigned i=0;i<3u;i+=2u)if(g_cust_neon_hooks[i]){g_api->hook_remove(g_api,g_cust_neon_hooks[i]);g_cust_neon_hooks[i]=0;}
+        return 0;
+    }
     log_line("customization: native projected underglow renderer installed");return 1;
 }

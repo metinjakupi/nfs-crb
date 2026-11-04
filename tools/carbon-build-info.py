@@ -40,6 +40,8 @@ def stamp(page, runtime):
         strict = '"use strict";' if lead.startswith((b'"use strict"', b"'use strict'")) else ''
         prefix = f'{MARK}{build}\n{strict}globalThis.{variable} = Object.freeze({encoded});\n'
         (runtime/name).write_bytes(prefix.encode() + inputs[name])
+    # A rollback must invalidate If-Modified-Since for a newer cached runtime.
+    (runtime / "CarbonRecomp.wasm").touch()
     print(f'Embedded build {build}; wasm SHA-256 {info["wasm"]}')
 
 if __name__ == '__main__':

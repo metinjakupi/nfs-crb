@@ -10,6 +10,9 @@
 #include "loader.h"
 #include "resources.h"
 #include <algorithm>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +52,28 @@ void host_set_time_source(uint32_t (*fn)()) {
     g_time_source = fn;
 }
 
+namespace {
+uint32_t (*g_quiet_time_source)() = nullptr;
+FILE *cadence_file();
+} // namespace
+void host_set_quiet_time_source(uint32_t (*fn)()) {
+    g_quiet_time_source = fn;
+}
+bool host_millis_quiet(uint32_t *out) {
+    // The cadence trace records every clock read, which takes its lock and the clock's side
+    // effects: a traced run reads on the baton, as it always has.
+    if (cadence_file())
+        return false;
+    if (g_quiet_time_source) {
+        *out = g_quiet_time_source();
+        return true;
+    }
+    if (g_time_source || !g_epoch_us)
+        return false; // no quiet version of this host's clock, or none read yet
+    *out = (uint32_t)((now_us() - g_epoch_us) / 1000ull);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // The pinned clock. One counter, here, so that the parity fixture and the boot
 // hosts pin the same thing rather than each keeping their own.
@@ -86,6 +111,44 @@ void host_pinned_clock_advance() {
         return;
     g_pin_ms.fetch_add(g_pin_step, std::memory_order_relaxed);
 }
+
+// Pinning part-way through a run, for runs that must repeat only from some point
+// on: the replay benchmark lets the front end run on real time (pinned from the
+// start, its intro waits poll the clock so rarely that boot takes minutes) and
+// pins at the race grid. Any thread may ask; the pin starts on the thread that
+// presents, at its next frame, from the time the guest was last told, so the
+// guest's clock never runs backwards. A boot host's installed source already
+// answers with the pin when it is on and is kept, since it also services the
+// host; with no source installed the pin becomes the source.
+namespace {
+std::atomic<uint32_t> g_pin_request{0};
+}
+void host_request_pinned_clock(uint32_t step_ms) {
+    g_pin_request.store(step_ms, std::memory_order_relaxed);
+}
+void host_take_pinned_clock_request() {
+    const uint32_t step = g_pin_request.exchange(0, std::memory_order_relaxed);
+    if (!step || g_pin_on.load(std::memory_order_acquire))
+        return;
+    const uint32_t now = host_millis();
+    g_pin_ms.store(now, std::memory_order_relaxed);
+    g_pin_step = step;
+    snprintf(g_pin_desc, sizeof g_pin_desc, "pinned start=%u step=%u", now, step);
+    host_set_clock_description(g_pin_desc);
+    if (!g_time_source)
+        host_set_time_source(pinned_millis);
+    g_pin_on.store(true, std::memory_order_release);
+    printf("[host] the guest clock is pinned from now on at %u ms and moves %u per presented "
+           "frame\n",
+           now, step);
+    fflush(stdout);
+}
+#ifdef __EMSCRIPTEN__
+// For the page (the benchmark harness): Module._recomp_request_pinned_clock(16).
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_request_pinned_clock(uint32_t step_ms) {
+    host_request_pinned_clock(step_ms);
+}
+#endif
 
 void host_clear_time_source() {
     g_pin_on.store(false, std::memory_order_release);
@@ -142,6 +205,9 @@ CadenceKind g_cadence_kinds[] = {
     {"timeGetTime", 0, false}, {"GetTickCount", 0, false}, {"QueryPerformanceCounter", 0, false},
     {"WM_TIMER", 0, false},    {"mm_callback", 0, false},
 };
+FILE *cadence_file() {
+    return g_cadence;
+}
 } // namespace
 
 void host_set_cadence_trace(const char *path) {
@@ -1230,6 +1296,13 @@ uint32_t g_next_timer_id = 1;
 void m_timeGetTime(X86 *c) {
     host_note_cadence("timeGetTime");
     set_eax(c, host_millis());
+}
+bool mf_timeGetTime(X86 *c) {
+    uint32_t now;
+    if (!host_millis_quiet(&now))
+        return false;
+    set_eax(c, now);
+    return true;
 }
 
 void m_timeSetEvent(X86 *c) {
@@ -2454,3 +2527,10 @@ const ImportShim g_misc_shims[] = {
     {"weanetr.dll", "?SendChat@MLDPlay@@QAEHKPAGKPAK@Z", 4, nullptr},
 };
 const size_t g_misc_shim_count = sizeof(g_misc_shims) / sizeof(g_misc_shims[0]);
+
+// Baton-free versions (imports.h ImportFreeShim): a clock read with no side effect.
+const ImportFreeShim g_misc_free_shims[] = {
+    {"WINMM.dll", "timeGetTime", mf_timeGetTime},
+    {"_INMM.dll", "timeGetTime", mf_timeGetTime},
+};
+const size_t g_misc_free_shim_count = sizeof(g_misc_free_shims) / sizeof(g_misc_free_shims[0]);

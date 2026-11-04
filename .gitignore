@@ -30,6 +30,7 @@ __pycache__/
 
 # Local customization game assets and generated font data
 /source/web/custom-assets/
+/source/web/cockpit-assets/
 /source/mods/core/nfsc/customization/candidate/missing-title-font.h
 
 # Local experiments, generated analysis and browser screenshots

@@ -41,10 +41,11 @@
   // RaceShared (race.h)
   const MAGIC = 0x31435243, PAGE_SEQ = 0x08, PAGE = 0x0c, PEERS = 0x60, PEER = 0x40, MAX_PEERS = 8;
   const GAME_SEQ = 0x260, ROW0 = 0x2d0, ROW = 0x30, MAX_ROWS = 8;
-  const CATCH = 1, KEEP_AI = 2;
+  const CATCH = 1, KEEP_AI = 2, WORLD = 4, CANCEL = 8;
+  let worldHosting = false, pickCommand = 0;
   const PHASE = { idle: 0, launched: 1, setUp: 2, holding: 3, racing: 4, done: 5 };
-  // DAL 0xbc3 returns the frontend type: Lincoln Boulevard (Sprint) is 2.
-  const TYPES = ["Sprint", "Circuit", "Sprint", "Lap knockout", "Tollbooth", "Speedtrap", "Checkpoint", "Cash grab",
+  // Native GRaceParameters gameplay types; DAL menu categories use different IDs.
+  const TYPES = ["Sprint", "Circuit", "Drag", "Lap knockout", "Tollbooth", "Speedtrap", "Checkpoint", "Cash grab",
     "Challenge", "Speedtrap jump", "Milestone jump", "Drift", "Canyon drift", "Canyon duel", "Pursuit tag",
     "Pursuit knockout", "Encounter"];
   const LOBBY_EVERY = 4000;  // the host repeats the lobby, so players who arrive later see it
@@ -53,6 +54,14 @@
   const FORGET = 15000;      // a lobby nobody repeats is gone
 
   let active = false, me = 0;
+  let modeNotice = "", cancelledCardKey = "";
+  const isDrift = type => type === 11 || type === 12;
+  const needsNativeMatch = type => type === 14;
+  const worldType = type => [0, 1, 5, 11, 12].includes(type);
+  function nativeModeNotice() {
+    modeNotice = "Pursuit Tag needs Online → Custom Match. Race Together uses Quick Race and cannot start Pursuit Tag.";
+    draw();
+  }
   let hosting = false;       // F9: the next Quick Race Start opens a lobby
   let lobby = null;          // the host's own lobby: {race, key, type, opts, laps, ai, roster: [{id, name, car}]}
   let invites = new Map();   // race -> {from, name, race, type, laps, ai, roster, at}
@@ -80,6 +89,8 @@
     const at = (o) => (p + o) >> 2;
     const text = (o, n) => { let s = ""; for (let i = 0; i < n && u8[p + o + i]; i++) s += String.fromCharCode(u8[p + o + i]); return s; };
     const out = {
+      worldReady: u32[at(4)] >= 2, driftReady: u32[at(4)] >= 3,
+      score: u32[at(4)] >= 3 ? u32[at(0x450)] : 0, dnf: u32[at(4)] >= 3 && !!u32[at(0x454)], roam: !!(u32[at(0x2cc)] & 0x800),
       phase: u32[at(0x264)], car: u32[at(0x268)], caught: u32[at(0x26c)], caughtKey: u32[at(0x270)],
       caughtType: u32[at(0x274)], caughtOpts: Array.from(u8.subarray(p + 0x278, p + 0x2a0)),
       place: u32[at(0x2a0)], laps: u32[at(0x2a4)], done: u32[at(0x2a8)], pct: f32[at(0x2ac)], time: f32[at(0x2b0)],
@@ -121,7 +132,7 @@
       const others = race ? race.roster.filter((r) => r.id !== me) : [];
       const mine = race?.roster.find((r) => r.id === me);
       w.u32(0x00, race ? race.race : 0);
-      w.u32(0x04, (hosting && !race && !lobby ? CATCH : 0) | (race?.ai ? KEEP_AI : 0));
+      w.u32(0x04, (hosting && !race && !lobby ? CATCH : 0) | (race?.ai ? KEEP_AI : 0) | (race?.world || lobby?.world || worldHosting ? WORLD : 0) | (race?.cancelled ? CANCEL : 0));
       w.u32(0x08, me);
       w.u32(0x0c, mine ? mine.grid : 0);
       w.u32(0x10, others.length);
@@ -129,6 +140,7 @@
       w.u32(0x18, race && !race.cancelled ? race.race : 0);
       w.u32(0x1c, race ? race.key : 0);
       w.bytes(0x20, race ? race.opts : [], 40);
+      w.u32(0x48, pickCommand);
       for (let i = 0; i < MAX_PEERS; i++) {
         const o = w.peer(i), r = others[i], s = r && standings.get(r.id);
         w.u32(o, r ? r.id : 0);
@@ -141,7 +153,7 @@
         w.f32(o + 20, s ? s.pct : 0);
         w.f32(o + 24, s ? s.lapPct : 0);
         w.u32(o + 28, s ? s.lap : 0);
-        w.u32(o + 32, s ? s.cp : 0);
+        w.u32(o + 32, s ? isDrift(race.type) ? ((s.score || 0) | (s.dnf ? 0x80000000 : 0)) >>> 0 : s.cp : 0);
         w.u32(o + 36, s ? s.ms : 0);
         w.f32(o + 40, s ? s.rate : 0);
         w.f32(o + 44, s ? s.lapRate : 0);
@@ -169,46 +181,113 @@
     return out;
   }
   function lobbyFields(l) {
-    return { race: l.race, key: l.key, type: l.type, opts: hex(l.opts), laps: l.laps, ai: l.ai,
+    return { rv: 3, race: l.race, key: l.key, type: l.type, opts: hex(l.opts), laps: l.laps, ai: l.ai, world: l.world === true,
              roster: l.roster.map(({ id, name, car }) => ({ id, name, car })) };
+  }
+
+  const retired = new Set();
+  function retire(id) {
+    if (!id) return;
+    retired.add(id);
+    if (retired.size > 64) retired.delete(retired.values().next().value);
+  }
+  const allFinished = () => !!race && race.roster.every(p => p.id === me ? finishSent === race.race : standings.get(p.id)?.done);
+  function onlineChanged(state) {
+    if (typeof state?.open !== "boolean") return;
+    const linked = state.open && (!me || !state.me || state.me === me);
+    const present = new Set((state.people || []).map(p => p.id));
+    present.add(me);
+    if (!linked) {
+      hosting = false;
+      worldHosting = false;
+      retire(lobby?.race);
+      lobby = null;
+      for (const id of invites.keys()) retire(id);
+      invites.clear();
+      pendingJoin = 0;
+      if (race && (!race.went || race.world) && !allFinished()) cancelLoading();
+      tellGame();
+      draw();
+      return;
+    }
+    for (const [id, inv] of invites) if (!present.has(inv.from)) {
+      invites.delete(id);
+      retire(id);
+      if (pendingJoin === id) pendingJoin = 0;
+    }
+    if (lobby) {
+      const before = lobby.roster.length;
+      lobby.roster = lobby.roster.filter(p => present.has(p.id));
+      if (lobby.roster.length !== before) send("lobby", lobbyFields(lobby));
+    }
+    if (race && (!race.went || race.world) && !race.cancelled && !allFinished()) {
+      if (!present.has(race.host)) cancelLoading();
+      else if (race.roster.some(p => !present.has(p.id))) {
+        if (race.host === me) send("cancel", {race:race.race});
+        cancelLoading();
+      }
+    }
   }
 
   function heard(m) {
     if (!m || m.t !== "race" || !uint(m.id) || !uint(m.race)) return;
     const from = m.id, self = from === me || (!me && m.self);
+    if (retired.has(m.race)) return;
     if (m.k === "lobby") {
       if (lobby && lobby.race === m.race && !me) me = from; // our own lobby came back: that is us
       const r = roster(m.roster), opts = unhex(m.opts);
       if (!r || !opts || !uint(m.key)) return;
       if (lobby && lobby.race === m.race) { draw(); return; }
       const old = invites.get(m.race);
+      if (m.rv !== 3 || !game()?.driftReady || m.world === true && !worldType(m.type | 0)) return;
+      if (needsNativeMatch(m.type | 0)) { if (!race && !lobby) nativeModeNotice(m.type | 0); return; }
       invites.set(m.race, { from, name: m.name, race: m.race, key: m.key, type: m.type | 0, laps: m.laps | 0,
-                            ai: m.ai === true, roster: r, at: performance.now(),
+                            ai: !isDrift(m.type | 0) && m.world !== true && m.ai === true, world: m.world === true, roster: r, at: performance.now(),
                             joined: !!old?.joined || (!!me && r.some((x) => x.id === me)) });
       draw();
     } else if (m.k === "join" || m.k === "leave") {
       if (m.k === "join" && pendingJoin === m.race && !me) me = from;
-      if (!lobby || lobby.race !== m.race) { if (m.k === "join") draw(); return; }
+      if (!lobby || lobby.race !== m.race) {
+        if (m.k === "leave" && race?.world && race.race === m.race && race.host === me && !race.cancelled && !allFinished()) {
+          if (race.roster.some(p => p.id === from)) {
+            send("cancel", {race:race.race});cancelLoading();
+          }
+        } else if (m.k === "join") draw();
+        return;
+      }
+      if (m.k === "join" && (m.rv !== 3 || lobby.world && m.world !== true)) return;
       lobby.roster = lobby.roster.filter((r) => r.id !== from);
       if (m.k === "join" && lobby.roster.length <= MAX_PEERS)
         lobby.roster.push({ id: from, name: m.name || "Player", car: uint(m.car) ? m.car : 0 });
       send("lobby", lobbyFields(lobby));
       draw();
     } else if (m.k === "cancel") {
-      invites.delete(m.race);
-      if (race && race.race === m.race && race.host === from && !race.went) cancelLoading();
+      const inv = invites.get(m.race);
+      if (inv && inv.from === from) { invites.delete(m.race); retire(m.race); }
+      if (race && race.race === m.race && race.host === from && (!race.went || race.world)) cancelLoading();
       draw();
     } else if (m.k === "start") {
+      if(m.rv !== 3 || !game()?.driftReady || m.world === true && !worldType(m.type | 0)) return;
+      if (m.world === true) {
+        const inv = invites.get(m.race), own = lobby?.race === m.race && from === me;
+        if (!own && !(inv?.from === from && inv.joined)) return;
+        const g = game();
+        if (!g?.worldReady || g.flow !== 6 || !g.roam) {
+          send("leave", {race:m.race}); invites.delete(m.race); return;
+        }
+      }
       // Relay duplicates and another lobby must not replace an in-flight race.
-      if (race) return;
+      if (race || nativeEncounterOwnsPage) return;
       invites.delete(m.race);
       const r = roster(m.roster), opts = unhex(m.opts);
       if (!r || !opts || !uint(m.key)) return;
-      if (lobby && lobby.race === m.race) { if (!me) me = from; lobby = null; hosting = false; }
+      if (lobby && lobby.race === m.race) { if (!me) me = from; lobby = null; hosting = false; worldHosting = false; }
       if (!r.some((x) => x.id === me)) { draw(); return; } // a race without us
-      race = { race: m.race, host: from, key: m.key, type: m.type | 0, laps: m.laps | 0, opts, ai: m.ai === true, roster: r,
+      if (needsNativeMatch(m.type | 0)) { nativeModeNotice(m.type | 0); return; }
+      modeNotice = "";
+      race = { race: m.race, host: from, key: m.key, type: m.type | 0, laps: m.laps | 0, opts, ai: !isDrift(m.type | 0) && m.world !== true && m.ai === true, world: m.world === true, roster: r,
                ready: new Set(), startedAt: performance.now(), went: false, launched: false };
-      standings = new Map(r.map((x) => [x.id, { name: x.name, place: 0, lap: 0, cp: 0, pct: 0, lapPct: 0, ms: 0, rate: 0,
+      standings = new Map(r.map((x) => [x.id, { name: x.name, score: 0, place: 0, lap: 0, cp: 0, pct: 0, lapPct: 0, ms: 0, rate: 0,
                                                  lapRate: 0, t: 0, done: false, time: 0, at: 0 }]));
       finishSent = 0;
       pendingJoin = 0;
@@ -225,6 +304,9 @@
     } else if (m.k === "progress" || m.k === "finish") {
       if (!race || race.cancelled || !race.went || race.race !== m.race || !standings.has(from)) return;
       const s = standings.get(from);
+      if (isDrift(race.type) && (!Number.isInteger(m.score) || m.score < 0 || m.score > 0x7fffffff)) return;
+      if (s.done) return;
+      if (isDrift(race.type)) {s.score = m.score;s.dnf = m.dnf === true;}
       if (m.k === "progress") {
         for (const k of ["place", "lap", "cp"]) if (Number.isInteger(m[k]) && m[k] >= 0 && m[k] < 100) s[k] = m[k];
         const pct = Number.isFinite(m.pct) ? Math.max(0, Math.min(100, m.pct)) : s.pct;
@@ -246,7 +328,7 @@
         s.pct = 100;
         if (!self) tellGame();
       }
-      drawBoard();
+      syncLocalStanding();
     }
   }
   let pendingJoin = 0;
@@ -261,15 +343,23 @@
 
   // ---- Actions ----
   function cancelLoading() {
-    if (!race || race.went || race.cancelled) return;
+    if (!race || race.went && !race.world || race.cancelled) return;
     race.cancelled = true;
+    retire(race.race);
+    if (document.pointerLockElement) document.exitPointerLock?.();
     // Release an already loaded game, but never launch a queued race later.
     // This is an abandoned race; neither client may publish a result for it.
     tellGame();
     draw();
   }
   function host(on) {
+    modeNotice = "";
+    if (on && nativeEncounterOwnsPage) return;
+    const g = game();
+    if(on && !g?.driftReady) {modeNotice = "Reload the game to use the updated Race Together.";draw();return;}
     hosting = on;
+    worldHosting = !!(on && g?.worldReady && g.flow === 6 && g.roam);
+    if (worldHosting) pickCommand++;
     if (!on && lobby) cancelLobby();
     tellGame();
     draw();
@@ -277,20 +367,31 @@
   function cancelLobby() {
     if (!lobby) return;
     send("cancel", { race: lobby.race });
+    retire(lobby.race);
+    if (lobby.world) { hosting = false; worldHosting = false; }
     lobby = null;
     tellGame();
     draw();
+  }
+  function leaveRace() {
+    if (!race?.world || race.cancelled) return;
+    send(race.host === me ? "cancel" : "leave", {race:race.race});
+    cancelLoading();
   }
   function startLobby() {
     if (!lobby) return;
     const l = lobby;
     send("start", { ...lobbyFields(l), roster: l.roster.map((r, grid) => ({ id: r.id, name: r.name, car: r.car, grid })) });
   }
+  function canJoin(inv, g = game()) {
+    return !!inv && !!g?.driftReady && !nativeEncounterOwnsPage && !race && !lobby && uint(g?.car) && (inv.world
+      ? g.worldReady && g.flow === 6 && g.roam : g.flow === 3);
+  }
   function join(inv) {
     const g = game(), car = g?.car;
-    if (race || lobby || !uint(car) || g.flow !== 3) return;
+    if (!canJoin(inv, g)) return;
     pendingJoin = inv.race;
-    send("join", { race: inv.race, car });
+    send("join", { rv: 3, race: inv.race, car, world: inv.world === true });
     inv.joined = true;
     draw();
   }
@@ -320,8 +421,15 @@
     if (g.caught !== lastCaught) {
       lastCaught = g.caught;
       if (hosting && !lobby && !race && g.caughtKey) {
+        if (worldHosting && !worldType(g.caughtType)) {
+          hosting = false; worldHosting = false; tellGame(); modeNotice = "Choose Sprint, Circuit, Speedtrap, Drift, or Canyon Drift."; draw(); return;
+        }
+        if (needsNativeMatch(g.caughtType)) {
+          hosting = false; worldHosting = false; tellGame(); nativeModeNotice(g.caughtType); return;
+        }
+        modeNotice = "";
         lobby = { race: ((Math.random() * 0x7ffffffe) | 0) + 1, key: g.caughtKey, type: g.caughtType, opts: g.caughtOpts,
-                  laps: g.caughtOpts[4], ai: false, roster: [{ id: me || 0, name: myName(), car: g.car }], at: now };
+                  laps: g.caughtOpts[4], ai: false, world: worldHosting, roster: [{ id: me || 0, name: myName(), car: g.car }], at: now };
         send("lobby", lobbyFields(lobby));
         lobby.sentAt = now;
         tellGame();
@@ -343,15 +451,19 @@
       const current = !race.cancelled && race.went && g.session === race.race && g.phase >= PHASE.racing;
       if (current && now - lastProgress > PROGRESS_EVERY) {
         lastProgress = now;
-        send("progress", { race: race.race, place: g.place, lap: g.laps, cp: g.cp, pct: Math.round(g.pct * 1000) / 1000,
+        send("progress", { race: race.race, place: g.place, lap: g.laps, cp: g.cp, score: g.score, dnf: g.dnf, pct: Math.round(g.pct * 1000) / 1000,
                            lp: Math.round(g.lapPct * 1000) / 1000, rt: Math.round(g.time * 1000) / 1000, ms: g.ms });
       }
       if (current && g.done && g.time > 0 && finishSent !== race.race) {
         finishSent = race.race;
-        send("finish", { race: race.race, time: Math.round(g.time * 1000) / 1000 });
+        send("finish", { race: race.race, score: g.score, dnf: g.dnf, time: Math.round(g.time * 1000) / 1000 });
       }
       // Back in the menus after the race: it is over.
       if (race.launched && g.phase === PHASE.idle && lastPhase !== PHASE.idle) {
+        // An unexpected native exit must not leave the other games waiting.
+        const complete = allFinished();
+        if (race.world && !race.cancelled && !complete)
+          send(race.host === me ? "cancel" : "leave", {race:race.race});
         race.over = now;
       }
       if (race.over) { race = null; tellGame(); }
@@ -360,7 +472,7 @@
     const cardState = `${g.flow}:${g.car}:${g.waitingResult}`;
     if (cardState !== lastCardState) { lastCardState = cardState; draw(); }
     lastPhase = g.phase;
-    drawBoard(g);
+    syncLocalStanding(g);
   }
 
   // The game's list against what the players say: a mismatch goes to the console.
@@ -378,45 +490,62 @@
 
   // ---- What the player sees ----
   const css = `
-  .crc { --ink: #e9f6ff; --dim: #8fa6bd; --cyan: #5fe4f2; --line: rgba(95, 228, 242, .22);
-         --u: clamp(12px, 1.8vh, 17px); font: 600 var(--u)/1.3 "Avenir Next", "Segoe UI", system-ui, sans-serif; color: var(--ink); }
-  .crc * { box-sizing: border-box; }
-  .crc-card { position: fixed; right: 16px; top: 56px; z-index: 8; width: min(calc(var(--u) * 22), calc(100vw - 32px));
-         background: rgba(6, 12, 22, .9); border: 1px solid var(--line); padding: calc(var(--u) * .9);
-         clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px)); animation: crc-in .16s ease-out; }
-  .crc-card h2 { margin: 0 0 calc(var(--u) * .6); font: italic 800 .95em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif;
-         letter-spacing: .2em; text-transform: uppercase; color: var(--cyan); display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-  .crc-card h2::after { content: ""; flex: 1; height: 2px; transform: skewX(-30deg); background: linear-gradient(90deg, var(--cyan), transparent); opacity: .5; }
-  .crc-card p { margin: 0 0 calc(var(--u) * .6); }
-  .crc-card b { color: var(--cyan); font-weight: 700; }
-  .crc-who { margin: 0 0 calc(var(--u) * .6); font-size: .86em; color: var(--dim); }
-  .crc-who span { color: var(--ink); }
-  .crc-row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .crc-btn { flex: 1; font: italic 700 1em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .1em;
-         text-transform: uppercase; color: var(--ink); background: rgba(95, 228, 242, .06); border: 1px solid var(--line);
-         padding: calc(var(--u) * .55) calc(var(--u) * .8); cursor: pointer; transform: skewX(-10deg); white-space: nowrap; }
-  .crc-btn > span { display: inline-block; transform: skewX(10deg); }
-  .crc-btn:hover, .crc-btn:focus-visible { outline: none; background: rgba(95, 228, 242, .16); border-color: var(--cyan); }
-  .crc-btn.go { color: #021018; border-color: transparent; background: linear-gradient(100deg, #9ff3fb, var(--cyan) 40%, #2aa4dc); }
-  .crc-check { display: flex; align-items: center; gap: 8px; margin: 0 0 calc(var(--u) * .6); font-size: .86em; color: var(--dim); cursor: pointer; }
-  .crc-check input { accent-color: var(--cyan); }
-  .crc-note { margin-top: calc(var(--u) * .5); font-size: .78em; font-weight: 500; color: var(--dim); }
-  .crc-board { position: fixed; left: 16px; top: 52px; z-index: 5; min-width: calc(var(--u) * 13); pointer-events: none;
-         background: linear-gradient(90deg, rgba(6, 12, 22, .78), rgba(6, 12, 22, .45)); border-left: 2px solid var(--cyan);
-         padding: calc(var(--u) * .45) calc(var(--u) * .7); transform: skewX(-8deg); }
-  .crc-board > * { transform: skewX(8deg); }
-  .crc-board h3 { margin: 0 0 4px; font: italic 800 .78em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif;
-         letter-spacing: .2em; text-transform: uppercase; color: var(--cyan); }
-  .crc-line { display: grid; grid-template-columns: 1.6em 1fr auto auto; gap: 0 .7em; align-items: baseline; font-size: .9em; white-space: nowrap; }
-  .crc-line.me { color: var(--cyan); }
-  .crc-line .pos { font: italic 800 1.05em/1.2 "Avenir Next Condensed", "DIN Condensed", sans-serif; }
-  .crc-line .lap, .crc-line .gap { font: 500 .85em/1.2 system-ui, sans-serif; color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
-  .crc-line.me .lap, .crc-line.me .gap { color: var(--cyan); }
-  .crc [hidden] { display: none !important; }
-  @keyframes crc-in { from { opacity: 0; translate: 8px 0; } }
-  @media (prefers-reduced-motion: reduce) { .crc-card { animation: none; } }
+  .crc { --ink:#ecf1e9; --dim:#a1b6b1; --cyan:#78d5cc; --select:#e4ef43; --line:rgba(112,209,196,.36);
+    --u:clamp(14px,2.3vh,18px); font:500 var(--u)/1.35 "Arial Narrow","Avenir Next Condensed","Segoe UI",sans-serif; color:var(--ink); }
+  .crc * { box-sizing:border-box; }
+  .crc-card { position:fixed; right:max(20px,env(safe-area-inset-right)); top:max(64px,calc(env(safe-area-inset-top) + 48px)); z-index:8;
+    width:min(420px,calc(100vw - 40px)); max-height:calc(100dvh - 100px); overflow:auto; scrollbar-width:thin; scrollbar-color:#41685d transparent;
+    padding:18px; border:1px solid var(--line); border-radius:5px;
+    background:linear-gradient(120deg,rgba(25,54,51,.45),transparent 65%),rgba(3,10,11,.94);
+    box-shadow:0 0 0 3px rgba(16,51,48,.28),0 18px 44px #0006,inset 0 0 28px #315e5215; }
+  .crc-card::before { content:"ONLINE / RACE TOGETHER"; display:block; margin:-18px -18px 14px; padding:9px 16px;
+    color:var(--cyan); background:linear-gradient(90deg,#244c46b3,#0c1819cc); border-bottom:2px dotted #7fdcd18c;
+    font-size:11px; font-weight:800; letter-spacing:.2em; }
+  .crc-card h2 { display:flex; align-items:center; gap:10px; margin:0 0 14px; color:#f2f4e9;
+    font:italic 800 clamp(22px,3.2vh,28px)/1.1 "Arial Narrow","Avenir Next Condensed","Bahnschrift",sans-serif;
+    letter-spacing:.04em; text-transform:uppercase; }
+  .crc-card h2::before { content:""; width:22px; height:22px; flex:none; border-left:2px solid var(--ink);
+    background:conic-gradient(#e9f3ed 25%,transparent 0 50%,#e9f3ed 0 75%,transparent 0) 4px 1px/8px 8px;
+    clip-path:polygon(0 0,100% 0,100% 75%,12% 75%,12% 100%,0 100%); transform:skewY(-7deg); }
+  .crc-card p { margin:0 0 13px; color:#d1ddd5; }
+  .crc-card b { color:var(--select); font-weight:650; }
+  .crc-card.crc-lobby { width:min(680px,calc(100vw - 40px)); }
+  .crc-lobby-body { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr); gap:20px; }
+  .crc-lobby-body .crc-who { margin-bottom:0; }
+  .crc-summary { display:grid; grid-template-columns:1fr auto; gap:5px 16px; margin:0 0 14px; padding:10px 12px;
+    background:#28483d3b; border-top:1px solid #83b9a139; border-bottom:1px solid #83b9a139; }
+  .crc-summary .label { color:var(--dim); font-size:.82em; }
+  .crc-summary .value { text-align:right; color:#f4f4e9; font-weight:650; }
+  .crc-who { margin:0 0 14px; display:grid; gap:3px; }
+  .crc-player { display:grid; grid-template-columns:24px minmax(0,1fr) auto; align-items:center; gap:8px;
+    min-height:36px; padding:6px 10px; background:linear-gradient(90deg,#264e455e,#0d1d1a4d); border-left:2px solid #5a928544; }
+  .crc-player.me { border-left-color:var(--select); background:linear-gradient(90deg,#889b2038,#3c48140c); }
+  .crc-player .slot { font-size:.74em; color:#78968b; font-variant-numeric:tabular-nums; }
+  .crc-player .player-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#e1ece3; }
+  .crc-player.me .player-name { color:var(--select); }
+  .crc-player .player-state { display:flex; align-items:center; gap:6px; font-size:10px; font-weight:750; letter-spacing:.09em; color:#91a69c; }
+  .crc-player .player-state::before { content:""; width:5px; height:5px; background:#84988c; }
+  .crc-player.ready .player-state { color:var(--cyan); }
+  .crc-player.ready .player-state::before { background:var(--cyan); box-shadow:0 0 6px #78d5cc55; }
+  .crc-row { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .crc-btn { flex:1; min-height:42px; padding:10px 14px; border:1px solid #6d9d8a66; border-radius:2px;
+    font:700 .87em/1.15 "Arial Narrow","Avenir Next Condensed",sans-serif; letter-spacing:.04em; text-transform:uppercase;
+    color:#d5e5da; background:linear-gradient(#294c405c,#172a235c); cursor:pointer;
+    transition:background-color 120ms ease-out,border-color 120ms ease-out,color 120ms ease-out; }
+  .crc-btn:hover:not(:disabled),.crc-btn:focus-visible { color:#f4f8d7; border-color:var(--select); background-color:#8b9c2138; outline:2px solid #e4ef4366; outline-offset:2px; }
+  .crc-btn:active:not(:disabled) { background-color:#dbe95455; }
+  .crc-btn.go { color:#ecf56b; border-color:#c8d33f99; background:linear-gradient(90deg,#839a2852,#435d302b); }
+  .crc-btn.go::before { content:"›"; margin-right:7px; font-size:1.2em; }
+  .crc-btn:disabled { color:#829186; border-color:#56726544; background:#18221c; cursor:not-allowed; }
+  .crc-check { display:flex; align-items:center; gap:9px; margin:10px 0 0; font-size:.85em; color:#b6c9ba; cursor:pointer; }
+  .crc-check input { width:16px; height:16px; accent-color:var(--select); }
+  .crc-note { margin-top:12px; padding-top:11px; border-top:1px solid #72a98a33; color:#9eb6a7; font-size:.78em; line-height:1.45; }
+  .crc [hidden] { display:none !important; }
+  @media(max-width:600px) { .crc-card.crc-lobby { width:calc(100vw - 24px); } .crc-lobby-body { display:flex; flex-direction:column; gap:14px; } .crc-settings { order:-1; } .crc-card { right:max(12px,env(safe-area-inset-right)); width:min(380px,calc(100vw - 24px)); padding:14px; } .crc-card::before { margin:-14px -14px 12px; } }
+  @media(max-height:500px) { .crc-card>.crc-note { position:sticky; bottom:-18px; background:#07120ff5; padding-bottom:10px; } .crc-who { max-height:max(100px,calc(100dvh - 260px)); overflow:auto; scrollbar-width:thin; scrollbar-color:#41685d transparent; } .crc-lobby>.crc-note { display:none; } .crc-card { top:max(46px,env(safe-area-inset-top)); max-height:calc(100dvh - 58px); width:min(380px,calc(100vw - 24px)); } .crc-player { min-height:29px; padding-block:4px; } }
+  @media(prefers-reduced-motion:reduce) { .crc-btn { transition:none; } }
   `;
-  let root, card, board, lastCardState = "";
+  let root, card, lastCardState = "", cardViewKey = "";
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -431,22 +560,55 @@
     b.addEventListener("mousedown", (e) => e.preventDefault()); // the game keeps the keyboard
     return b;
   }
-  function names(list) {
+  function names(list, ready = null, hostId = list[0]?.id) {
     const w = el("div", "crc-who");
-    list.forEach((r, i) => { if (i) w.append(", "); w.append(el("span", null, r.id === me ? `${r.name} (you)` : r.name)); });
+    list.forEach((r, i) => {
+      const row = el("div", `crc-player${r.id === me ? " me" : ""}${ready?.has(r.id) ? " ready" : ""}`);
+      const state = ready ? `${r.id === hostId ? "HOST · " : ""}${ready.has(r.id) ? "READY" : "LOADING"}` : r.id === hostId ? "HOST" : r.id === me ? "YOU" : "JOINED";
+      row.setAttribute("aria-label", `${r.name}, ${r.id === me ? "you, " : ""}${state}`);
+      row.append(el("span", "slot", String(i + 1).padStart(2, "0")),
+        el("span", "player-name", r.name), el("span", "player-state", state));
+      w.append(row);
+    });
+    return w;
+  }
+  function summary(l) {
+    const w = el("div", "crc-summary");
+    w.append(el("span", "label", "Game mode"), el("span", "value", what(l)),
+      el("span", "label", "Players"), el("span", "value", String(l.roster.length)));
     return w;
   }
   // The card: hosting hint, the host's lobby, an invite, or the race starting.
   function draw() {
     if (!root) return;
     dispatchEvent(new Event("recomp-race-invitations"));
-    card.replaceChildren();
     const inv = [...invites.values()].sort((a, b) => b.at - a.at)[0];
     const g = game();
+    // Retain controls across periodic redraws: replacing a pressed/focused
+    // button before mouseup loses its click and keyboard focus.
+    const cancelledKey = race?.cancelled ? `${race.race}:${!!((g?.flow === 3 || race.world && g?.roam) && g.phase === PHASE.idle)}`
+      : modeNotice && !race && !lobby ? `notice:${modeNotice}` : "";
+    if (cancelledKey && cancelledCardKey === cancelledKey) return;
+    cancelledCardKey = cancelledKey;
+    const viewKey = JSON.stringify({ me, hosting, modeNotice,
+      race: race && { id: race.race, cancelled: race.cancelled, went: race.went, launched: race.launched, ready: [...race.ready], roster: race.roster, type: race.type, laps: race.laps },
+      lobby: lobby && { type: lobby.type, laps: lobby.laps, ai: lobby.ai, roster: lobby.roster },
+      invite: inv && { id: inv.race, name: inv.name, type: inv.type, laps: inv.laps, joined: inv.joined, roster: inv.roster },
+      game: g && { phase: g.phase, flow: g.flow, car: g.car, waitingResult: g.waitingResult } });
+    if (viewKey === cardViewKey) return;
+    cardViewKey = viewKey;
+    card.className = lobby && !race ? "crc-card crc-lobby" : "crc-card";
+    card.replaceChildren();
+    if (modeNotice && !race && !lobby) {
+      card.hidden = false;
+      card.append(el("h2", null, "Race together"), el("p", null, modeNotice),
+        button("OK", () => { modeNotice = ""; draw(); }));
+      return;
+    }
     if (race?.cancelled) {
       card.append(el("h2", null, "Race cancelled"));
-      card.append(el("p", null, "Not everyone was ready. No shared result will be recorded."));
-      card.append(el("div", "crc-note", "Exit to the start page, then press Play to return to the game."));
+      card.append(el("p", null, race.world ? "No shared result will be recorded." : "Not everyone was ready. No shared result will be recorded."));
+      card.append(el("div", "crc-note", race.world ? "Returning to free roam…" : "Exit to the start page, then press Play to return to the game."));
       // Loading may never reach a native menu that can accept Esc. Use the
       // same exit path as F9 Quit, without depending on the game's readiness.
       card.append(button("Exit to start page", () => {
@@ -455,96 +617,67 @@
       }, true));
       // Hiding the panel must not clear cancellation while a queued launch or
       // loading hold still owns the native session (including an unreadable block).
-      if (g?.flow === 3 && g.phase === PHASE.idle)
+      if ((g?.flow === 3 || race?.world && g?.roam) && g.phase === PHASE.idle)
         card.append(button("Dismiss", () => { race = null; tellGame(); draw(); }));
     } else if (race && g?.waitingResult && g.session === race.race) {
       card.append(el("h2", null, "Waiting for race results"));
-      card.append(el("p", null, "Your finish time is recorded. Waiting for the other players to finish."));
-      card.append(el("div", "crc-note", "If a player cannot finish, use F9 → Quit to the start page. No shared winner is confirmed until all finish times arrive."));
+      card.append(el("p", null, isDrift(race.type) ? "Your drift score is recorded. Waiting for the other players to finish." : "Your finish time is recorded. Waiting for the other players to finish."));
+      card.append(el("div", "crc-note", "If a player cannot finish, use F9 → Quit to the start page. No shared winner is confirmed until all results arrive."));
     } else if (race && !race.went) {
       const host = race.roster.find((r) => r.id === race.host);
       card.append(el("h2", null, "Race together"));
-      const p = el("p");
-      p.append(el("b", null, what(race)), ` with ${race.roster.length - 1} ${race.roster.length === 2 ? "friend" : "friends"}`);
-      card.append(p, names(race.roster));
+      card.append(summary(race), names(race.roster, race.ready, race.host));
       const loading = !race.launched;
       card.append(el("div", "crc-note", loading && g && g.phase === PHASE.idle
-        ? "Starting… (the race starts from the game's menus: leave free roam for the main menu)"
+        ? race.world ? "Starting from free roam…" : "Starting… (the race starts from the game's menus: leave free roam for the main menu)"
         : `Loading · ${race.ready.size} of ${race.roster.length} ready${host && host.id !== me ? ` · ${host.name} starts it` : ""}`));
     } else if (lobby) {
       card.append(el("h2", null, "Race together"));
-      const p = el("p");
-      p.append("Your race: ", el("b", null, what(lobby)));
-      card.append(p, names(lobby.roster));
+      const body = el("div", "crc-lobby-body"), settings = el("div", "crc-settings");
+      settings.append(summary(lobby));
+      if (!lobby.world && !isDrift(lobby.type)) {
       const ai = el("label", "crc-check"), box = el("input");
       box.type = "checkbox";
       box.checked = lobby.ai;
       box.addEventListener("change", () => { lobby.ai = box.checked; send("lobby", lobbyFields(lobby)); });
       ai.append(box, "AI opponents too");
-      card.append(ai);
+      settings.append(ai);
+      }
+      body.append(names(lobby.roster), settings); card.append(body);
       const row = el("div", "crc-row");
       row.append(button(lobby.roster.length > 1 ? `Start · ${lobby.roster.length} players` : "Start alone", startLobby, true),
                  button("Cancel", cancelLobby));
-      card.append(row, el("div", "crc-note", "Friends in this room can join now, from the game's menus."));
+      card.append(row, el("div", "crc-note", lobby.world ? "Practice race · no career cash or race completion." : "Friends in this room can join now, from the game's menus."));
     } else if (inv && !race) {
       const joined = !!inv.joined;
       card.append(el("h2", null, "Race together"));
-      const p = el("p");
-      p.append(el("b", null, inv.name || "A player"), " started a race: ", el("b", null, what(inv)), inv.ai ? " (with AI)" : "");
-      card.append(p, names(inv.roster));
+      card.append(el("p", null, `${inv.name || "A player"} invites you to race.`), summary(inv), names(inv.roster));
       const row = el("div", "crc-row");
-      const joinButton = joined ? button("Leave", () => leave(inv)) : button(g?.car && g.flow === 3 ? "Join" : "Return to main menu", () => join(inv), true);
-      joinButton.disabled = !joined && (!g?.car || g.flow !== 3);
+      const joinButton = joined ? button("Leave", () => leave(inv)) : button(canJoin(inv, g) ? "Join" : inv.world ? "Enter free roam" : "Return to main menu", () => join(inv), true);
+      joinButton.disabled = !joined && !canJoin(inv, g);
       row.append(joinButton,
                  button("Not now", () => { invites.delete(inv.race); if (inv.joined) leave(inv); draw(); }));
       card.append(row, el("div", "crc-note", joined ? `Joined · waiting for ${inv.name || "the host"} to start`
-        : "Join from the game's menus; F9 lists it too."));
+        : inv.world ? "Join from career free roam; F9 lists it too." : "Join from the game's menus; F9 lists it too."));
     } else if (hosting) {
       card.append(el("h2", null, "Race together"));
-      card.append(el("p", null, "Pick a Quick Race and press Start: friends in this room can join before it begins."));
+      card.append(el("p", null, worldHosting ? "Choose an event on the world map, then select Jump to Event to open your lobby." : "Pick a Quick Race and press Start: friends in this room can join before it begins."));
       const row = el("div", "crc-row");
       row.append(button("Stop hosting", () => host(false)));
       card.append(row);
     }
     card.hidden = !card.childElementCount;
   }
-  function fmt(t) {
-    const m = Math.floor(t / 60), s = t - m * 60;
-    return `${m}:${s.toFixed(2).padStart(5, "0")}`;
-  }
-  // The shared race list: every player's place, lap and gap, from what each sends.
-  let boardKey = "";
-  function drawBoard(g = game()) {
-    if (!root) return;
-    const show = race && !race.cancelled && race.went && g && g.session === race.race && g.phase >= PHASE.racing;
-    if (!show) { board.hidden = true; boardKey = ""; return; }
+  // Keep local result data for the shared protocol. The native leaderboard
+  // displays standings; no second leaderboard is drawn by the page.
+  function syncLocalStanding(g = game()) {
+    if (!race || race.cancelled || !race.went || !g || g.session !== race.race || g.phase < PHASE.racing) return;
     const mine = standings.get(me);
-    if (mine && g) { mine.place = g.place; mine.lap = g.laps; mine.pct = g.pct; mine.t = g.time; if (g.done) { mine.done = true; mine.time = g.time; } }
-    const list = [...standings].map(([id, s]) => ({ id, ...s }));
-    // Finished first, by time; then by progress.
-    list.sort((a, b) => (b.done - a.done) || (a.done ? a.time - b.time : b.pct - a.pct));
-    const lead = list[0];
-    // The leader's average pace (% a second) turns a gap in progress into seconds,
-    // once they have gone far enough for it to mean something.
-    const rate = lead && !lead.done && lead.t > 5 && lead.pct >= 0.5 ? lead.pct / lead.t : 0;
-    const laps = race.type === 1 || race.type === 3 ? race.laps : 0;
-    const rows = list.map((s, i) => {
-      let gap = "";
-      if (s.done) gap = fmt(s.time);
-      else if (i && lead.done) gap = "racing";
-      else if (i && rate) gap = `+${Math.max(0, (lead.pct - s.pct) / rate).toFixed(1)} s`;
-      const lap = laps ? `L${Math.min(laps, s.lap + 1)}/${laps}` : `${Math.floor(s.pct)}%`;
-      return { me: s.id === me, pos: String(i + 1), name: s.name, lap: s.done ? "FIN" : lap, gap };
-    });
-    const key = JSON.stringify(rows);
-    if (key === boardKey) return;
-    boardKey = key;
-    board.replaceChildren(el("h3", null, "Race together"), ...rows.map((r) => {
-      const line = el("div", r.me ? "crc-line me" : "crc-line");
-      line.append(el("span", "pos", r.pos), el("span", "name", r.name), el("span", "lap", r.lap), el("span", "gap", r.gap));
-      return line;
-    }));
-    board.hidden = false;
+    if (mine) {
+      mine.score = g.score; mine.dnf = g.dnf; mine.place = g.place;
+      mine.lap = g.laps; mine.pct = g.pct; mine.t = g.time;
+      if (g.done) { mine.done = true; mine.time = g.time; }
+    }
   }
 
   // ---- The F9 menu ----
@@ -552,10 +685,12 @@
   function menu() {
     const actions = (window.recompMenuActions ||= []);
     actions.push(
-      { id: "race-host", group: "Race together", label: "Host a race together", keepOpen: true,
-        hint: () => (hosting ? "On · pick a Quick Race, press Start" : "Off"), shown: () => !lobby && !race, run: () => host(!hosting) },
+      { id: "race-host", group: "Race together", label: "Host a race together",
+        hint: () => (hosting ? worldHosting ? "On · choose an event on the world map" : "On · pick a Quick Race, press Start" : game()?.worldReady && game()?.roam ? "Choose on world map" : "Off"), shown: () => !lobby && !race, run: () => host(!hosting) },
       { id: "race-start", group: "Race together", label: "Start the race", shown: () => !!lobby,
         hint: () => (lobby ? `${lobby.roster.length} ${lobby.roster.length === 1 ? "player" : "players"}` : ""), run: startLobby },
+      { id: "race-leave-active", group: "Race together", label: () => race?.host === me ? "Cancel race" : "Leave race",
+        shown: () => !!race?.world && !race.cancelled, run: leaveRace },
       { id: "race-cancel", group: "Race together", label: "Cancel the race", shown: () => !!lobby, run: cancelLobby },
       { id: "race-join", group: "Race together", shown: () => !lobby && !race && invites.size > 0,
         label: () => { const i = [...invites.values()].pop(); return i ? `${i.joined ? "Leave" : "Join"} ${i.name || "the"}'s race` : "Join"; },
@@ -574,15 +709,14 @@
     card.setAttribute("role", "dialog");
     card.setAttribute("aria-label", "Race together");
     card.hidden = true;
-    board = el("div", "crc-board");
-    board.setAttribute("aria-live", "polite");
-    board.hidden = true;
-    root.append(card, board);
+    root.append(card);
     document.body.append(root);
     menu();
     addEventListener("recomp-online-message", (e) => heard(e.detail));
     addEventListener("carbon-race", () => tellGame());
     addEventListener("recomp-online", (e) => {
+      // Reconnection changes relay identity. Cancel the previous session first.
+      onlineChanged(e.detail);
       if (Number.isInteger(e.detail?.me) && e.detail.me > 0) me = e.detail.me;
       maybeGo();
       draw();
@@ -596,7 +730,7 @@
   if (window.recompOnline || window.recompOnlineState) wake();
   // For tests: the state, and the actions the buttons run.
   window.recompRace = { state: () => ({ me, hosting, lobby, invites: [...invites.values()], race, standings: [...standings], game: game() }),
-                        host, startLobby, cancelLobby,
+                        host, startLobby, cancelLobby, leaveRace, canJoin,
                         join: (raceId) => { const i = raceId == null ? [...invites.values()].pop() : invites.get(raceId); if (i) join(i); },
                         leave: (raceId) => { const i = invites.get(raceId); if (i?.joined) leave(i); } };
 })();

@@ -283,9 +283,31 @@ addToLibrary({
         block(f, first, true).catch(() => {}).finally(() => { --prefetches; pumpWarm(); });
       }
     }
+    const modelJobs = new Map();
+    async function prepareModelReady(key) {
+      const prefix = models.get(String(key));
+      if (!prefix) return false;
+      const group = [...paths.values()].filter(f => f.path.startsWith(prefix));
+      if (!group.length) return false;
+      if (!modelJobs.has(key)) modelJobs.set(key, (async () => {
+        // One block at a time per model; never retain a whole model's buffers.
+        // Background requests retain the same two-download concurrency limit.
+        for (const f of group) for (let i = 0; i * blockSize < f.size; ++i)
+          await block(f, i, true);
+        return true;
+      })().finally(() => modelJobs.delete(key)));
+      return modelJobs.get(key);
+    }
     channel.onmessage = async ({ data }) => {
       await indexReady;
       if (data?.type === 'prefetch-models' && Array.isArray(data.keys)) {
+        if (typeof data.request === 'string' && data.request.length <= 80 && data.keys.length === 1) {
+          const key = data.keys[0];
+          let ready = false;
+          try { ready = await prepareModelReady(key); } catch {}
+          channel.postMessage({ type: 'model-ready', request: data.request, key, ready });
+          return;
+        }
         for (const key of data.keys.slice(0, 9)) {
           const prefix = models.get(String(key));
           if (prefix) warmGroup(prefix);
@@ -332,7 +354,11 @@ addToLibrary({
             for (const bytes of blocks) {
               const from = (offset + done) % blockSize;
               const count = Math.min(bytes.length - from, length - done);
-              HEAPU8.set(bytes.subarray(from, from + count), buffer + done);
+              const artworkURL = env('RECOMP_BILLBOARD_OVERLAY');
+              const delivered = artworkURL
+                ? await (await import(artworkURL)).overlay(f, offset + done, bytes.subarray(from, from + count))
+                : bytes.subarray(from, from + count);
+              HEAPU8.set(delivered, buffer + done);
               done += count;
             }
           }
