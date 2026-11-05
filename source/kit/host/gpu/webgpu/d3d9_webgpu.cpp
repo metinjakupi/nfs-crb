@@ -22,9 +22,11 @@
 #include "../../../dx/host_d9.h"
 #include "../../../platform/ab_phase.h"
 #include "../../../platform/os.h"
+#include "../../../runtime/display_seam.h"
 #include "../../present.h"
 #include "../d3d9_backend.h"
 #include "../d3d9_common.h"
+#include "../d3d9_world_filter.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2061,6 +2063,7 @@ class WebGpuRenderer final : public D9Backend {
 
     struct LastSampler {
         uint32_t state[14] = {};
+        int anisotropy = 0;
         WGPUSampler sampler = nullptr;
     };
     struct GroupKey {
@@ -2135,16 +2138,26 @@ class WebGpuRenderer final : public D9Backend {
             (t->info.format == WGPUTextureFormat_R32Float ||
              t->info.format == WGPUTextureFormat_RGBA32Float))
             s[5] = s[6] = s[7] = 1;
+        // WebGPU requires all three filters to be linear for anisotropy.
+        // Incorporate the effective value in both caches so changing the
+        // live setting takes effect even when the guest state is unchanged.
+        const int aniso = s[5] >= 2 && s[6] >= 2 && s[7] == 2
+                              ? d3d9_world_anisotropy(s, mods_display_filtering())
+                              : 1;
         LastSampler &last = last_sampler_[stage];
-        if (!ab_old_ && last.sampler && memcmp(last.state, s, sizeof s) == 0) {
+        if (!ab_old_ && last.sampler && last.anisotropy == aniso &&
+            memcmp(last.state, s, sizeof s) == 0) {
             if (stats_)
                 ++fs_.sampler_hits;
             return last.sampler;
         }
-        uint64_t key = fnv(s, sizeof s);
+        struct SamplerKey { uint32_t state[14]; uint32_t anisotropy; } sk{};
+        memcpy(sk.state, s, sizeof s);
+        sk.anisotropy = uint32_t(aniso);
+        uint64_t key = fnv(&sk, sizeof sk);
         auto it = samplers_.find(key);
         if (it != samplers_.end()) {
-            remember_sampler(last, s, it->second);
+            remember_sampler(last, s, aniso, it->second);
             return it->second;
         }
         WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
@@ -2156,18 +2169,17 @@ class WebGpuRenderer final : public D9Backend {
         sd.mipmapFilter = s[7] == 2 ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
         sd.lodMinClamp = (float)s[9];
         sd.lodMaxClamp = s[7] == 0 ? sd.lodMinClamp + 0.25f : 32.0f;
-        if ((s[6] == 3 || s[5] == 3) && sd.magFilter == WGPUFilterMode_Linear &&
-            sd.minFilter == WGPUFilterMode_Linear && sd.mipmapFilter == WGPUMipmapFilterMode_Linear)
-            sd.maxAnisotropy = (uint16_t)std::max<uint32_t>(1, std::min<uint32_t>(16, s[10]));
+        sd.maxAnisotropy = uint16_t(aniso);
         WGPUSampler out = wgpuDeviceCreateSampler(device_, &sd);
         samplers_[key] = out;
-        remember_sampler(last, s, out);
+        remember_sampler(last, s, aniso, out);
         return out;
     }
-    void remember_sampler(LastSampler &last, const uint32_t state[14], WGPUSampler sampler) {
+    void remember_sampler(LastSampler &last, const uint32_t state[14], int anisotropy, WGPUSampler sampler) {
         if (ab_old_)
             return;
         memcpy(last.state, state, sizeof last.state);
+        last.anisotropy = anisotropy;
         last.sampler = sampler;
     }
     WGPUSampler shadow_sampler() {
