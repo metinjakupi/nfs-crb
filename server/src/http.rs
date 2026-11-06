@@ -386,6 +386,9 @@ async fn route(app: &App, conn: &mut Conn, req: &mut Request) -> io::Result<()> 
     if url.path == "/names" {
         return crate::identity::handle(app, conn, req, &url).await;
     }
+    if url.path == "/leaderboard" || url.path == "/leaderboard/admin" {
+        return crate::leaderboard::handle(app, conn, req, &url).await;
+    }
     if url.path == "/stats" {
         // {players, here}: how many are on the relay and in that room (empty: the lobby),
         // for the start page. Counts only, no names.

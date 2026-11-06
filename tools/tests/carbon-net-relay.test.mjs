@@ -132,7 +132,11 @@ async function connect(t, relay, room = "lobby", name, physics = false, bin = fa
 // Execute the actual worker Blob produced by net.js. Only its browser launch
 // and clock are supplied here; WebSocket, shared memory, relay and worker
 // message handlers are real. No game data or browser profile is needed.
-async function gameLink(t, relay, name, crew = "") {
+// more: a game with mp.h's MpMore (2026-11-05): 20 car slots, the 12 past the version-2 block.
+const MP_MORE = 0x18f0, MP_MORE_SLOT0 = 0x1940, MP_MORE_LABELS = 0x2540;
+const mpSlotAt = (i) => (i < 8 ? 0x60 + i * 0x100 : MP_MORE_SLOT0 + (i - 8) * 0x100);
+const mpLabelAt = (i) => (i < 8 ? 0x860 + i * 16 : MP_MORE_LABELS + (i - 8) * 16);
+async function gameLink(t, relay, name, crew = "", { more = false } = {}) {
   let blob;
   const captured = new Error("worker captured");
   const page = vm.createContext({
@@ -144,9 +148,14 @@ async function gameLink(t, relay, name, crew = "") {
   const clientScript = process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
   assert.throws(() => vm.runInContext(fs.readFileSync(clientScript, "utf8"), page), (e) => e === captured);
   const timers = [], timeouts = [], sockets = [], posted = [];
-  let now = 1000;
+  let now = 1000, holdModels = false;
   const worker = vm.createContext({
-    onmessage: null, postMessage(data) { posted.push(data); }, console, atob, btoa,
+    onmessage: null, console, atob, btoa,
+    // As the page does for a model that is here: the car goes on at once.
+    postMessage(data) {
+      posted.push(data);
+      if (data?.t === "prepare-model" && !holdModels) queueMicrotask(() => worker.onmessage({ data: { t: "model-ready", key: data.key, ready: true } }));
+    },
     performance: { now: () => now },
     setInterval: (fn) => timers.push(fn),
     setTimeout(fn, delay = 0) {
@@ -161,15 +170,18 @@ async function gameLink(t, relay, name, crew = "") {
   });
   t.after(() => { for (const socket of sockets) socket.close(); });
   vm.runInContext(await blob.text(), worker);
-  const buffer = new SharedArrayBuffer(0x18f0);
+  const buffer = new SharedArrayBuffer(more ? 0x2600 : 0x18f0);
   const u32 = new Uint32Array(buffer), i32 = new Int32Array(buffer), f32 = new Float32Array(buffer);
   u32[0] = 0x31504d43; u32[1] = 2;
+  if (more) { u32[MP_MORE / 4] = 0x2b504d43; u32[MP_MORE / 4 + 1] = 20; }
+  const slots = more ? 20 : 8;
   worker.onmessage({ data: { t: "block", memory: { buffer }, ptr: 0 } });
   worker.onmessage({ data: { t: "start", relay: relay.ws(), name, crew, ghost: false } });
   const id = await until(() => u32[0x5c / 4] || false, "game link identity");
   return {
     id, u32, i32, f32, posted,
     post(data) { worker.onmessage({ data }); },
+    holdModels(on) { holdModels = on; },
     close() { for (const socket of sockets) socket.close(); },
     tick(ms = 40) {
       now += ms;
@@ -184,7 +196,7 @@ async function gameLink(t, relay, name, crew = "") {
       Atomics.add(i32, 3, 1);
     },
     slot(other) {
-      for (let i = 0; i < 8; i++) if (u32[(0x60 + i * 0x100) / 4] === other) return i;
+      for (let i = 0; i < slots; i++) if (u32[mpSlotAt(i) / 4] === other) return i;
       return -1;
     },
   };
@@ -297,6 +309,39 @@ test("authentication and a room limit of eight (CARBON_ROOM_MAX) preserve room c
   assert.deepEqual(await relay.stats(), { players: 8, here: 8 });
 });
 
+// A connection as nginx passes it on: true if the relay took it. The socket stays open.
+function knock(t, relay, realIp) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: relay.port });
+    t.after(() => socket.destroy());
+    socket.on("error", () => resolve({ taken: false, socket }));
+    socket.on("close", () => resolve({ taken: false, socket }));
+    socket.once("data", (b) => resolve({ taken: b.toString().startsWith("HTTP/1.1 101"), socket }));
+    const url = new URL(relay.ws());
+    socket.write([`GET ${url.pathname}${url.search} HTTP/1.1`, `Host: 127.0.0.1:${relay.port}`, "Upgrade: websocket", "Connection: Upgrade",
+      "Sec-WebSocket-Version: 13", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", ...(realIp ? [`X-Real-IP: ${realIp}`] : []), "", ""].join("\r\n"));
+  });
+}
+
+test("one public address holds at most CARBON_CLIENT_MAX connections, and internal ones are never limited", async (t) => {
+  const relay = await start(t, { CARBON_CLIENT_MAX: "2" });
+  const first = await knock(t, relay, "8.8.8.8");
+  assert.equal(first.taken, true);
+  assert.equal((await knock(t, relay, "8.8.8.8")).taken, true);
+  assert.equal((await knock(t, relay, "8.8.8.8")).taken, false, "a third from the same address");
+  assert.equal((await knock(t, relay, "8.8.4.4")).taken, true, "another address");
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2::1")).taken, true);
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2::2")).taken, true);
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2:ffff::3")).taken, false, "the same /64");
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await knock(t, relay, "172.18.0.2")).taken, true, "a proxy's internal address");
+    assert.equal((await knock(t, relay)).taken, true, "no address given, from this machine");
+    assert.equal((await knock(t, relay, "not an address")).taken, true);
+  }
+  first.socket.destroy();
+  await until(async () => (await knock(t, relay, "8.8.8.8")).taken, "the place freed by leaving");
+});
+
 test("an engine impact reaches its owner once, then the owner pose acknowledges it", async (t) => {
   const relay = await start(t);
   const a = await connect(t, relay, "lobby", "Driver", true);
@@ -321,6 +366,20 @@ test("an engine impact reaches its owner once, then the owner pose acknowledges 
   const acknowledged = await a.read("pose", b.welcome.id);
   assert.deepEqual(acknowledged.acks, [[a.welcome.id, 1]]);
   assert.equal(a.messages.some((m) => m.t === "impact"), false);
+});
+
+test("a paused player's car stays in the others' games: the unchanged pose goes again every second", async (t) => {
+  const relay = await start(t);
+  const a = await gameLink(t, relay, "A"), b = await gameLink(t, relay, "B");
+  a.publish(1500); b.publish(1500); a.tick(); b.tick();
+  await until(() => b.slot(a.id) >= 0, "A's car in B's game");
+  // A pauses: its game publishes the same pose with state 0 and its clock stands still.
+  a.publish(1500, pose.s, 0);
+  for (let i = 0; i < 80; i++) { // 8 s of both games' time, longer than STALE (5 s)
+    a.tick(100); b.publish(1500 + i); b.tick(100);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.ok(b.slot(a.id) >= 0, "A's paused car is still in B's game");
 });
 
 test("game workers retain a hit queued before its frame and return the owner's acknowledgement", async (t) => {
@@ -809,7 +868,8 @@ test("car looks reach the others, wait for players who join later, and are check
   alice.send({ t: "look", k, data });
   assert.deepEqual(await bob.read("look"), { t: "look", id: alice.welcome.id, k, data });
   const carol = await connect(t, relay, "lobby", "Carol");
-  assert.equal(carol.messages[0]?.t, "look", "the looks come right after the welcome");
+  // The relay's private moderation state may come first.
+  assert.equal(carol.messages.find((m) => m.t !== "moderation")?.t, "look", "the looks come right after the welcome");
   assert.deepEqual(await carol.read("look"), { t: "look", id: alice.welcome.id, k, data });
   await delay(100);
   assert.equal(carol.messages.filter((m) => m.t === "look").length, 0, "only kept looks, once each");
@@ -1202,6 +1262,70 @@ test("game workers prioritize nearest players and racers, ignore legacy crew tag
   assert.deepEqual(Array.from(where.p.find((e) => e[0] === bots.get(10).welcome.id)), [bots.get(10).welcome.id, 22, -40, 0]);
 });
 
+test("a game with 20 car slots (MpMore) fills all of them, looks too, and hears who left the room", async (t) => {
+  const relay = await start(t);
+  const g = await gameLink(t, relay, "G", "", { more: true });
+  g.publish(1500); g.tick();
+  const here = (d, extra) => still(12 + d, -40, extra, undefined, 3);
+  let n = 0;
+  async function gsync(from) {
+    const k = ++n;
+    from.send({ t: "race", k: "sync", n: 3000 + k });
+    await until(() => g.posted.some((x) => x.t === "msg" && x.m.t === "race" && x.m.n === 3000 + k), "worker sync");
+  }
+  // A look block of version 2: an entry for each of the 20 slots.
+  const lookBuffer = new SharedArrayBuffer(0x460 * 21), lu32 = new Uint32Array(lookBuffer);
+  lu32[0] = 0x4b4c4d43; lu32[1] = 2;
+  g.post({ t: "look-block", memory: { buffer: lookBuffer }, ptr: 0 });
+  const lookEntry = (id) => { for (let i = 0; i < 20; i++) if (lu32[(0x460 + i * 0x460) / 4] === id) return i; return -1; };
+  const bots = new Map();
+  for (let d = 10; d <= 220; d += 10) bots.set(d, await join(t, relay, `At ${d}`));
+  for (const [d, b] of bots) b.send({ t: "look", k: pose.k, data: Buffer.alloc(16, d).toString("base64") });
+  for (const [, b] of bots) { b.send(here(0, { ts: 2000 + n })); await gsync(b); } // every one at 12, -40: then by distance
+  for (const [d, b] of bots) { b.send(here(d, { ts: 2100 + n })); await gsync(b); }
+  g.tick(3000);
+  for (const [d, b] of bots) { b.send(here(d, { ts: 2200 + n })); await gsync(b); }
+  g.tick(250);
+  const has = (d) => g.slot(bots.get(d).welcome.id) >= 0;
+  assert.equal([...bots.keys()].filter(has).length, 20, "20 of the 22 have a slot");
+  const ids = Array.from({ length: 20 }, (_, i) => g.u32[mpSlotAt(i) / 4]);
+  assert.equal(new Set(ids).size, 20, "every slot a different player");
+  assert.ok(ids.slice(8).every((id) => [...bots.values()].some((b) => b.welcome.id === id)), "slots 8-19 in MpMore");
+  // The pose went into slot 12's ring in MpMore: count 1 or more, the sender's x.
+  const at = mpSlotAt(12) / 4, count = g.u32[at + 4];
+  assert.ok(count >= 1);
+  const ring = (mpSlotAt(12) + 0x20 + ((count - 1) % 4) * 0x38) / 4;
+  const d12 = [...bots].find(([, b]) => b.welcome.id === ids[12])[0];
+  assert.equal(g.f32[ring + 5], 12 + d12, "slot 12's newest pose is its player's");
+  assert.ok([...bots.values()].filter((b) => lookEntry(b.welcome.id) >= 0).length >= 20, "a look entry for each slot's player");
+  // The page's state names 20 slots.
+  const state = g.posted.filter((x) => x.t === "state").at(-1);
+  assert.equal(state.slots.length, 20);
+  // A player who leaves the room goes into the gone ring (mp.h lets its kept car go).
+  const leaver = bots.get(150);
+  const leaverId = leaver.welcome.id;
+  leaver.ws.close();
+  await until(() => g.u32[(MP_MORE + 8) / 4] >= 1, "the gone ring");
+  assert.equal(g.u32[(MP_MORE + 0x10) / 4], leaverId);
+  assert.equal(g.slot(leaverId), -1, "and its slot is empty");
+  // Acknowledgements are read from slot 12's label in MpMore.
+  assert.equal(mpLabelAt(12), MP_MORE_LABELS + 4 * 16);
+});
+
+test("a game without MpMore keeps 8 car slots and no gone ring", async (t) => {
+  const relay = await start(t);
+  const g = await gameLink(t, relay, "G");
+  g.publish(1500); g.tick();
+  const bots = [];
+  for (let d = 10; d <= 120; d += 10) bots.push(await join(t, relay, `At ${d}`));
+  for (const [j, b] of bots.entries()) { b.send(still(22 + 10 * j, -40, { ts: 2000 + j }, undefined, 3)); await sync(b, b); }
+  await until(() => bots.filter((b) => g.slot(b.welcome.id) >= 0).length === 8, "8 slots");
+  g.tick(250);
+  assert.equal(bots.filter((b) => g.slot(b.welcome.id) >= 0).length, 8);
+  assert.equal(g.u32.length * 4, 0x18f0, "nothing written past the version-2 block");
+  assert.equal(g.posted.filter((x) => x.t === "state").at(-1).slots.length, 8);
+});
+
 // worldmap.js in a context of its own: the page's online state and where feed in, the
 // game's block (worldmap.h WmShared version 2) out. No relay needed.
 test("the world map shows 10 players: crew-mates first, then the nearest, at the where feed's places", () => {
@@ -1388,6 +1512,57 @@ test("a game worker coalesces a recovered pose backlog to the newest pose", asyn
   assert.equal(ben.f32[at + 5], 42, "the recovered car resumes at the newest position");
 });
 
+test("a car whose model is not ready waits longer far away, and its files can release it early", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  ben.holdModels(true);
+  ben.publish(1000, [0, 0, 0, 1, 212, 3, -40, 0, 0, 0, 0, 0, 0]); ben.tick(); // 200 m from Ana's pose
+  const ana = await connect(t, relay, "lobby", "Ana");
+  ana.send({ ...pose, k: 111, ts: 1000 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 111); }, "model asked for");
+  // Ana keeps driving, as a real car does: her poses keep her in the room.
+  const step = async (ms, ts) => {
+    ana.send({ ...pose, k: 111, ts });
+    await until(() => ben.u32[0] && true, "tick");
+    await delay(30);
+    ben.tick(ms);
+  };
+  for (let i = 1; i <= 2; i++) await step(1000, 1000 + 1000 * i);
+  assert.equal(ben.slot(ana.welcome.id), -1, "far away it outlasts the near limit");
+  for (let i = 3; i <= 7; i++) await step(1000, 1000 + 1000 * i);
+  assert.ok(ben.slot(ana.welcome.id) >= 0, "and goes on at the far limit");
+  assert.ok(ben.posted.some((m) => m.t === "model-stat" && m.ready === false), "the late model is counted");
+  ana.ws?.close?.();
+
+  const cy = await connect(t, relay, "lobby", "Cy");
+  ben.publish(1100, pose.s); ben.tick();
+  cy.send({ ...pose, k: 222, ts: 1000 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 222); }, "second model asked for");
+  ben.post({ t: "model-ready", key: 222, ready: true });
+  await until(() => { ben.tick(40); return ben.slot(cy.welcome.id) >= 0; }, "ready car shown");
+  assert.equal(ben.u32[(0x60 + ben.slot(cy.welcome.id) * 0x100) / 4 + 2], 222);
+  assert.ok(ben.posted.some((m) => m.t === "model-stat" && m.ready === true), "the ready model is counted");
+});
+
+test("a friend who changes cars keeps moving in the old car until the new model is ready", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  ben.publish(1000, pose.s); ben.tick();
+  const ana = await connect(t, relay, "lobby", "Ana");
+  ana.send({ ...pose, k: 111, ts: 1000 });
+  const slot = await until(() => { ben.tick(40); return ben.slot(ana.welcome.id) + 1; }, "Ana's car") - 1;
+  const base = (0x60 + slot * 0x100) / 4;
+  ben.holdModels(true);
+  ana.send({ ...pose, k: 222, ts: 1100 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 222); }, "new model asked for");
+  const before = ben.u32[base + 4];
+  ana.send({ ...pose, k: 222, ts: 1200 });
+  await until(() => { ben.tick(40); return ben.u32[base + 4] > before; }, "poses keep coming");
+  assert.equal(ben.u32[base + 2], 111, "still the old car");
+  ben.post({ t: "model-ready", key: 222, ready: true });
+  await until(() => ben.u32[base + 2] === 222, "the new car");
+});
+
 test("a hidden or paused game keeps a stationary paused car until disconnect and restores it", async (t) => {
   const relay = await start(t);
   const ana = await gameLink(t, relay, "Ana"), ben = await gameLink(t, relay, "Ben");
@@ -1450,6 +1625,7 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   const json = await copsJoin(t, relay, "Json", { cops: 1 });        // no compact poses: no cops either
   assert.equal(ana.welcome.cops, 1);
   assert.equal(ben.welcome.cops, 1);
+  assert.equal(ana.welcome.copsMax, 16, "the cars a frame may carry (shared traffic, Step B)");
   assert.equal(old.welcome.cops, undefined);
   assert.equal(json.welcome.cops, undefined);
   for (const c of [ana, ben, old, json]) c.send(still(10));
@@ -1464,11 +1640,16 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   await sync(ana, old);
   await sync(ana, json);
   for (const c of [ana, old, json]) assert.equal(c.messages.filter((m) => m.t === "cops").length, 0);
-  // Malformed frames are dropped: a number 0, a number twice, more than 8 cops, a wrong length.
+  // A full frame (COPS_MAX = 16 cars: cops and shared traffic) passes.
+  ana.ws.send(copsFrame(Array.from({ length: 16 }, (_, i) => ({ c: i + 1, f: 8 }))));
+  assert.equal((await ben.read("cops")).n, 16);
+  // Malformed frames are dropped: a number 0, a number twice, more than 16 cars, a wrong length.
   ana.ws.send(copsFrame([{ c: 0 }]));
   ana.ws.send(copsFrame([{ c: 3 }, { c: 3 }]));
-  ana.ws.send(copsFrame(Array.from({ length: 9 }, (_, i) => ({ c: i + 1 }))));
+  ana.ws.send(copsFrame(Array.from({ length: 17 }, (_, i) => ({ c: i + 1 }))));
   ana.ws.send(Buffer.concat([copsFrame([{ c: 2 }]), Buffer.alloc(1)]));
+  // A car farther than COPS_NEAR (500 m) from the sender's own car (Ana at x 10): not hers to send.
+  ana.ws.send(copsFrame([{ c: 1 }, { c: 2, p: [700, 3, -40] }]));
   // A page that did not ask sends none either.
   old.ws.send(copsFrame([{ c: 1 }]));
   await sync(ana, ben);
@@ -1488,8 +1669,8 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   for (let i = 0; i < 30; i++) ana.ws.send(copsFrame([{ c: 1 }], 3000 + i));
   await sync(ana, ben);
   const passed = ben.messages.filter((m) => m.t === "cops").length;
-  // Three frames passed above, so 7 of the burst are left (and a few refilled since).
-  assert.ok(passed >= 7 && passed <= 12, `burst limit (${passed} passed)`);
+  // Four frames passed above, so 6 of the burst are left (and a few refilled since).
+  assert.ok(passed >= 6 && passed <= 11, `burst limit (${passed} passed)`);
 });
 
 test("police chases: a hit on a cop reaches its chased player only, checked against its newest cops frame", async (t) => {
@@ -1552,6 +1733,7 @@ test("game workers send their chase, show a friend's cops in the game's slots, a
   a.u32[3] = 2;
   ana.tick(100);
   await until(() => { ben.tick(10); return b.u32[0x220 / 4] === ana.id; }, "Ana's cop in Ben's game");
+  assert.ok(ben.posted.some((m) => m.t === "prepare-model" && m.key === 0xc0c0a), "a cop's model is prepared like a friend's");
   const slot = 0x220 / 4;
   assert.equal(b.u32[slot + 1] % 2, 0, "the slot is not left half written");
   assert.deepEqual([b.u32[slot + 2], b.u32[slot + 3], b.u32[slot + 5], b.u32[slot + 6]], [0xc0c0a, 1, 3, 0x21]);
@@ -1575,6 +1757,30 @@ test("game workers send their chase, show a friend's cops in the game's slots, a
   a.u32[3] = 5; a.u32[5] = 0; a.u32[3] = 6;
   ana.tick(100);
   await until(() => { ben.tick(10); return b.u32[slot] === 0 && b.u32[slot + 3] === 0; }, "the cop gone from Ben's game");
+});
+
+test("a chased player's cops get slots even when traffic copies fill all 16", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  const buffer = new SharedArrayBuffer(0x1a30), u32 = new Uint32Array(buffer);
+  u32[0] = 0x31504f43; u32[1] = 1;
+  ben.post({ t: "cop-block", memory: { buffer }, ptr: 0 });
+  ben.publish(1500); ben.tick();
+  const senders = [];
+  for (const name of ["Ann", "Cid", "Dan"]) {
+    const c = await copsJoin(t, relay, name, { bin: 1, cops: 1 });
+    c.send(still(12, -40)); senders.push(c);
+  }
+  await until(() => { ben.tick(10); return true; }, "joined");
+  for (let i = 0; i < 20; i++) { ben.publish(1500 + i); ben.tick(50); await new Promise((r) => setTimeout(r, 5)); }
+  const eight = (f) => Array.from({ length: 8 }, (_, j) => ({ c: j + 1, f, p: [12 + j, 3, -40] }));
+  senders[0].ws.send(copsFrame(eight(8)));   // two traffic owners: 16 traffic cars
+  senders[1].ws.send(copsFrame(eight(8)));
+  const slots = () => Array.from({ length: 16 }, (_, i) => [u32[(0x220 + i * 0x100) / 4], u32[(0x220 + i * 0x100) / 4 + 6]]);
+  await until(() => { ben.tick(10); return slots().filter(([o]) => o).length === 16; }, "16 traffic cars in Ben's slots");
+  senders[2].ws.send(copsFrame(eight(3).slice(0, 3))); // a chase: 3 cops, light bar and chasing
+  await until(() => { ben.tick(10); return slots().filter(([o, f]) => o && !(f & 8)).length === 3; }, "the chase's cops took traffic slots");
+  assert.equal(slots().filter(([o]) => o).length, 16);
 });
 
 // ---- Car lights (lights.h, net.js; the relay header's "Car lights") ----

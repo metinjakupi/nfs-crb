@@ -7,11 +7,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>@TITLE@</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
-  #canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+  #canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; outline: none; }
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
             text-align: center; padding: 0 16px; white-space: pre-line; pointer-events: none; }
   #status a { pointer-events: auto; color: #8cf; }
@@ -36,6 +36,24 @@
   #cl-reload[hidden] { display: none; }
   #cl-reload:hover { background: #244956; } #cl-reload:active { background: #315b68; }
   #cl-reload:focus-visible { outline: 2px solid #91f5ed; outline-offset: 4px; }
+  /* "Open in Chrome / Safari" (in-app browsers) and the small add-on notice. */
+  #open-browser { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); background: radial-gradient(ellipse at 50% 20%, #112b3e, #04080d 65%); overflow: auto; box-sizing: border-box; }
+  #open-browser[hidden] { display: none; }
+  #open-browser .cl-panel { text-align: left; }
+  #ob-text { margin: 0 0 18px; color: #c4d5df; font-size: 15px; line-height: 1.5; }
+  #ob-steps { margin: 0 0 20px; padding-left: 22px; color: #a6bbc9; font-size: 14px; line-height: 1.55; }
+  #ob-steps:empty { display: none; }
+  .ob-actions { display: grid; gap: 10px; }
+  .ob-btn { display: flex; align-items: center; justify-content: center; min-height: 48px; padding: 10px 18px; box-sizing: border-box; background: #173340; color: #eaf6fb; border: 1px solid #537987; font: 600 16px system-ui, sans-serif; text-decoration: none; cursor: pointer; }
+  .ob-btn.primary { background: #2a7f9a; border-color: #6adce6; }
+  .ob-btn[hidden] { display: none; }
+  .ob-btn:focus-visible { outline: 2px solid #91f5ed; outline-offset: 3px; }
+  #ob-link { width: 100%; margin-top: 14px; padding: 8px 10px; box-sizing: border-box; background: #050b11; color: #9fc3d2; border: 1px solid #263c4b; font: 13px ui-monospace, monospace; }
+  #ob-copied { min-height: 1.4em; margin: 8px 0 0; color: #7edfe8; font-size: 13px; }
+  #addon-notice { position: fixed; z-index: 25; left: 50%; bottom: max(14px, env(safe-area-inset-bottom)); transform: translateX(-50%); width: min(calc(100% - 32px), 520px); box-sizing: border-box; display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; background: #09141ef2; border: 1px solid #263c4b; border-left: 3px solid #e6b450; color: #dce9f0; font-size: 13px; line-height: 1.45; }
+  #addon-notice[hidden] { display: none; }
+  #addon-notice p { margin: 0; flex: 1; }
+  #addon-notice button { flex: none; min-width: 44px; min-height: 32px; background: transparent; color: #9fc3d2; border: 1px solid #3a5566; font: inherit; cursor: pointer; }
   @keyframes cl-wait { to { background-position: -200% 0; } }
   @media (prefers-reduced-motion: reduce) { .cl-panel progress:indeterminate { animation: none; } }
 </style>
@@ -58,6 +76,21 @@
   </div>
 </section>
 
+<section id="open-browser" hidden aria-labelledby="ob-title">
+  <div class="cl-panel">
+    <p class="cl-kicker">OPEN IN YOUR BROWSER</p>
+    <h1 id="ob-title">Open in your browser</h1>
+    <p id="ob-text"></p>
+    <ol id="ob-steps"></ol>
+    <div class="ob-actions">
+      <a id="ob-open" class="ob-btn primary" hidden></a>
+      <button id="ob-copy" class="ob-btn" type="button">Copy link</button>
+    </div>
+    <input id="ob-link" type="text" readonly aria-label="Game link">
+    <p id="ob-copied" role="status" aria-live="polite"></p>
+  </div>
+</section>
+<div id="addon-notice" role="status" aria-live="polite" hidden><p id="addon-notice-text"></p><button id="addon-notice-close" type="button" aria-label="Close notice">OK</button></div>
 <script>if (document.documentElement.dataset.gameId) window.recompSite = true;</script>
 <script src="report.js"></script>
 <script>
@@ -222,6 +255,7 @@ function noSpaceError(result = {}) {
   return error;
 }
 async function reportStartupFailure(error) {
+  if (error?.name === "InAppBrowserError" || error?.name === "StorageUnavailableError") return reportFailure("startup", error);
   if (staleStorageError(error)) {
     const recovery = new Error("The browser changed its game storage while Carbon was loading. Close other Carbon tabs, then select Open game page and press Play again. Your saves are kept.");
     recovery.name = "InvalidStateError";
@@ -458,14 +492,170 @@ async function prepareStream(game) {
   }
 }
 
-function webGpuUnavailableError() {
-  const ua = navigator.userAgent || "";
-  if (/Android/i.test(ua))
-    return new Error("This Android device or browser does not provide WebGPU. Open the game in the current Chrome app. If current Chrome shows this message too, this device cannot run this build.");
-  if (/iPhone|iPad|iPod/i.test(ua))
-    return new Error("This iPhone or iPad does not provide the WebGPU support this build needs. This device cannot run the game yet.");
-  return new Error("This browser could not start WebGPU. Turn on hardware acceleration and restart the browser. If that does not work, update the graphics driver or use the current Chrome or Edge version.");
+// What the page knows about the browser, from its user agent (2026-11-06; logs/startup-fixes-20261106).
+// In-app browsers: 204 reports in two days were Facebook/Instagram/TikTok/LINE webviews on Android
+// without cross-origin isolation, and iOS in-app browsers have no WebGPU.
+const IN_APP = [["Messenger", /MessengerForiOS|FBAN\/Messenger|FB_IAB\/Orca|Orca-Android/i], ["Instagram", /Instagram/i],
+  ["Facebook", /FBAN|FBAV|FB_IAB|FBIOS|FB4A/i], ["TikTok", /musical_ly|TikTok|BytedanceWebview|trill_/i], ["Discord", /Discord/i],
+  ["Telegram", /Telegram/i], ["Snapchat", /Snapchat/i], ["X", /Twitter/i], ["LINE", /\bLine\//i], ["WeChat", /MicroMessenger/i],
+  ["KakaoTalk", /KAKAOTALK/i], ["LinkedIn", /LinkedInApp/i], ["Pinterest", /Pinterest/i], ["Reddit", /Reddit\//i],
+  ["WhatsApp", /WhatsApp/i], ["Threads", /Barcelona/i], ["Google app", /\bGSA\//]];
+function browserContext(ua = navigator.userAgent || "") {
+  const ios = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const android = /Android/i.test(ua);
+  const named = IN_APP.find(([, pattern]) => pattern.test(ua));
+  // An Android WebView ("; wv)") is always some app's built-in browser.
+  const app = named ? named[0] : android && /;\s*wv\)/.test(ua) ? "this app" : "";
+  const chrome = Number(/(?:Chrome|CriOS)\/(\d+)/.exec(ua)?.[1]) || 0;
+  const safari = !chrome && !/Firefox|FxiOS|Edg/i.test(ua) ? Number(/Version\/(\d+)/.exec(ua)?.[1]) || 0 : 0;
+  const osVersion = Number(/OS (\d+)_\d+/.exec(ua)?.[1]) || 0;
+  return { ua, ios, android, app, chrome, safari, osVersion,
+    edge: /Edg(A|iOS)?\//.test(ua), firefox: /Firefox|FxiOS/.test(ua), samsung: /SamsungBrowser/.test(ua), opera: /OPR\/|OPX\//.test(ua),
+    windows: /Windows/.test(ua), oldWindows: /Windows NT (5\.|6\.[0-3])/.test(ua), cros: /CrOS/.test(ua),
+    mac: /Macintosh/.test(ua) && !ios, linux: /Linux|X11/.test(ua) && !android && !/CrOS/.test(ua) };
 }
+// The page's own link without click trackers, for "Open in Chrome" and "Copy link".
+function shareableUrl() {
+  const url = new URL(location.href);
+  for (const key of [...url.searchParams.keys()]) if (/^(fbclid|igshid|igsh|gclid|ttclid|utm_\w+|mibextid|ref_src|si)$/i.test(key)) url.searchParams.delete(key);
+  return url.href;
+}
+function chromeIntentUrl(href) {
+  const url = new URL(href);
+  return `intent://${url.host}${url.pathname}${url.search}#Intent;scheme=${url.protocol.replace(":", "")};package=com.android.chrome;S.browser_fallback_url=${encodeURIComponent(href)};end`;
+}
+function openInBrowserText(info, why) {
+  const where = info.app === "this app" ? "This app's built-in browser" : info.app ? `${info.app}'s built-in browser` : "This browser";
+  const target = info.ios ? "Safari" : info.android ? "Chrome" : "Chrome or Edge";
+  return `${where} cannot run the game: ${why}. Open this page in ${target}.`;
+}
+// The "Open in Chrome / Safari" screen. Returns the text it shows (also kept in #status).
+function showOpenInBrowser(info, why) {
+  const text = openInBrowserText(info, why), link = shareableUrl();
+  const panel = document.getElementById("open-browser");
+  const open = document.getElementById("ob-open"), steps = document.getElementById("ob-steps");
+  document.getElementById("ob-title").textContent = info.ios ? "Open in Safari" : info.android ? "Open in Chrome" : "Open the game directly";
+  document.getElementById("ob-text").textContent = text;
+  const items = info.ios
+    ? ["Tap the ••• or share button of this window (top or bottom).", "Choose Open in browser (it can also be called Open in Safari or Open in external browser).", "Or copy the link below and paste it into Safari."]
+    : info.android
+      ? ["Tap Open in Chrome below.", "If nothing happens: tap ⋮ (top right) and choose Open in browser or Open in Chrome.", "Or copy the link below and paste it into Chrome."]
+      : ["Copy the link below and open it in a new tab of the current Google Chrome or Microsoft Edge, not inside another site or app."];
+  steps.textContent = "";
+  for (const item of items) { const li = document.createElement("li"); li.textContent = item; steps.append(li); }
+  if (info.android) { open.href = chromeIntentUrl(link); open.textContent = "Open in Chrome"; open.hidden = false; }
+  else open.hidden = true;
+  const field = document.getElementById("ob-link"), copied = document.getElementById("ob-copied");
+  field.value = link;
+  document.getElementById("ob-copy").onclick = async () => {
+    let ok = false;
+    try { await navigator.clipboard.writeText(link); ok = true; } catch {}
+    if (!ok) { try { field.focus(); field.select(); ok = document.execCommand("copy"); } catch {} }
+    copied.textContent = ok ? `Link copied. Paste it into ${info.ios ? "Safari" : "Chrome"}.` : "Select the link above and copy it.";
+  };
+  panel.hidden = false;
+  stopRuntimeLoader();
+  diagnostics.openInBrowser = { app: info.app || null, platform: info.ios ? "ios" : info.android ? "android" : "other", why };
+  return text;
+}
+function inAppError(info, why) {
+  const error = new Error(showOpenInBrowser(info, why) + (info.app ? "" : " If it still fails, send a report."));
+  error.name = "InAppBrowserError";
+  return error;
+}
+// Not cross-origin isolated: the game cannot share memory between its threads here.
+function isolationError() {
+  const info = browserContext();
+  const why = info.app || info.ios || info.android ? "it does not give pages the secure browser environment the game needs"
+    : "the page was opened without the secure browser environment the game needs (for example inside another site, an app or an extension)";
+  if (/Instagram/i.test(info.ua)) {
+    const error = inAppError(info, why);
+    error.message = "The game cannot run inside Instagram's browser. Open Instagram's menu and choose Open in browser, or copy this page's link into Chrome or Safari.";
+    return error;
+  }
+  if (info.app || info.ios || info.android) return inAppError(info, why);
+  const error = new Error("The game needs a secure browser environment that this page does not provide. Open this link directly in Chrome or Edge, not inside another site or app. If it still fails, send a report.");
+  showOpenInBrowser(info, why);
+  return error;
+}
+// No WebGPU (221 reports in two days): name what works on this platform. `adapterNull` means the
+// browser has WebGPU but gave no adapter (blocked GPU, hardware acceleration off, old driver).
+function webGpuUnavailableError(adapterNull = !!navigator.gpu) {
+  const b = browserContext();
+  const accel = "Turn on hardware acceleration (Chrome: Settings > System > Use graphics acceleration when available; Edge: Settings > System and performance), restart the browser, and update the graphics driver.";
+  if (b.app && (b.ios || b.android)) return inAppError(b, "it does not provide WebGPU, which the game needs");
+  if (b.android) {
+    if (!adapterNull || !b.chrome || b.samsung || b.opera || b.edge || b.firefox)
+      return new Error("This Android browser does not provide WebGPU for this device. Open the game in the current Chrome app (Android 12 or newer). If current Chrome shows this message too, this device cannot run this build.");
+    return new Error("This Android device or browser does not provide WebGPU. Chrome on this phone did not offer WebGPU for its graphics chip. Update Chrome and Android, then open the game in the current Chrome app again. If current Chrome shows this message too, this device cannot run this build.");
+  }
+  if (b.ios) {
+    const version = b.safari || b.osVersion;
+    if (version && version < 26)
+      return new Error("This iPhone or iPad does not provide the WebGPU support this build needs. The game needs iOS or iPadOS 26 or newer: update in Settings > General > Software Update, then open the game in Safari.");
+    return new Error("This iPhone or iPad does not provide the WebGPU support this build needs. Open the game in Safari on iOS or iPadOS 26 or newer. If Safari shows this message too, check that WebGPU is not turned off in Safari's Advanced settings (Feature Flags).");
+  }
+  if (b.oldWindows) return new Error("This browser could not start WebGPU. Windows 7 and 8 stop at Chrome 109, which has no WebGPU: the game needs Windows 10 or 11 with the current Google Chrome or Microsoft Edge.");
+  if (b.mac && b.safari && !adapterNull)
+    return new Error(`This browser could not start WebGPU. Safari ${b.safari} ${b.safari < 26 ? "has no WebGPU: use Safari 26 or newer, or" : "did not provide WebGPU here: check Safari's Feature Flags (Settings > Advanced) for WebGPU, or use"} the current Google Chrome.`);
+  if (b.firefox) return new Error("This browser could not start WebGPU. Firefox did not provide WebGPU here: the game runs in the current Google Chrome or Microsoft Edge. " + accel);
+  if (b.chrome && b.chrome < 113) return new Error(`This browser could not start WebGPU. Version ${b.chrome} is too old for WebGPU: update to the current Google Chrome or Microsoft Edge (113 or newer).`);
+  if (b.linux) return new Error("This browser could not start WebGPU. Use the current Google Chrome; chrome://gpu should list WebGPU as Hardware accelerated. " + accel);
+  if (b.cros) return new Error("This browser could not start WebGPU. Update ChromeOS and Chrome, then try again. " + accel);
+  return new Error("This browser could not start WebGPU. " + accel + " If that does not work, use the current Google Chrome or Microsoft Edge" + (b.mac ? ", or Safari 26 or newer." : "."));
+}
+
+// Opening browser storage. WebKit's Private Browsing (Safari, and Chrome or Firefox on iPhone and
+// iPad) rejects getDirectory() at once with "UnknownError: The operation failed for an unknown
+// transient reason (e.g. out of memory)" and reports a 1000 MiB quota with nothing used: 30 iPhone
+// reports, and the same in Playwright's WebKit with an ephemeral context
+// (logs/startup-fixes-20261106/webkit/probe-private.txt). It is retried once, then explained.
+async function storageRoot() {
+  let failure;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return await navigator.storage.getDirectory(); }
+    catch (error) {
+      failure = error;
+      if (error?.name === "QuotaExceededError" || /quota/i.test(String(error?.message || ""))) throw error;
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  let privateWindow = false;
+  try { const e = await navigator.storage.estimate(); privateWindow = e.quota === 1048576000 && !e.usage; } catch {}
+  const b = browserContext();
+  diagnostics.storageOpen = { ...errorDetails(failure), privateWindow };
+  const error = new Error(b.ios || b.mac && b.safari
+    ? `This browser window does not let the game keep its files${privateWindow ? " (it looks like a Private Browsing window)" : ""}. Open the game in a normal Safari tab, not a Private one${b.ios ? " (also not Incognito in Chrome for iPhone)" : ""}, then press Play again.`
+    : `This browser window does not let the game keep its files${privateWindow ? " (it looks like a private window)" : ""}. Open the game in a normal window, not a Private or Incognito one, then press Play again.`,
+    { cause: failure });
+  error.name = "StorageUnavailableError";
+  throw error;
+}
+
+// Optional add-ons that were left out this start (a car that could not be installed, city artwork):
+// a small notice, kept in the diagnostics for reports.
+function addonNotice(text) {
+  (diagnostics.notices ||= []).push({ at: new Date().toISOString(), text });
+  const box = document.getElementById("addon-notice"), body = document.getElementById("addon-notice-text");
+  body.textContent = (diagnostics.notices.length > 1 ? body.textContent + " " : "") + text;
+  box.hidden = false;
+  document.getElementById("addon-notice-close").onclick = () => { box.hidden = true; };
+  if (gameRunning) hideAddonNoticeLater();
+}
+// Kept through loading; gone 20 seconds after the game starts (or when closed).
+function hideAddonNoticeLater() {
+  const box = document.getElementById("addon-notice");
+  if (box.hidden) return;
+  clearTimeout(addonNotice.timer);
+  addonNotice.timer = setTimeout(() => { box.hidden = true; }, 20000);
+}
+function optionalFailure(what, error) {
+  diagnostics.failures.push({ kind: "optional", what, ...errorDetails(error), step: error?.customizationStep, path: error?.customizationPath,
+    phase: startupPhase, at: new Date().toISOString() });
+  if (diagnostics.failures.length > 20) diagnostics.failures.shift();
+  console.warn(`[browser] ${what} skipped:`, error?.message || String(error));
+}
+const unitName = unit => String(unit).replace(/^CARS\//, "");
 
 // options (from the game's start page): profile, a save slot name like
 // ?profile=; online, {relay, name, claim} like ?mp= and &name=; lan, {url, name, claim}
@@ -473,12 +663,8 @@ function webGpuUnavailableError() {
 // virtual LAN (lan.js; RECOMP_LAN turns the kit's Winsock on).
 async function start(options = {}) {
   startup("browser checks");
-  if (!crossOriginIsolated) {
-    if (/Instagram/i.test(navigator.userAgent || ""))
-      throw new Error("The game cannot run inside Instagram's browser. Open Instagram's menu and choose Open in browser, or copy this page's link into Chrome or Safari.");
-    throw new Error("The game needs a secure browser environment that this page does not provide. Open this link directly in Chrome or Safari. If it still fails, send a report.");
-  }
-  if (!navigator.gpu) throw webGpuUnavailableError();
+  if (!crossOriginIsolated) throw isolationError();
+  if (!navigator.gpu) throw webGpuUnavailableError(false);
   await waitForPhoneLandscape();
   startup("reading game information");
   const id = await gameId();
@@ -490,7 +676,7 @@ async function start(options = {}) {
   // Full imports still boot locally; hosted games prepare only verified startup modules.
   startup("checking game files");
   let stream = null;
-  let dir = await navigator.storage.getDirectory();
+  let dir = await storageRoot();
   let complete = false;
   try {
     for (const p of [id, "game"]) dir = await dir.getDirectoryHandle(p);
@@ -508,13 +694,37 @@ async function start(options = {}) {
     try { await dir.getDirectoryHandle("NIS"); window.carbonTestAssets.NIS = true; }
     catch { console.warn("[browser] NIS scene data is missing; resume Import Windows installation."); }
   }
-  const customizationReady = id === "nfsc";
+  let customizationReady = id === "nfsc";
   if (customizationReady) {
     startup("preparing customization assets");
-    await (await import(new URL("./custom-install.js", document.baseURI).href)).prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"});
+    // Custom parts are an add-on: a car that cannot be installed is left out (custom-install.js
+    // restores it), and when the shared catalog cannot be installed the game starts without any
+    // customization if its files are the originals (always so for a streamed game).
+    try {
+      let installer;
+      try { installer = await import(new URL("./custom-install.js", document.baseURI).href); }
+      catch (error) { error.customizationOptional = !!stream; throw error; }
+      const result = await installer.prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"});
+      if (result?.skipped?.length) {
+        diagnostics.customizationSkipped = result.skipped;
+        addonNotice(`Custom parts for ${result.skipped.map(unitName).join(", ")} could not be installed, so ${result.skipped.length > 1 ? "they use" : "it uses"} the original parts this time. Press Play again later to retry.`);
+      }
+    } catch (error) {
+      if (error?.customizationOptional !== true) throw error;
+      customizationReady = false;
+      optionalFailure("customization", error);
+      addonNotice("Custom car parts could not be installed this time, so the game starts without them. Press Play again later to retry. Your saves are kept.");
+    }
   }
   if (id === "nfsc" && !stream) {
-    await (await import(new URL("./billboards.js", document.baseURI).href)).prepareBillboards(status, {enabled: new URLSearchParams(location.search).get("billboards") !== "0"});
+    try {
+      await (await import(new URL("./billboards.js", document.baseURI).href)).prepareBillboards(status, {enabled: new URLSearchParams(location.search).get("billboards") !== "0"});
+    } catch (error) {
+      // A failed rollback keeps its recovery record; only then is the start stopped.
+      if (error?.restored === false || error?.name === "QuotaExceededError") throw error;
+      optionalFailure("billboards", error);
+      addonNotice("City artwork could not be installed this time, so the original billboards are shown.");
+    }
   }
   if (id === "nfsc" && !stream && ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) && !window.recompSite) {
     await (await import(new URL("./cockpit-assets.js", document.baseURI).href)).prepareCockpitAssets(startup);
@@ -565,7 +775,7 @@ async function start(options = {}) {
     if (adapter) break;
     if (options) console.warn("[browser] high-performance WebGPU adapter unavailable; trying the browser default");
   }
-  if (!adapter) throw webGpuUnavailableError();
+  if (!adapter) throw webGpuUnavailableError(true);
   const info = adapter.info || {};
   window.carbonGraphicsInfo = {
     source: "active device adapter", preference: diagnostics.adapterRequests.at(-1)?.preference,
@@ -704,6 +914,7 @@ async function start(options = {}) {
       stopRuntimeLoader();
       status("");
       gameRunning = true;
+      hideAddonNoticeLater();
       canvas.focus();
       try { Module.callMain([`--exe=${exe}`]); }
       catch (error) { reportFailure("main", error); }
@@ -737,6 +948,9 @@ window.recompBoot = (options) => {
     reportFailure("graphics-device-lost", new Error("The graphics device stopped. The game has been stopped to prevent repeated graphics errors. Select Back to game to try again. If this repeats, restart the browser and check hardware acceleration and your graphics driver. Your saves are kept."));
     return;
   }
+  // Not isolated (in-app browsers): show how to open the page in Chrome / Safari at once, instead of
+  // a start page whose Play button cannot work here.
+  if (!crossOriginIsolated) { booted = true; status("Loading…"); reportStartupFailure(isolationError()); return; }
   const params = [...new URLSearchParams(location.search).keys()];
   if (params.some((k) => k === "mp" || k === "lan" || k === "profile" || k.startsWith("RECOMP_"))) return recompBoot();
   const id = await gameId();

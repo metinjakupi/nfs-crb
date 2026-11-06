@@ -148,6 +148,14 @@ static void log_line(const char *text) {
 #include "encounter.h" /* native Crew Challenge with online opponents */
 #include "maprace.h"
 #include "ai_fixes.h"
+#include "guards.h" /* crash guards from NFSCO: minimap pieces, a render object, a race row without a race */
+#include "paint.h" /* paint slots past the game's eight: friends' cars 9+ in their own paint */
+#include "paint_fast.h" /* the skin compositor's pixel loops in native code (logs/paint-speed-20261105) */
+#include "crowd_test.h" /* TEST ONLY, RECOMP_CROWD=<max>: how many extra cars the game holds */
+#include "carlimit.h" /* more than the game's 30 cars: moved car lists, the car gate, full-vector guards */
+#include "guards2.h" /* more unchecked tables: the players registry of 20, watches (logs/stability-20261105) */
+#include "reflect.h" /* the car reflection cube in turns when many cars are near */
+#include "poolfill.h" /* no 0xEE fill of free pool memory: pools cost only what they hold */
 #include "photo_zoom.h"
 #include "autosculpt.h" /* balance native model buffer locks */
 #include "cockpit.h" /* local driver-seat camera and native wheel animation */
@@ -622,6 +630,14 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     sculpt_install();
     custom_hud_install();
     ai_fixes_install();
+    guards_install();
+    paint_install();
+    paint_fast_install();
+    crowd_install();
+    carlimit_install(); /* after mp_install: it alone sets the Cars pool size (phones keep 65000 KB) */
+    guards2_install();
+    reflect_install();
+    poolfill_install();
     photo_zoom_install();
     cockpit_install();
     traffic_install();
@@ -666,6 +682,14 @@ PopModStatus pop_mod_init(const PopModApi *api) {
 PopModStatus pop_mod_exit(void) {
     custom_hud_shutdown();
     ai_fixes_shutdown();
+    guards_shutdown();
+    paint_fast_shutdown();
+    paint_shutdown();
+    crowd_shutdown();
+    carlimit_shutdown();
+    guards2_shutdown();
+    reflect_shutdown();
+    poolfill_shutdown();
     photo_zoom_shutdown();
     traffic_shutdown();
     customization_shutdown();

@@ -90,7 +90,10 @@ static void hlr_car_flares(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocat
         return;
     api->guest_write_u32(api, esp + 0x1c, 1u); /* the game draws the player's decal too */
     const uint32_t ri = cpu->ecx, pos = get_u32(esp + 8), mat = get_u32(esp + 0xc);
-    if ((get_u32(ri + 0x30c0) & 3u) != 3u || !pos || !mat || g_hlr_restore)
+    /* This hook runs before lights.h's, so the car's light bits are still on here: headlights
+     * switched off (and not flashing) must be checked directly, or the extra draws below still
+     * light the road in its reflection (seen when the camera swings sideways while steering). */
+    if (lt_dark(g_lt_state) || (get_u32(ri + 0x30c0) & 3u) != 3u || !pos || !mat || g_hlr_restore)
         return;
     const int flash = hlr_flashing();
     const int extra = (mode >= 2 ? HLR_BRIGHT_DRAWS : 0) + (flash ? HLR_FLASH_DRAWS : 0);

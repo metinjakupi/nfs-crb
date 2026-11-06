@@ -293,7 +293,7 @@ if(TARGET recomp_gen)
     # saves.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
+    foreach(page start.js play-home.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()
@@ -304,6 +304,9 @@ if(TARGET recomp_gen)
     if(EXISTS ${RECOMP_GAME_DIR}/web/billboard-assets/manifest.json)
       file(COPY ${RECOMP_GAME_DIR}/web/billboard-assets DESTINATION ${POP_OUT})
     endif()
+    if(EXISTS ${RECOMP_GAME_DIR}/web/play-home)
+      file(COPY ${RECOMP_GAME_DIR}/web/play-home DESTINATION ${POP_OUT})
+    endif()
     if(EXISTS ${RECOMP_GAME_DIR}/web/cockpit-assets/R32-TEXTURES.BIN)
       file(COPY ${RECOMP_GAME_DIR}/web/cockpit-assets DESTINATION ${POP_OUT})
     endif()
@@ -313,7 +316,9 @@ if(TARGET recomp_gen)
     # skips wasm-opt, and every draw goes through those bindings. The symbol
     # map (CarbonRecomp.js.symbols, not published) names the wasm functions
     # in browser profiles.
-    set(web_pool 24)
+    # A JS expression, read when the page starts: a phone gets 4 waiting workers, as the mobile
+    # beta did, and more on demand. Each waiting worker costs a phone memory it cannot spare.
+    set(web_pool "(navigator.maxTouchPoints>0?4:24)")
     set(web_initial_memory 1073741824)
     set(web_worker_stack 16777216)
     if(RECOMP_WEB_MOBILE)

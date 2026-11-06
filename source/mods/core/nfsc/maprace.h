@@ -48,9 +48,10 @@ static void mr_career(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *in
  (void)inv;
  /* The initial native race script caches IsCareerMode as CareerRace. Its
   * race-done closure only uses PostRaceWarpTarget when that cached flag is true.
-  * Drift arenas need this native world setup/return path. This predicate
+  * Drift arenas and canyons need this native world setup/return path (without it Enter left
+  * both players in the canyon, seen 2026-11-04). This predicate
   * exception never applies to the independent cash/record/transaction hooks. */
- const int drift_world_setup=g_mr_session&&race_is_drift()&&g_race_phase==RACE_LAUNCHED&&
+ const int drift_world_setup=g_mr_session&&(race_is_drift()||g_race_type==13)&&g_race_phase==RACE_LAUNCHED&&
                             !g_race_active_seen&&cpu->target==0x0064baf0;
  if(g_mr_session&&!drift_world_setup) {api->hook_return(api,cpu,0,(uint32_t)(uintptr_t)user);return;}
  api->call_original(api,cpu->target,cpu);
@@ -66,6 +67,31 @@ static void mr_postrace(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *
  if(practice)mp_put(rs+0x6a18,0);
  api->call_original(api,cpu->target,cpu);
  if(practice&&rs==race_status())mp_put(rs+0x6a18,3);
+}
+/* Enter after a race can leave a player where it ended, and the only way out of a canyon is a race:
+ * a race without a post-race target (Quick Race events have none) stayed there, in free roam, for
+ * good (reported and seen 2026-11-04). So where the race began is kept, and a player back in free
+ * roam still this far from it goes to the safehouse by the game's own jump (0064b800, Lua
+ * JumpToSafeHouse). A race that does return its players ends well within this. */
+#define MR_LEFT_BEHIND 4000.0f
+static float g_mr_from[2];
+static int g_mr_homing;
+static double g_mr_ended_at;
+static void mr_keep_start(void) {
+ const uint32_t player=mp_player(),state=player?mp_state(get_u32(player+0x70)):0;
+ g_mr_homing=0;
+ if(!state){g_mr_from[0]=g_mr_from[1]=0;return;}
+ g_mr_from[0]=bits_float(get_u32(state+0x10));g_mr_from[1]=bits_float(get_u32(state+0x18));g_mr_homing=-1;
+}
+static void mr_go_home(void) {
+ if(g_mr_homing!=1||mp_now()-g_mr_ended_at<1500)return;
+ g_mr_homing=0;
+ const uint32_t player=mp_player(),state=player?mp_state(get_u32(player+0x70)):0;
+ if(!state||!mr_roam())return;
+ const float dx=bits_float(get_u32(state+0x10))-g_mr_from[0],dz=bits_float(get_u32(state+0x18))-g_mr_from[1];
+ if(dx*dx+dz*dz<MR_LEFT_BEHIND*MR_LEFT_BEHIND)return;
+ race_log("core.nfsc: world race: left %.0f m from its start: to the safehouse",sqrtf(dx*dx+dz*dz));
+ mp_call(0x0064b800,0,0,0);
 }
 static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
  (void)api;(void)cpu;(void)inv;(void)user;
@@ -112,9 +138,11 @@ static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
     * race-status pointer. Keep the database slot alive until its next native
     * replacement, as the original in-world race path does. */
    g_mr_session=g_mr_custom=0;g_mr_abandoned=0;
+   if(g_mr_homing<0){g_mr_homing=1;g_mr_ended_at=mp_now();}
   }
   return;
  }
+ mr_go_home();
  if(!(p->flags&MR_WORLD)||(p->flags&MR_CANCEL)||!p->session||p->launch!=p->session||
     (p->launch==g_race_launched&&!g_mr_pending)||!mr_roam()||get_u32(0x00a977f0))return;
  /* Kill marks a free-roam car for removal at the next simulation step.
@@ -132,8 +160,8 @@ static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
  if(++g_mr_prepare_frames<3||mp_now()-g_mr_prepare_at<500)return;
  g_mr_pending=0;
  uint32_t type=0;const uint32_t options=race_options(p->launch_key,&type);
- /* First version is deliberately limited to Sprint/Circuit/Speedtrap and native Drift/Canyon Drift. */
- if(!options||(type!=0&&type!=1&&type!=5&&type!=11&&type!=12)){race_forget("unsupported world race type");return;}
+ /* Limited to Sprint/Circuit/Speedtrap, native Drift/Canyon Drift and Canyon Duel. */
+ if(!options||(type!=0&&type!=1&&type!=5&&type!=11&&type!=12&&type!=13)){race_forget("unsupported world race type");return;}
  uint32_t db=get_u32(0x00a9828c),raw=mp_call(0x0061bef0,db,&p->launch_key,1);
  if(!raw){race_forget("world race parameters unavailable");return;}
  /* The original in-world custom-race path retires its previous custom slot
@@ -150,6 +178,7 @@ static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
  const uint32_t opts[]={custom,g_race_buf+0xc0};mp_call(0x007a9dc0,0,opts,2);
  race_forget("practice race from world map");
  g_mr_session=p->session;g_mr_custom=custom;g_mr_context=3;
+ mr_keep_start();
  g_race_type=type;mp_put(rs+0x6a18,3);
  g_race_session=p->session;g_race_launched=p->session;g_race_phase=RACE_LAUNCHED;g_race_no_ai=race_is_drift()||!(p->flags&RACE_KEEP_AI);
  for(int i=0;i<MP_SLOTS;i++)if(g_mp_remote[i].simable) {

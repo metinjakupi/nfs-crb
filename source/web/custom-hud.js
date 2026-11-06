@@ -361,7 +361,7 @@ const HUD_LIBRARY = {"styles": [{"id": "NFS_WORLD/refined.ini", "name": "World /
   }
   addEventListener('keydown',e=>{if(picker?.open&&(e.code==='F9'||e.code==='F10')){e.preventDefault();e.stopImmediatePropagation();closePicker();}},true);
   (globalThis.recompMenuActions ||= []).push({
-    id:'hud-style',group:'Display',label:'HUD style',hint:()=>enabled?currentStyle.name:'Original Carbon',
+    id:'hud-style',group:'HUD styles',label:'HUD style',hint:()=>enabled?currentStyle.name:'Original Carbon',
     keepOpen:true,run:openPicker,
   });
   dispatchEvent(new Event('recomp-menu-toggles'));

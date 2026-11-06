@@ -469,7 +469,11 @@ bool boot_load(const BootOptions &opts) {
     g_opt = opts;
     g_window_next_ns = g_primary_present_ns = 0;
 
+    // loader_load makes the arena. Making it here as well means a second reservation of the whole
+    // arena, and on the web that reused block must be cleared: every page written, 2 GiB for Carbon.
+#ifndef __EMSCRIPTEN__
     mem_init();
+#endif
     const char *exe = g_opt.exe;
     if (!exe)
         exe = recomp_env("EXE");

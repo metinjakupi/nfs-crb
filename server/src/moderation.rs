@@ -5,17 +5,45 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
+/// The Latin letter a Cyrillic or Greek letter cannot be told from, case by case: a capital В
+/// looks like B, a small в does not.
+fn latin_twin(c: char) -> Option<char> {
+    Some(match c {
+        'А' | 'Α' => 'A', 'В' | 'Β' => 'B', 'С' | 'Ϲ' => 'C', 'Е' | 'Ε' => 'E', 'Н' | 'Η' => 'H', 'І' | 'Ι' | 'Ӏ' => 'I',
+        'Ј' => 'J', 'К' | 'Κ' => 'K', 'М' | 'Μ' => 'M', 'Ν' => 'N', 'О' | 'Ο' => 'O', 'Р' | 'Ρ' => 'P', 'Ѕ' => 'S',
+        'Т' | 'Τ' => 'T', 'Υ' | 'Ү' => 'Y', 'Х' | 'Χ' => 'X', 'Ζ' => 'Z',
+        'а' | 'α' => 'a', 'с' | 'ϲ' => 'c', 'ԁ' => 'd', 'е' => 'e', 'һ' => 'h', 'і' | 'ι' | 'ӏ' => 'i', 'ј' => 'j',
+        'ո' | 'η' => 'n', 'о' | 'ο' => 'o', 'р' | 'ρ' => 'p', 'ѕ' => 's', 'ν' => 'v', 'х' | 'χ' => 'x', 'у' | 'γ' => 'y',
+        _ => return None,
+    })
+}
+
+/// A name with its lookalike letters made Latin, for comparing, or the name as it is if any
+/// other non-Latin letter stays: Меtin compares as Metin, while Иван stays a name of its own.
+pub fn without_lookalikes(name: &str) -> String {
+    let folded: String = name.chars().map(|c| latin_twin(c).unwrap_or(c)).collect();
+    if folded.is_ascii() { folded } else { name.to_string() }
+}
+
 pub fn reserved(name: &str) -> bool {
+    let low = name.to_lowercase();
+    if low.contains("админ") || low.contains("адмін") || low.contains("αδμιν") {
+        return true;
+    }
     name.chars()
         .map(|c| {
             let c = if ('\u{ff01}'..='\u{ff5e}').contains(&c) {
                 char::from_u32(c as u32 - 0xfee0).unwrap()
             } else {
-                c
+                latin_twin(c).unwrap_or(c)
             };
             match c.to_ascii_lowercase() {
-                '4' | '@' => 'a',
-                '1' | '!' => 'i',
+                '4' | '@' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+                'ď' | 'đ' => 'd',
+                '1' | '!' | '|' | 'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => 'i',
+                'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+                'м' => 'm',
+                'п' => 'n',
                 c => c,
             }
         })
@@ -315,5 +343,28 @@ impl Moderation {
         }
         self.commit(next)?;
         Ok(json!({"id":id,"name":target,"until":if op=="mute" {Some(now+minutes*60)}else{None}}))
+    }
+}
+
+#[cfg(test)]
+mod lookalike_tests {
+    use super::*;
+
+    #[test]
+    fn lookalikes_of_admin_are_reserved() {
+        for name in ["Admin", "\u{410}dmin", "\u{430}\u{501}\u{43c}\u{456}\u{578}", "\u{e1}dm\u{ed}n", "\u{410}\u{414}\u{41c}\u{418}\u{41d}", "\u{430}\u{434}\u{43c}\u{456}\u{43d}", "Super\u{391}dmin"] {
+            assert!(reserved(name), "{name}");
+        }
+        for name in ["Adam", "Metin", "\u{418}\u{432}\u{430}\u{43d}", "Badminton2"] {
+            assert_eq!(reserved(name), name == "Badminton2", "{name}");
+        }
+    }
+
+    #[test]
+    fn real_names_in_other_alphabets_stay_themselves() {
+        assert_eq!(without_lookalikes("\u{41c}\u{435}tin"), "Metin");
+        assert_eq!(without_lookalikes("\u{418}\u{432}\u{430}\u{43d}"), "\u{418}\u{432}\u{430}\u{43d}"); // Ivan
+        assert_eq!(without_lookalikes("\u{412}\u{43e}\u{432}\u{430}"), "\u{412}\u{43e}\u{432}\u{430}"); // Vova: small v has no twin
+        assert_eq!(without_lookalikes("Arb\u{eb}r"), "Arb\u{eb}r");
     }
 }

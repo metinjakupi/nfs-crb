@@ -211,6 +211,9 @@ void profile_note_lock(uint32_t critical_section) {
     std::lock_guard<std::mutex> lock(t->m);
     ++t->locks[critical_section];
 }
+bool profile_import_notes_on() {
+    return thread_map_on();
+}
 void profile_note_import(uint32_t index) {
     if (!thread_map_on())
         return;

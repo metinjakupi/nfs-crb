@@ -16,8 +16,9 @@
  * on by its speed for up to MP_EXTRAPOLATE ms). It does that twice a frame: before the HUD runs and again
  * as the main view is set up for drawing, after the frame's fixed 1/60 s
  * physics steps (MainLoop 00761150 runs 1 to 8 a frame), so the car is drawn
- * where it should be at that moment. After touching our car it is left to the
- * engine for a while instead (CONTACTS below). The
+ * where it should be at that moment. Near our car it is driven there through its
+ * speed instead, and after touching our car it is left to the engine for a while
+ * (CONTACTS and NEAR OUR CAR below). The
  * mod builds a car for a slot near the player (within MP_NEAR metres) and
  * removes it when the slot empties, the player leaves the world, or the car is
  * beyond MP_FAR. Each side of the block
@@ -94,7 +95,10 @@
  * relay the lower connection id also sends the other car's change to its owner
  * through bounded queues; the owner applies it only when its own game saw no
  * touch with that car (mp_contacts), and its pose acknowledges it.
- * With setting mp_ghost_cars, or the page's menu asking for it (flags bit 0),
+ * With setting mp_ghost_cars 1 (drive through) they are built solid as above but
+ * keep RBRemote's own CanCollideWith, so no car touches them, and the touches
+ * other games report are not applied (mp_drive_through).
+ * With the page's menu asking for it (flags bit 0; no setting since 2026-11-04),
  * they are class 8 instead: RBGhost (a plain
  * RigidBody; only its destructor differs) and AIVehicleGhost, drawn see-through.
  * Either way the physics still runs, so between two frames a car can be pushed
@@ -103,6 +107,19 @@
  * (*0x00a98284; its IVehicleCache is at +0), as for racers. Addresses and
  * layouts were found with berkayylmao's NFSPluginSDK (BSD-3) and checked in the
  * listing.
+ *
+ * NEAR OUR CAR. A solid friend's car within MP_SPRING_NEAR of ours (until it is
+ * MP_SPRING_FAR away again, so it does not flip every frame) is never put on its
+ * poses: it is driven onto them through its speed (MP_NEARBY), as NFSCO moves every
+ * copy (logs/nfsco-2888/collisions.md): each frame its speed and spin are its
+ * owner's, plus a pull onto its place of at most MP_NEAR_CATCHUP. Put there, a pose
+ * inside or against our car (where our car was in its owner's game some 50-150 ms
+ * before, or where ours has been pushed since) overlapped the two bodies and the
+ * physics pinned, hopped or launched them. A touch still sets it free and it is
+ * pulled back as above, then driven again; out of the band it is put on its poses
+ * once within MP_NEAR_LEAVE of them. Only a snap (mp_follow: past MP_SNAP with its
+ * place clear of ours, or past MP_SNAP_FAR) still puts it anywhere near us. Cop
+ * copies (cops.h), race cars (race.h) and see-through cars keep their own rules.
  *
  * MOVING IT. Every rigid body class (eight IRigidBody vtables, RBGhost's 009e7aa8)
  * shares the same getters and setters, which work on a state block at
@@ -114,6 +131,22 @@
  * the rows and the world inertia, so it is called. The car's Kill (ISimable +0x08,
  * 006d43a0) is not listed either; mp_kill does its steps, which are.
  * The work runs before cFEng::Service (00600c90), once a frame while the HUD runs.
+ *
+ * MORE FRIENDS (Step A, 2026-11-05). MP_SLOTS slots (20; the relay sends the 24 nearest players).
+ * The first MP_SLOTS_V2 (8) stay where the version-2 block has them, so pages and scripts that know
+ * only those (chat.js, radar.js, streaming.js) still read them right; the rest follow the block's old
+ * end (MpMore), with a magic word that tells a new page they are there. The game holds 30 cars (list 0,
+ * count at 0x00a9f164) and its car memory (006d41d0 against [0x00b77084]); its gate 006d86f0 does not
+ * refuse a car over either: it frees another one through the vehicle cache, which silently removed
+ * friends' cars (logs/crowd-test-20261105). So every car mp_build makes is first checked against both,
+ * with MP_ROOM_CARS places and MP_ROOM_KB of memory left over for the game's own cars (mp_room_fits); a car
+ * that does not fit is not asked for. Which friends get a car is decided here, nearest first: a friend
+ * without one shows only a name tag at its poses. A friend's car that leaves the slots (not among the
+ * nearest any more, beyond MP_FAR, or not heard from) is KEPT, parked (SetPhysicsMode 0: not simulated,
+ * not drawn), by its owner's relay id, model and look, and taken again when that friend comes back in
+ * the same model and look (KEPT CARS below). A friend's car is never built in another model: one whose
+ * model is not loaded here is asked for again, spooled, every MP_RETRY_MS, with only the name tag
+ * meanwhile (MODELS below).
  */
 #include <stdlib.h>
 #include <time.h>
@@ -142,7 +175,10 @@
 #define MP_REMOTE_HUMAN 6u /* driver classes: online human (RBRemote, AIVehicleHuman; can be chased) */
 #define MP_REMOTE 7u /* online opponent */
 #define MP_GHOST 8u  /* see-through ghost */
-#define MP_SLOTS 8
+#define MP_SLOTS 64
+#define MP_SLOTS_V2 8  /* slots where the version-2 block has them; the rest are in MpMore */
+#define MP_SLOTS_V3 20 /* slots 8..19 in MpMore (Step A); 20..63 in MpMore2 (Step B, carlimit.h) */
+#define MP_GONE 16     /* MpMore.gone: players who left the room, as the page last wrote them */
 #define MP_NEAR 300.0f /* metres: a remote player's car is built within this */
 #define MP_FAR 500.0f  /* and removed beyond this */
 #define MP_SIDE 4.0f   /* test car: metres beside the player where it first appears */
@@ -168,9 +204,14 @@
 #define MP_SNAP 8.0f         /* metres: further off than this, the car is put back at once, */
 #define MP_SNAP_CLEAR 6.0f   /* unless its place is this close to ours (it would land on us) */
 #define MP_SNAP_FAR 40.0f    /* and always when it is this far off */
+#define MP_SPRING_NEAR 20.0f /* metres: a solid friend's car this near ours is driven, never put (NEAR OUR CAR) */
+#define MP_SPRING_FAR 25.0f  /* until it is this far away again */
+#define MP_NEAR_GAIN 4.0f    /* 1/s: such a car's speed is its owner's plus this times the distance to its place, */
+#define MP_NEAR_CATCHUP 8.0f /* m/s: at most this */
+#define MP_NEAR_LEAVE 0.25f  /* metres: out of the band, it is put on its poses again from this close */
 #define MP_IMPACT_HOLD 250.0 /* ms a received impact waits for this game's own contact */
 #define MP_IMPACT_SEEN 600.0 /* ms: an own contact this recent already gave this car its push */
-enum { MP_FOLLOWING, MP_FREE, MP_RETURNING }; /* MpCar.follow */
+enum { MP_FOLLOWING, MP_FREE, MP_RETURNING, MP_NEARBY }; /* MpCar.follow; MP_NEARBY: driven near our car */
 #define MP_LABEL_UP 1.7f /* metres above a car's centre where its name goes */
 
 typedef struct MpPose {
@@ -200,6 +241,21 @@ typedef struct MpImpact { /* 0x40 bytes, one engine-calculated contact response 
     float at[3], dp[3], dv[3], dw[3];
 } MpImpact;
 
+typedef struct MpMore { /* after the version-2 block (MORE FRIENDS in the header comment) */
+    uint32_t magic;          /* MP_MORE_MAGIC: the page may use all `count` slots */
+    uint32_t count;          /* MP_SLOTS: slots in all, the first MP_SLOTS_V2 of them in MpShared.slots */
+    uint32_t gone_head;      /* the page: relay ids written to gone[] so far */
+    uint32_t spare;
+    uint32_t gone[MP_GONE];  /* the page: players who left the room, gone[(gone_head - 1) % MP_GONE] the newest */
+    MpSlot slots[MP_SLOTS_V3 - MP_SLOTS_V2];
+    MpLabel labels[MP_SLOTS_V3 - MP_SLOTS_V2];
+} MpMore;
+
+typedef struct MpMore2 { /* after MpMore (+0x2600): slots 20 .. MP_SLOTS - 1; MpMore.count says how many in all */
+    MpSlot slots[MP_SLOTS - MP_SLOTS_V3];
+    MpLabel labels[MP_SLOTS - MP_SLOTS_V3];
+} MpMore2;
+
 typedef struct MpShared {
     uint32_t magic, version; /* MP_MAGIC, 2; the version-1 prefix stays intact */
     uint32_t page;           /* the page: nonzero while the relay link is up */
@@ -209,26 +265,45 @@ typedef struct MpShared {
     uint32_t flags;          /* the page's choices and capabilities: MP_PAGE_* */
     uint32_t keys;           /* the game's: letters bound on the keyboard (KEYS above); 0 = not known */
     uint32_t me;             /* the page: our relay connection's id, 0 offline */
-    MpSlot slots[MP_SLOTS];
-    MpLabel labels[MP_SLOTS];
+    MpSlot slots[MP_SLOTS_V2]; /* slot i: mp_slot(sh, i) */
+    MpLabel labels[MP_SLOTS_V2]; /* mp_label(sh, i) */
     uint32_t tx_head, tx_tail, rx_head, rx_tail;
     MpImpact tx[MP_IMPACTS], rx[MP_IMPACTS]; /* single-producer/single-consumer queues */
+    MpMore more;             /* +0x18f0, where the version-2 block ended */
+    MpMore2 more2;           /* +0x2600, where Step A's block ended */
 } MpShared;
 #define MP_MAGIC 0x31504d43u /* "CMP1" */
+#define MP_MORE_MAGIC 0x2b504d43u /* "CMP+" */
 #define MP_PAGE_GHOST 1u      /* flags: show other players' cars see-through */
 #define MP_PAGE_CONTACTS 2u   /* relay and page support shared collision responses */
 #define MP_KEYS_KNOWN 0x80000000u /* keys: the mod filled it in */
 /* The page reads these by offset (web/net.js, chat.js). */
 _Static_assert(offsetof(MpShared, flags) == 0x54 && offsetof(MpShared, keys) == 0x58 &&
                    offsetof(MpShared, slots) == 0x60 && offsetof(MpShared, tx_head) == 0x8e0 &&
-                   sizeof(MpImpact) == 0x40 && sizeof(MpShared) == 0x18f0,
+                   sizeof(MpImpact) == 0x40 && offsetof(MpShared, more) == 0x18f0 &&
+                   offsetof(MpShared, more.gone) == 0x1900 && offsetof(MpShared, more.slots) == 0x1940 &&
+                   offsetof(MpShared, more.labels) == 0x2540 && offsetof(MpShared, more2) == 0x2600 &&
+                   offsetof(MpShared, more2.labels) == 0x2600 + 0x100 * (MP_SLOTS - MP_SLOTS_V3) &&
+                   sizeof(MpShared) == 0x2600 + 0x110 * (MP_SLOTS - MP_SLOTS_V3),
                "MpShared layout");
+
+/* Slot i (0 .. MP_SLOTS - 1) and its label, wherever the layout keeps them. */
+static MpSlot *mp_slot(MpShared *sh, int i) {
+    return i < MP_SLOTS_V2 ? &sh->slots[i] : i < MP_SLOTS_V3 ? &sh->more.slots[i - MP_SLOTS_V2] : &sh->more2.slots[i - MP_SLOTS_V3];
+}
+static MpLabel *mp_label(MpShared *sh, int i) {
+    return i < MP_SLOTS_V2 ? &sh->labels[i] : i < MP_SLOTS_V3 ? &sh->more.labels[i - MP_SLOTS_V2] : &sh->more2.labels[i - MP_SLOTS_V3];
+}
 
 typedef struct MpCar {
     uint32_t simable, id, key; /* the car's ISimable (0 = none) and whose it is */
     uint32_t kind;             /* the driver class it was built with */
-    int wait;                  /* frames before the next build attempt */
+    int wait;                  /* frames before the next build attempt (cops.h, rivals.h) */
     int tries;
+    double retry_at;           /* our ms: a friend's car is not asked for again before this (MODELS) */
+    double built_at;           /* our ms: when its car was built or taken back */
+    uint32_t look_hash;        /* the look its car was built in (mp_look_hash; 0 = stock) */
+    int tag_only;              /* a friend with no car here: only the name tag, at its poses */
     int visual_only; /* encounter copies: owner poses, no player inputs or contacts */
     int paused;      /* connected but in a menu: keep the car, stationary and non-colliding */
     int spawn_overlap; /* no contact with our car until a shared spawn has cleared */
@@ -241,7 +316,8 @@ typedef struct MpCar {
     float drawn[3];            /* where it was last placed */
     uint32_t contacts, ack, applied, sent;
     int pending;               /* impact (below) being gathered for its owner */
-    int follow;                /* MP_FOLLOWING its poses, MP_FREE after a touch, MP_RETURNING */
+    int follow;                /* MP_FOLLOWING its poses, MP_FREE after a touch, MP_RETURNING, MP_NEARBY */
+    int spring_near;           /* within MP_SPRING_NEAR of our car (until MP_SPRING_FAR): never put */
     double contact_at;         /* our ms: its last touch with our car */
     double free_at;            /* our ms: the touch that set it free */
     float hit_v0[3], hit_dv[3]; /* its owner's newest speed then, and the push our game gave it */
@@ -301,7 +377,21 @@ static void (*g_mp_drive_car)(MpCar *c, double play, int late);
 static void (*g_mp_follow_target)(MpCar *c, MpPose *target); /* cops.h: keeps a remote car's place off our car */
 
 static uint32_t mp_kind(void) {
-    return setting("mp_ghost_cars", 0) || g_mp_page_ghost ? MP_GHOST : MP_REMOTE;
+    return g_mp_page_ghost ? MP_GHOST : MP_REMOTE; /* see-through: only the page's own flag now */
+}
+
+/* Setting mp_ghost_cars 1, drive through (the user's wish, 2026-11-04; it replaced the see-through
+ * ghost choice, so a player who had ghost mode on now drives through): other players' cars look
+ * as solid as ever, but this player drives through them. They are built as solid cars without
+ * mp_enable_contacts, so RBRemote's own CanCollideWith (006ecca0) keeps every car off them (it
+ * asks for the original online session, which our relay never creates), and the pushes other
+ * games send are not applied (mp_contacts). Walls and the road still hold them. */
+static int mp_drive_through(void) {
+    return setting("mp_ghost_cars", 0) != 0 && !g_mp_page_ghost;
+}
+/* No touching other players' cars on this screen: see-through or drive through. */
+static int mp_no_contacts(void) {
+    return mp_kind() == MP_GHOST || mp_drive_through();
 }
 
 /* The driver class for player id's own car (g_mp_friend_kind: 6 or 7 when solid). */
@@ -315,6 +405,30 @@ static uint32_t mp_friend_kind(uint32_t id) {
 static int mp_kind_kept(uint32_t car, uint32_t kind) {
     const uint32_t now = get_u32(car + 0x148);
     return now == kind || ((now == MP_REMOTE || now == MP_REMOTE_HUMAN) && (kind == MP_REMOTE || kind == MP_REMOTE_HUMAN));
+}
+
+/* HUMANS. A class-6 car (AIVehicleHuman) is pushed, as the player's car is, onto an 8-entry list
+ * at 0x00a9ffe8 (method table, begin +4, capacity +8, count +0xc; 0042b370 pushes past the capacity:
+ * its grow, table +0xc, keeps the inline buffer). Seen 2026-11-05 (logs/step-a-20261105/runs/bots-1):
+ * the player and 9 friends' class-6 cars made the count 10, entries 9 and 10 overwrote the list after
+ * it (0x00aa0018: its method table and its buffer pointer) and the game ended 30 ms later
+ * (ExitProcess 0xC0000005 in 00763ca0's walk of that list). With 8 slots, 8 class-6 friends would
+ * already have overwritten its method table. A kept (parked) class-6 car keeps its entry. So a
+ * friend's car is class 6 only while the list has room; otherwise it is class 7 (AIVehicleEmpty: this
+ * game's police do not chase it), and a class-7 car is good enough for a friend who would be class 6
+ * (mp_kind_fits), so it is not rebuilt when room comes back. */
+#define MP_HUMANS 0x00a9ffe8u
+static uint32_t g_mp_humans_max = 8u; /* carlimit.h raises it once it has moved this list */
+#define MP_HUMANS_MAX g_mp_humans_max
+static uint32_t mp_humans(void) {
+    return get_u32(MP_HUMANS + 0xc);
+}
+static int mp_humans_room(void) {
+    const uint32_t cap = get_u32(MP_HUMANS + 8);
+    return mp_humans() + 1u <= (cap && cap < MP_HUMANS_MAX ? cap : MP_HUMANS_MAX);
+}
+static int mp_kind_fits(uint32_t have, uint32_t want) {
+    return have == want || (have == MP_REMOTE && want == MP_REMOTE_HUMAN);
 }
 
 /* 0 off, 1 record and replay, 2 escort. */
@@ -364,6 +478,21 @@ static void mp_enable_contacts(uint32_t simable) {
     log_line("core.nfsc: mp solid car uses the normal vehicle collision rule");
 }
 
+/* A solid car (class 6 or 7) given or freed of the collision rule when drive through is switched
+ * while it exists: its own table back (RBRemote's, no touching) or the private copy again. */
+static void mp_sync_contacts(uint32_t simable) {
+    const uint32_t body = get_u32(simable - 0x24 + 0x70);
+    if (body < 0x40u || get_u32(body - 0x14u) != simable)
+        return;
+    const uint32_t table = get_u32(body - 0x40u), through = mp_drive_through();
+    if (through && g_mp_solid_vtable && table == g_mp_solid_vtable) {
+        mp_put(body - 0x40u, MP_REMOTE_VTABLE);
+        log_line("core.nfsc: mp solid car: drive through (no collisions)");
+    } else if (!through && table == MP_REMOTE_VTABLE) {
+        mp_enable_contacts(simable);
+    }
+}
+
 static MpShared *mp_shared(void) {
     void *p = NULL;
     return g_mp_block && g_api->guest_ptr(g_api, g_mp_block, sizeof(MpShared), &p) == POP_OK ? p : NULL;
@@ -380,7 +509,7 @@ static uint32_t mp_state(uint32_t body) {
  * (after the finish line); it is still the player's car. */
 static uint32_t mp_player(void) {
     uint32_t node = get_u32(MP_CARS), other = 0;
-    for (int n = 0; node && node != MP_CARS && n < 64; ++n, node = get_u32(node)) {
+    for (int n = 0; node && node != MP_CARS && n < 256; ++n, node = get_u32(node)) {
         const uint32_t car = node - 0xd0;
         if (!get_u32(car + 0x7c) || !get_u32(car + 0x70))
             continue;
@@ -394,7 +523,7 @@ static uint32_t mp_player(void) {
 
 static int mp_listed(uint32_t car) {
     uint32_t node = get_u32(MP_CARS);
-    for (int n = 0; node && node != MP_CARS && n < 64; ++n, node = get_u32(node))
+    for (int n = 0; node && node != MP_CARS && n < 256; ++n, node = get_u32(node))
         if (node - 0xd0 == car)
             return 1;
     return 0;
@@ -480,11 +609,197 @@ static int mp_place(uint32_t simable, const MpPose *pose) {
  * player's) at pos, facing the player's way until its first pose arrives, in
  * look (a VehicleCustomizations, which the car copies; 0 = the stock look).
  * Returns its ISimable or 0. */
+/* How long one car build held up the game thread, in real time (a build runs on it, and includes
+ * any wait for other guest threads). Built cars, police models and refused cars are counted apart, so one kind cannot use up the
+ * others' log lines. A refusal is the model
+ * not being loaded and says nothing about what a build costs. Logged for the first MP_BUILD_LOG of
+ * each kind, at each new worst, and every MP_BUILD_EVERY after, so reports carry it without flooding. */
+#define MP_BUILD_LOG 24u
+#define MP_BUILD_EVERY 50u
+static int mp_cop_model(uint32_t key);
+
+static void mp_build_time(uint32_t kind, uint32_t key, uint32_t flags, const char *look, double ms, int built) {
+    static struct { uint32_t count; double total, worst; } t[3]; /* refused, built, built police models */
+    const int i = !built ? 0 : mp_cop_model(key) ? 2 : 1;
+    const int worst = ms > t[i].worst;
+    t[i].total += ms;
+    ++t[i].count;
+    if (worst)
+        t[i].worst = ms;
+    if (t[i].count > MP_BUILD_LOG && !worst && t[i].count % MP_BUILD_EVERY != 0)
+        return;
+    char line[160];
+    snprintf(line, sizeof line, "core.nfsc: mp build took %.1f ms (%s, model %08x, class %u%s%s): %u so far, average %.1f, worst %.1f",
+             ms, i == 2 ? "built police" : i ? "built" : "refused", key, kind, flags & 1u ? ", spooled" : "", look, t[i].count,
+             t[i].total / t[i].count, t[i].worst);
+    log_line(line);
+}
+
+/* ROOM (MORE FRIENDS in the header comment). 006d86f0 adds the new cars' estimates to the sum
+ * 006d41d0 returns (each car's [car + 0x1a8], in bytes; a car whose model's memory class is traffic
+ * or police, [0x00b74ccc] + model index * 0xd0 + 0x94 = 1 or 2, counted once per model) and their
+ * number to list 0's count, and when either is over [0x00b77084] (007b11e0) or 30, frees cars through
+ * the params' cache instead of refusing (read in the listing, 006d87ce..006d880c; seen in the crowd
+ * test). mp_room_fits asks the same before a build, with room left for the game's own cars; a car
+ * killed for room stays in list 0 until the game destroys it, so no second one is killed for room
+ * while the first is still listed (g_mp_dying). */
+#define MP_LIST0_COUNT 0x00a9f164u  /* list 0 of the 12 vehicle lists at 0x00a9f158: every car */
+static uint32_t g_mp_list0_max = 30u; /* 006d87f8 cmp eax, 0x1e; carlimit.h raises it once its lists are moved */
+#define MP_LIST0_MAX g_mp_list0_max
+#define MP_MEMORY_SUM 0x006d41d0u   /* cdecl (): the cars' memory estimates, bytes */
+#define MP_MEMORY_BUDGET 0x00b77084u /* bytes */
+#define MP_CAR_KB 6397u   /* a player's or racer's car, each (the class table at 0x00a77440; crowd test) */
+#define MP_COP_KB 1023u   /* a police car (driver class 2 or 4), once per model */
+#define MP_ROOM_CARS 3u   /* places of list 0 left free for the game's own traffic and police */
+#define MP_ROOM_KB 1024u  /* and memory */
+#define MP_DYING 8
+static uint32_t g_mp_dying[MP_DYING]; /* cars killed for room, until the game has destroyed them */
+static double g_mp_dying_at[MP_DYING];
+static int mp_listed(uint32_t car);
+
+static uint32_t mp_list0(void) {
+    return get_u32(MP_LIST0_COUNT);
+}
+
+/* carlimit.h (Step B): the gate's budget is the pool times g_mp_budget_x (the estimates are about three times what a
+ * car takes from the pool), and g_mp_real_room says whether the pool itself has room for one more car. */
+static uint32_t g_mp_budget_x = 1u;
+static int (*g_mp_real_room)(void);
+
+/* The car memory in use and the budget, KB. */
+static uint32_t mp_memory_kb(uint32_t *budget) {
+    if (budget)
+        *budget = get_u32(MP_MEMORY_BUDGET) / 1024u * g_mp_budget_x;
+    return mp_call(MP_MEMORY_SUM, 0, NULL, 0) / 1024u;
+}
+
+/* Whether a car killed for room is still in the car list (then list 0 has not dropped yet). */
+static int mp_dying_pending(void) {
+    int n = 0;
+    const double now = mp_now();
+    for (int i = 0; i < MP_DYING; ++i) {
+        if (g_mp_dying[i] && (!mp_listed(g_mp_dying[i] - 0x24) || now - g_mp_dying_at[i] > 5000.0))
+            g_mp_dying[i] = 0;
+        n += g_mp_dying[i] != 0;
+    }
+    return n;
+}
+
+static void mp_dying_add(uint32_t simable) {
+    int at = 0;
+    for (int i = 0; i < MP_DYING; ++i)
+        if (!g_mp_dying[i] || g_mp_dying_at[i] < g_mp_dying_at[at])
+            at = i;
+    g_mp_dying[at] = simable;
+    g_mp_dying_at[at] = mp_now();
+}
+
+/* The estimate 006d86f0 adds for a new car of driver class kind, KB (cautious: a police model's car
+ * already here would add nothing). */
+/* LITE CARS (Step B, carlimit.h): a friend farther than g_mp_lite_from metres (0 = never) is built as
+ * RacingLite (VehicleParams + 0x38 flag 0x20: the 1600 KB estimate and the _LITE textures); once it comes
+ * within MP_LITE_NEAR of that it is built again as a full car. */
+#define MP_LITE_FLAG 0x20u
+#define MP_LITE_KB 1600u
+#define MP_LITE_NEAR 0.5f
+static float g_mp_lite_from;
+static int g_mp_build_lite; /* the next build is lite (mp_estimate_kb, mp_build's caller) */
+static uint32_t g_mp_lite_built, g_mp_lite_rebuilt;
+static int mp_car_lite(uint32_t simable) {
+    return simable && get_u32(simable - 0x24 + 0x1a8) == MP_LITE_KB * 1024u;
+}
+
+static uint32_t mp_estimate_kb(uint32_t kind) {
+    return kind == 2u || kind == 4u ? MP_COP_KB : g_mp_build_lite ? MP_LITE_KB : MP_CAR_KB;
+}
+
+/* Whether one more car of class kind fits in list 0 and the car memory with room to spare; why gets
+ * the figures. */
+static int mp_room_fits(uint32_t kind, char *why, size_t n) {
+    uint32_t budget = 0;
+    const uint32_t list0 = mp_list0(), used = mp_memory_kb(&budget), est = mp_estimate_kb(kind);
+    const int fits = list0 + 1u + MP_ROOM_CARS <= MP_LIST0_MAX && budget > MP_ROOM_KB &&
+                     used + est <= budget - MP_ROOM_KB && (!g_mp_real_room || g_mp_real_room());
+    if (why)
+        snprintf(why, n, "list 0 %u/%u, memory %u + %u / %u KB", list0, MP_LIST0_MAX, used, est, budget);
+    return fits;
+}
+
+static int mp_kept_free_oldest(const char *why); /* KEPT CARS below: 1 if a kept car was removed */
+
+/* The kept cars the game counts and this file could remove: removes the oldest when the game's own
+ * cars have used up the room left for them (every MP_ROOM_EVERY ms, or at once when asked). */
+#define MP_ROOM_EVERY 250.0
+static void mp_room_keep(int now_too) {
+    static double at;
+    const double now = mp_now();
+    if (!now_too && now - at < MP_ROOM_EVERY)
+        return;
+    at = now;
+    uint32_t budget = 0;
+    const uint32_t list0 = mp_list0(), used = mp_memory_kb(&budget);
+    if ((list0 + MP_ROOM_CARS > MP_LIST0_MAX || used + MP_ROOM_KB > budget) && !mp_dying_pending()) {
+        char why[96];
+        snprintf(why, sizeof why, "room for the game's own cars: list 0 %u/%u, memory %u/%u KB", list0, MP_LIST0_MAX,
+                 used, budget);
+        mp_kept_free_oldest(why);
+    }
+}
+
+/* One line per car built, while counted: the room before and after, and whether the game freed
+ * another car to make it (list 0 grew by less than one). */
+static uint32_t g_mp_builds_logged, g_mp_evictions;
+static void mp_room_note(uint32_t kind, uint32_t key, uint32_t list0, uint32_t used, uint32_t budget) {
+    uint32_t budget2 = 0;
+    const uint32_t list1 = mp_list0(), used1 = mp_memory_kb(&budget2);
+    const int evicted = list1 != list0 + 1u;
+    g_mp_evictions += evicted;
+    if (!evicted && ++g_mp_builds_logged > 200u && g_mp_builds_logged % 50u != 0)
+        return;
+    char line[200];
+    snprintf(line, sizeof line, "core.nfsc: mp room: built model %08x class %u: list 0 %u -> %u/%u, memory %u -> %u/%u KB (+%d KB)%s",
+             key, kind, list0, list1, MP_LIST0_MAX, used, used1, budget2, (int)used1 - (int)used,
+             evicted ? "; EVICTION: list 0 did not grow by one" : "");
+    log_line(line);
+}
+
+static int g_mp_no_room; /* the last mp_build was not tried: no room (mp_room_fits) */
+/* PLAYERS' CARS SHOWN (Step B, carlimit.h): at most this many friends' cars at once, nearest first (the
+ * setting, or its Auto steps); mp_remotes' last counts for Auto. */
+static uint32_t g_mp_cars_cap = 64u;
+static int g_mp_built_now, g_mp_waiting_now;
+
 static uint32_t mp_build(uint32_t player, uint32_t kind, uint32_t key, const float pos[3], uint32_t flags,
                          uint32_t look) {
     const uint32_t b = g_mp_buf, state = mp_state(get_u32(player + 0x70));
+    g_mp_no_room = 0;
     if (!state)
         return 0;
+    char why[96];
+    if (kind == MP_REMOTE_HUMAN && !mp_humans_room()) { /* HUMANS: never a ninth entry */
+        static uint32_t told;
+        if (++told <= 8u || told % 100u == 0) {
+            char line[128];
+            snprintf(line, sizeof line, "core.nfsc: mp: no class-6 car of model %08x: the human list holds %u: %u so far", key, mp_humans(), told);
+            log_line(line);
+        }
+        return 0;
+    }
+    if (!mp_room_fits(kind, why, sizeof why)) {
+        static uint32_t told;
+        g_mp_no_room = 1;
+        if (++told <= 24u || told % 100u == 0) {
+            char line[200];
+            snprintf(line, sizeof line, "core.nfsc: mp room: no car of model %08x class %u now (%s): %u so far", key, kind, why, told);
+            log_line(line);
+        }
+        if (!mp_dying_pending())
+            mp_kept_free_oldest("room for a nearer car");
+        return 0;
+    }
+    uint32_t budget = 0;
+    const uint32_t list0 = mp_list0(), used = mp_memory_kb(&budget);
+    const double build_from = mp_now();
     for (uint32_t i = 0; i < 0x60; i += 4)
         mp_put(b + i, 0);
     uint32_t arg = b;
@@ -513,8 +828,11 @@ static uint32_t mp_build(uint32_t player, uint32_t kind, uint32_t key, const flo
         log_line(line);
         car = 0;
     }
-    if (car && (kind == MP_REMOTE || kind == MP_REMOTE_HUMAN)) /* both are RBRemote (006d0d40) */
+    if (car && (kind == MP_REMOTE || kind == MP_REMOTE_HUMAN) && !mp_drive_through()) /* both are RBRemote (006d0d40) */
         mp_enable_contacts(car);
+    mp_build_time(kind, key, flags, look ? ", own look" : "", mp_now() - build_from, car != 0);
+    if (car)
+        mp_room_note(kind, key, list0, used, budget);
     return car;
 }
 
@@ -614,7 +932,7 @@ static const char *mp_resolve_pair_body(const PopModApi *api, pop_cpu_v1 *cpu) {
      * a long push drifted metres from where its owner's car really went (2026-10-25). */
     const double now = mp_now();
     remote->contact_at = now;
-    if (remote->follow == MP_FOLLOWING && remote->kept) {
+    if ((remote->follow == MP_FOLLOWING || remote->follow == MP_NEARBY) && remote->kept) {
         remote->follow = MP_FREE;
         remote->free_at = now;
         memcpy(remote->hit_v0, remote->pose[remote->kept - 1].v, sizeof remote->hit_v0);
@@ -691,7 +1009,9 @@ static void mp_impact_log(const char *what, const MpImpact *hit) {
 static void mp_contacts(MpShared *sh, uint32_t player) {
     const uint32_t me = __atomic_load_n(&sh->me, __ATOMIC_ACQUIRE);
     const uint32_t flags = __atomic_load_n(&sh->flags, __ATOMIC_ACQUIRE);
-    const int enabled = me && (flags & (MP_PAGE_GHOST | MP_PAGE_CONTACTS)) == MP_PAGE_CONTACTS;
+    /* Not while this player drives through other players' cars (or they are see-through): a
+     * push from a car we pass through would shove ours out of nowhere. */
+    const int enabled = me && (flags & (MP_PAGE_GHOST | MP_PAGE_CONTACTS)) == MP_PAGE_CONTACTS && !mp_no_contacts();
     const uint32_t body = player ? get_u32(player + 0x70) : 0, state = mp_state(body);
     const double now = mp_now();
     uint32_t tail = __atomic_load_n(&sh->rx_tail, __ATOMIC_RELAXED);
@@ -781,8 +1101,10 @@ static void mp_contacts(MpShared *sh, uint32_t player) {
 }
 
 static void mp_drop(MpCar *c, const char *why) {
-    if (c->simable && mp_listed(c->simable - 0x24))
+    if (c->simable && mp_listed(c->simable - 0x24)) {
         mp_kill(c->simable);
+        mp_dying_add(c->simable); /* ROOM: its place is not free until the game destroys it */
+    }
     if (c->simable && why) {
         char line[96];
         snprintf(line, sizeof line, "core.nfsc: mp car of player %u removed (%s)", c->id, why);
@@ -793,23 +1115,47 @@ static void mp_drop(MpCar *c, const char *why) {
     c->follow = MP_FOLLOWING;
 }
 
-/* POLICE-MODEL CARS ARE KEPT. Removing (Kill) a car built in a police model ended the game now
- * and then (plans/police-sync.md "Known problems"), and a friend who turns police, or back,
- * changes model: its car here was removed twice (for the new model, then again ~0.6 s later for
- * its look). So a friend's car of a police model is not removed but kept out of sight (light bar
- * off, its controls cleared, MP_PARK_DOWN below our car) and taken by the next friend's car of
- * that model and class that has no look of its own, as cops.h keeps its cop copies. Only beyond
- * MP_SPARES, or when see-through cars change the class, is one removed. A police model is one
- * named in mp_cop_model, by the key 00606b60 makes of its name (mp_model_key gives the same). */
-#define MP_SPARES 4
-#define MP_PARK_DOWN 400.0f       /* metres below our car where kept cars wait */
+/* KEPT CARS. A friend's car is parked, not removed, when the friend leaves the slots (not among the
+ * page's nearest any more, or not heard from) or drives beyond MP_FAR (mp_park_friend): light bar
+ * off, its controls cleared, then SetPhysicsMode 0 (not simulated, not drawn, not solid) where it
+ * stands (a car put below our car came back up at our car, 2026-10-26, run c23: the police copy
+ * under the friend's own car). It is kept with its owner's relay id, model, driver class and look
+ * (mp_look_hash), and when that friend's slot asks for a car again in the same model, class and look,
+ * the kept car is put at its pose and its physics turned on again (mp_kept_take): no build, no
+ * spooling, no new memory. A kept car still counts toward list 0 and the car memory (vehicle-limit
+ * findings §7: parking frees nothing), so the oldest kept one is removed (Kill) when a nearer car
+ * needs its place (mp_build) or the game's own cars have used up their room (mp_room_keep). Kept
+ * cars also go when their friend leaves the room (MpMore.gone), when this player is not driving,
+ * and when another file removes the friends' cars (a race starting: mp_drop_friend). A friend whose
+ * model or look changed gets a new car: the old one is removed then, not kept.
+ * POLICE MODELS. Removing (Kill) a car built in a police model ended the game now and then
+ * (plans/police-sync.md "Known problems"), and a friend who turns police, or back, changes model:
+ * its car here was removed twice (for the new model, then again ~0.6 s later for its look). So a
+ * friend's car of a police model is never removed for room or a change but kept as above, and may
+ * also be taken by the next friend's car of that model and class that has no look of its own, as
+ * cops.h keeps its cop copies. Only beyond MP_SPARES of them, or when see-through cars change the
+ * class, is one removed. A police model is one named in mp_cop_model, by the key 00606b60 makes of
+ * its name (mp_model_key gives the same). Friends' cars of racer models were removed 56 times in
+ * stress tests without a crash (cops.h, TAKING THEM AWAY). */
+#define MP_KEPT 16
+#define MP_SPARES 4               /* kept cars of police models at most */
+#define MP_PARK_DOWN 400.0f       /* metres below our car where a kept car with its physics on waits */
 #define MP_SET_PHYSICS 0x006d6950u /* IVehicle +0x38 SetPhysicsMode, thiscall (IVehicle *, 0 inactive / 1 active) */
 #define MP_STRING_KEY 0x00606b60u /* cdecl (const char *name): the attribute key of a name */
 #define MP_LIGHT_BAR 0x7000u      /* PVehicle + 0x150 light bits: the police light bar */
-typedef struct MpSpare { uint32_t simable, kind, key; } MpSpare;
-static MpSpare g_mp_spares[MP_SPARES];
+#define MP_LOOK_BYTES 0x42cu      /* a VehicleCustomizations (look.h LOOK_BYTES) */
+typedef struct MpKept {
+    uint32_t simable, kind, key; /* the car, its driver class and model */
+    uint32_t id, look;           /* whose it was (0: a police-model spare of nobody now) and its look */
+    int cop;                     /* a police model: never removed for room */
+    double at;                   /* our ms: when it was parked */
+} MpKept;
+static MpKept g_mp_kept[MP_KEPT];
 static uint32_t g_mp_cop_keys[16];
 static int g_mp_cop_keys_n = -1;
+static uint32_t g_mp_gone_tail; /* MpMore.gone read so far */
+static uint32_t g_mp_reused, g_mp_parked, g_mp_kept_removed; /* for the log */
+static uint32_t g_mp_kept_kind; /* the driver class of the car mp_kept_take gave last */
 
 /* Whether key is a police car's model. */
 static int mp_cop_model(uint32_t key) {
@@ -834,8 +1180,20 @@ static int mp_cop_model(uint32_t key) {
     return 0;
 }
 
+/* A look as a number (FNV-1a of the record look.h gave mp_build, at guest address look; 0 = stock),
+ * so a kept car is taken back only in the look its owner has now. */
+static uint32_t mp_look_hash(uint32_t look) {
+    const uint8_t *p = NULL;
+    if (!look || g_api->guest_ptr(g_api, look, MP_LOOK_BYTES, (void **)&p) != POP_OK || !p)
+        return 0;
+    uint32_t h = 0x811c9dc5u;
+    for (uint32_t i = 0; i < MP_LOOK_BYTES; ++i)
+        h = (h ^ p[i]) * 0x01000193u;
+    return h ? h : 1u;
+}
+
 /* Whether simable is a car in use here now (a kept one then is not ours any more). */
-static int mp_spare_in_use(uint32_t simable) {
+static int mp_kept_in_use(uint32_t simable) {
     for (int i = 0; i < MP_SLOTS; ++i)
         if (g_mp_remote[i].simable == simable)
             return 1;
@@ -843,72 +1201,204 @@ static int mp_spare_in_use(uint32_t simable) {
            (g_mp_cop_car && g_mp_cop_car(simable));
 }
 
-/* A friend's car goes: kept when it is of a police model and there is room, else removed. */
-static void mp_drop_friend(MpCar *c, const char *why) {
+/* Whether kept car k is still ours: in the car list, its class, and not (its memory given to) a car
+ * in use. */
+static int mp_kept_ok(const MpKept *k) {
+    return k->simable && mp_listed(k->simable - 0x24) && mp_kind_kept(k->simable - 0x24, k->kind) &&
+           !mp_kept_in_use(k->simable);
+}
+
+/* Removes kept car k (Kill), or only forgets it when it is not ours any more. */
+static void mp_kept_remove(MpKept *k, const char *why) {
+    if (mp_kept_ok(k)) {
+        mp_kill(k->simable);
+        mp_dying_add(k->simable);
+        ++g_mp_kept_removed;
+        char line[160];
+        snprintf(line, sizeof line, "core.nfsc: mp kept car of player %u removed (model %08x, kept %.1f s; %s)", k->id, k->key,
+                 (mp_now() - k->at) / 1000.0, why);
+        log_line(line);
+    }
+    memset(k, 0, sizeof *k);
+}
+
+static int mp_kept_free_oldest(const char *why) {
+    MpKept *oldest = NULL;
+    for (int i = 0; i < MP_KEPT; ++i) {
+        MpKept *k = &g_mp_kept[i];
+        if (k->simable && !k->cop && mp_kept_ok(k) && (!oldest || k->at < oldest->at))
+            oldest = k;
+    }
+    if (!oldest)
+        return 0;
+    mp_kept_remove(oldest, why);
+    return 1;
+}
+
+/* Every kept car that is not of a police model goes. */
+static void mp_kept_flush(const char *why) {
+    for (int i = 0; i < MP_KEPT; ++i)
+        if (g_mp_kept[i].simable && !g_mp_kept[i].cop)
+            mp_kept_remove(&g_mp_kept[i], why);
+}
+
+/* A friend's car leaves the slots: kept for that friend (KEPT CARS), or removed (mp_drop: Kill) when
+ * it cannot be (see-through, gone already, or a police model beyond MP_SPARES). */
+static void mp_park_friend(MpCar *c, const char *why) {
+    const uint32_t car = c->simable ? c->simable - 0x24 : 0;
+    if (!car || c->kind == MP_GHOST || !mp_listed(car) || !mp_kind_kept(car, c->kind)) {
+        mp_drop(c, why);
+        return;
+    }
+    const uint32_t key = mp_model_key(car);
+    const int cop = mp_cop_model(key);
+    int cops = 0;
+    MpKept *free_at = NULL;
+    for (int i = 0; i < MP_KEPT; ++i) {
+        MpKept *k = &g_mp_kept[i];
+        if (k->simable && !mp_kept_ok(k))
+            memset(k, 0, sizeof *k);
+        if (k->simable && !k->cop && c->id && k->id == c->id)
+            mp_kept_remove(k, "an older car of the same player"); /* never two of one friend */
+        cops += k->simable && k->cop;
+    }
+    if (cop && cops >= MP_SPARES) {
+        mp_drop(c, why);
+        return;
+    }
+    for (int round = 0; round < 2 && !free_at; ++round) {
+        for (int i = 0; i < MP_KEPT && !free_at; ++i)
+            if (!g_mp_kept[i].simable)
+                free_at = &g_mp_kept[i];
+        if (!free_at && (round || !mp_kept_free_oldest("no place to keep another")))
+            break;
+    }
+    if (!free_at) {
+        mp_drop(c, why);
+        return;
+    }
+    mp_put(car + 0x150, get_u32(car + 0x150) & ~MP_LIGHT_BAR);
+    const uint32_t in = get_u32(car + 0xec); /* IInput::ClearInput: no gas or nitrous left on */
+    if (in && get_u32(in))
+        mp_call(get_u32(get_u32(in) + 4), in, NULL, 0);
+    const uint32_t off = 0; /* parked the game's way at once (inactive: not drawn, not solid) */
+    mp_call(MP_SET_PHYSICS, car + 0xb8, &off, 1);
+    free_at->simable = c->simable;
+    free_at->kind = c->kind;
+    free_at->key = key;
+    free_at->id = c->id;
+    free_at->look = c->look_hash;
+    free_at->cop = cop;
+    free_at->at = mp_now();
+    ++g_mp_parked;
+    char line[192];
+    snprintf(line, sizeof line, "core.nfsc: mp car of player %u kept (model %08x%s; %s): list 0 %u/%u, %u kept so far",
+             c->id, key, cop ? ", police model" : "", why ? why : "gone", mp_list0(), MP_LIST0_MAX, g_mp_parked);
+    log_line(line);
+    c->simable = 0;
+    c->pending = c->holding = 0;
+    c->follow = MP_FOLLOWING;
+}
+
+/* A friend's car goes for good (its model, look or class changed, or this player stopped driving):
+ * removed (Kill), or kept as a spare of nobody when it is of a police model (POLICE MODELS). */
+static void mp_remove_friend(MpCar *c, const char *why) {
     const uint32_t car = c->simable ? c->simable - 0x24 : 0;
     if (car && c->kind != MP_GHOST && mp_listed(car) && mp_kind_kept(car, c->kind) && mp_cop_model(mp_model_key(car))) {
-        for (int i = 0; i < MP_SPARES; ++i) {
-            MpSpare *sp = &g_mp_spares[i];
-            if (sp->simable)
-                continue;
-            mp_put(car + 0x150, get_u32(car + 0x150) & ~MP_LIGHT_BAR);
-            const uint32_t in = get_u32(car + 0xec); /* IInput::ClearInput: no gas or nitrous left on */
-            if (in && get_u32(in))
-                mp_call(get_u32(get_u32(in) + 4), in, NULL, 0);
-            sp->simable = c->simable;
-            sp->kind = c->kind;
-            sp->key = mp_model_key(car);
-            { /* parked the game's way at once (inactive: not drawn, not solid), before the friend's
-               * next car is built where this one stands; a car put below our car came back up at
-               * our car (2026-10-26, run c23: the police copy under the friend's own car) */
-                const uint32_t off = 0;
-                mp_call(MP_SET_PHYSICS, car + 0xb8, &off, 1);
-            }
-            char line[128];
-            snprintf(line, sizeof line, "core.nfsc: mp car of player %u kept for reuse (police model %08x; %s)", c->id,
-                     sp->key, why ? why : "gone");
-            log_line(line);
-            c->simable = 0;
-            break;
-        }
+        const uint32_t id = c->id;
+        c->id = 0;
+        mp_park_friend(c, why);
+        c->id = id;
+        return;
     }
     mp_drop(c, why);
 }
 
-/* A kept car of model key and class kind, or 0. */
-static uint32_t mp_spare_take(uint32_t key, uint32_t kind) {
-    for (int i = 0; i < MP_SPARES; ++i) {
-        MpSpare *sp = &g_mp_spares[i];
-        if (sp->simable && sp->key == key && sp->kind == kind && mp_listed(sp->simable - 0x24) &&
-            mp_kind_kept(sp->simable - 0x24, kind) && !mp_spare_in_use(sp->simable)) {
-            const uint32_t simable = sp->simable;
-            sp->simable = 0;
-            return simable;
-        }
-    }
-    return 0;
+/* A friend's car goes, and every kept one with it: for other files (a race starting). */
+static void mp_drop_friend(MpCar *c, const char *why) {
+    mp_remove_friend(c, why);
+    mp_kept_flush(why ? why : "friends' cars removed");
 }
 
-/* The kept cars, every frame: out of sight below our car (here, when we drive), standing still;
- * one gone with the world is forgotten, one of a class no longer used removed. */
-static void mp_spares(const float here[3], int driving) {
-    for (int i = 0; i < MP_SPARES; ++i) {
-        MpSpare *sp = &g_mp_spares[i];
-        if (!sp->simable)
+/* The kept car of player id in model key, class kind and look (0 = stock), or (has_look 0) a kept
+ * police-model car of nobody; 0 if none. A kept car of that player in another model or look is
+ * removed: that friend has a new one now. */
+static uint32_t mp_kept_take(uint32_t id, uint32_t key, uint32_t kind, uint32_t look, int has_look) {
+    MpKept *got = NULL;
+    for (int i = 0; i < MP_KEPT; ++i) {
+        MpKept *k = &g_mp_kept[i];
+        if (!k->simable)
             continue;
-        if (!mp_listed(sp->simable - 0x24) || !mp_kind_kept(sp->simable - 0x24, sp->kind) ||
-            mp_spare_in_use(sp->simable)) {
-            sp->simable = 0;
+        if (!mp_kept_ok(k)) {
+            memset(k, 0, sizeof *k);
+            continue;
+        }
+        if (k->id == id && id) {
+            if (k->key == key && mp_kind_fits(k->kind, kind) && k->look == look)
+                got = k;
+            else if (!k->cop)
+                mp_kept_remove(k, "its player has another car or look now");
+            else
+                k->id = 0;
+        }
+    }
+    for (int i = 0; !got && !has_look && i < MP_KEPT; ++i) {
+        MpKept *k = &g_mp_kept[i];
+        if (k->simable && k->cop && !k->id && k->key == key && k->kind == kind)
+            got = k;
+    }
+    if (!got)
+        return 0;
+    const uint32_t simable = got->simable;
+    g_mp_kept_kind = got->kind;
+    char line[160];
+    snprintf(line, sizeof line, "core.nfsc: mp car of player %u reused, not rebuilt (model %08x, kept %.1f s%s): %u so far", id,
+             key, (mp_now() - got->at) / 1000.0, got->id ? "" : ", a police-model spare", ++g_mp_reused);
+    log_line(line);
+    memset(got, 0, sizeof *got);
+    return simable;
+}
+
+/* The kept cars, every frame: forgotten when gone with the world; removed when their friend left the
+ * room (the page's MpMore.gone; all of them when more left than it holds), when this player is not
+ * driving, or when see-through cars change the class; one with its physics on is kept out of sight
+ * below our car (here). */
+static void mp_kept_frame(MpShared *sh, const float here[3], int driving) {
+    const uint32_t head = __atomic_load_n(&sh->more.gone_head, __ATOMIC_ACQUIRE);
+    if (head - g_mp_gone_tail > MP_GONE) {
+        mp_kept_flush("more players left than the page could say");
+        g_mp_gone_tail = head;
+    }
+    for (; g_mp_gone_tail != head; ++g_mp_gone_tail) {
+        const uint32_t id = sh->more.gone[g_mp_gone_tail % MP_GONE];
+        for (int i = 0; id && i < MP_KEPT; ++i) {
+            MpKept *k = &g_mp_kept[i];
+            if (k->simable && k->id == id) {
+                if (k->cop)
+                    k->id = 0;
+                else
+                    mp_kept_remove(k, "its player left the room");
+            }
+        }
+    }
+    if (!driving)
+        mp_kept_flush("this player is not driving");
+    for (int i = 0; i < MP_KEPT; ++i) {
+        MpKept *k = &g_mp_kept[i];
+        if (!k->simable)
+            continue;
+        if (!mp_kept_ok(k)) {
+            memset(k, 0, sizeof *k);
             continue;
         }
         if (mp_kind() == MP_GHOST) {
-            mp_kill(sp->simable);
-            sp->simable = 0;
+            mp_kill(k->simable);
+            memset(k, 0, sizeof *k);
             continue;
         }
-        if (get_u32(sp->simable - 0x24 + 0x160) == 0)
-            continue; /* parked inactive (mp_drop_friend): it stays where it is, unseen */
-        const uint32_t state = driving ? mp_state(get_u32(sp->simable - 0x24 + 0x70)) : 0;
+        if (get_u32(k->simable - 0x24 + 0x160) == 0)
+            continue; /* parked inactive (mp_park_friend): it stays where it is, unseen */
+        const uint32_t state = driving ? mp_state(get_u32(k->simable - 0x24 + 0x70)) : 0;
         MpPose park;
         if (!state)
             continue;
@@ -920,8 +1410,24 @@ static void mp_spares(const float here[3], int driving) {
         park.p[2] = here[2];
         memset(park.v, 0, sizeof park.v);
         memset(park.w, 0, sizeof park.w);
-        mp_place(sp->simable, &park);
+        mp_place(k->simable, &park);
     }
+}
+
+/* This game's own traffic: driver class 1 cars, and trucks' trailers (class 4 and the TRAILER type,
+ * as cops.h's cop_trailer). */
+#define MP_TRAILER_KEY 0x00a9e7bcu
+static int mp_traffic_count(int *trailers) {
+    int n = 0, t = 0;
+    uint32_t node = get_u32(MP_CARS);
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
+        const uint32_t car = node - 0xd0, kind = get_u32(car + 0x148);
+        n += kind == 1u;
+        t += kind == 4u && get_u32(car + 0x11c) == get_u32(MP_TRAILER_KEY);
+    }
+    if (trailers)
+        *trailers = t;
+    return n;
 }
 
 /* The physics time in ms: the page sends it with each pose, so the other
@@ -956,7 +1462,7 @@ static void mp_publish(MpShared *sh, uint32_t player) {
     sh->ms = mp_ms();
     sh->state = 0;
     for (int i = 0; i < MP_SLOTS; ++i)
-        sh->labels[i].applied = g_mp_remote[i].applied;
+        mp_label(sh, i)->applied = g_mp_remote[i].applied;
     if (player) {
         const uint32_t state = mp_state(get_u32(player + 0x70));
         if (state) {
@@ -1131,8 +1637,10 @@ static void mp_steer(uint32_t simable, const MpPose *pose) {
  * is left to the engine, as an AI car would be, until its owner's poses show the same
  * push (MP_FREE_MS at most), then pulled to those poses by a critically damped spring
  * on its speed (so it drives back onto them, never jumps), gentle at first; once there
- * it follows again. Only a car more than MP_SNAP off is put back at once, and never
- * onto our car (a snap 8 m back landed inside it after a long push, 2026-10-25). */
+ * it follows again. Near our car (MP_NEARBY, mp_place_all) it is driven instead: its
+ * owner's speed plus a pull onto its place, never put back from the last few cm. Only a
+ * car more than MP_SNAP off is put back at once, and never onto our car (a snap 8 m
+ * back landed inside it after a long push, 2026-10-25). */
 /* Whether the owner's newest pose already shows the push our game gave its car: its
  * speed changed along the push by at least half of it (the owner's game solved the
  * same touch). Then its poses are the better guide to where the car goes next. */
@@ -1143,6 +1651,47 @@ static int mp_owner_pushed(const MpCar *c) {
         along += (c->pose[c->kept - 1].v[k] - c->hit_v0[k]) * c->hit_dv[k];
     }
     return push2 > 0.01f && along >= 0.5f * push2;
+}
+
+/* A car put back at once: the jump a player sees. First ones, then every 100th. */
+static void mp_snap_note(const MpCar *c, float metres) {
+    static uint32_t snaps;
+    if (++snaps > 24u && snaps % 100u != 0)
+        return;
+    char line[112];
+    snprintf(line, sizeof line, "core.nfsc: mp snap of %.1f m (model %08x, player %u): %u so far", metres, c->key, c->id, snaps);
+    log_line(line);
+}
+
+/* How closely a driven car near ours (MP_NEARBY) keeps to its poses, over every MP_NEAR_NOTE frames of
+ * them: how far off it was before each pull, and of the frames its owner went faster than 100 km/h,
+ * the same and how far its speed was from its owner's. */
+#define MP_NEAR_NOTE 600
+static void mp_near_note(float off, const float want[3], const float has[3]) {
+    static int n, fast;
+    static float sum, most, fast_sum, fast_most, fast_dv;
+    float v2 = 0, dv2 = 0;
+    for (int k = 0; k < 3; ++k) {
+        v2 += want[k] * want[k];
+        dv2 += (want[k] - has[k]) * (want[k] - has[k]);
+    }
+    sum += off;
+    most = off > most ? off : most;
+    if (v2 > (100.0f / 3.6f) * (100.0f / 3.6f)) {
+        ++fast;
+        fast_sum += off;
+        fast_most = off > fast_most ? off : fast_most;
+        fast_dv += sqrtf(dv2);
+    }
+    if (++n < MP_NEAR_NOTE)
+        return;
+    char line[224];
+    snprintf(line, sizeof line, "core.nfsc: mp near spring: off its poses by %.3f m a frame on average, %.3f m at most; "
+             "%d frames above 100 km/h: %.3f m on average, %.3f m at most, speed off by %.2f m/s on average",
+             sum / n, most, fast, fast ? fast_sum / fast : 0.0f, fast_most, fast ? fast_dv / fast : 0.0f);
+    log_line(line);
+    n = fast = 0;
+    sum = most = fast_sum = fast_most = fast_dv = 0;
 }
 
 static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
@@ -1204,7 +1753,10 @@ static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
     }
     if (!state || !mp_pose_ok(&car) || error > MP_SNAP_FAR * MP_SNAP_FAR ||
         (error > MP_SNAP * MP_SNAP && clear > MP_SNAP_CLEAR * MP_SNAP_CLEAR)) {
-        c->follow = MP_FOLLOWING;
+        if (state)
+            mp_snap_note(c, sqrtf(error));
+        c->follow = c->spring_near ? MP_NEARBY : MP_FOLLOWING;
+        c->pull_at = now;
         mp_place(c->simable, &target);
         *out = target;
         return;
@@ -1215,9 +1767,11 @@ static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
     double dt = (now - c->pull_at) / 1000.0;
     dt = dt < 0 ? 0 : dt > 0.1 ? 0.1 : dt;
     c->pull_at = now;
-    float ramp = (float)((now - c->return_at) / MP_RETURN_MS);
+    float ramp = c->follow == MP_NEARBY ? 1.0f : (float)((now - c->return_at) / MP_RETURN_MS);
     ramp = ramp > 1.0f ? 1.0f : ramp;
     const float rate = MP_RETURN_RATE * (0.3f + 0.7f * ramp);
+    if (c->follow == MP_NEARBY)
+        mp_near_note(sqrtf(error), target.v, car.v);
     float a[3], a2 = 0, dv2 = 0, dot = 0, len = 0;
     for (int k = 0; k < 3; ++k) {
         a[k] = rate * rate * (target.p[k] - car.p[k]) + 2.0f * rate * (target.v[k] - car.v[k]);
@@ -1228,14 +1782,31 @@ static void mp_follow(MpCar *c, double now, int late, MpPose *out) {
     const float f = 1.0f - expf(-2.0f * rate * (float)dt);
     for (int k = 0; k < 4; ++k)
         dot += target.q[k] * car.q[k];
-    if (error < 0.03f * 0.03f && dv2 < 0.3f * 0.3f && fabsf(dot) > 0.99985f) {
-        c->follow = MP_FOLLOWING; /* back on its poses: the last few cm are placed */
+    /* Near our car (MP_NEARBY) its speed is its owner's, plus a pull onto its place of MP_NEAR_GAIN
+     * per second of the distance, at most MP_NEAR_CATCHUP, as NFSCO drives its copies. The spring
+     * alone, whose MP_RETURN_ACCEL cap holds the speed as well, left it metres behind at 100+ km/h
+     * and after any sudden change of its owner's speed (0.75 s to reach 80 km/h), so the car behind
+     * ran into it or it was snapped forward (logs/near-spring-20261105). A touch still frees it. */
+    float pull[3] = {0, 0, 0}, pull2 = 0;
+    for (int k = 0; k < 3 && c->follow == MP_NEARBY; ++k) {
+        pull[k] = MP_NEAR_GAIN * (target.p[k] - car.p[k]);
+        pull2 += pull[k] * pull[k];
+    }
+    for (int k = 0; k < 3 && pull2 > MP_NEAR_CATCHUP * MP_NEAR_CATCHUP; ++k)
+        pull[k] *= MP_NEAR_CATCHUP / sqrtf(pull2);
+    if (c->follow == MP_RETURNING && c->spring_near && now - c->return_at >= MP_RETURN_MS) {
+        c->follow = MP_NEARBY; /* pulled back at full strength near our car: driven from here (NEAR OUR CAR) */
+        c->pull_at = now;
+    } else if ((c->follow == MP_RETURNING && !c->spring_near && error < 0.03f * 0.03f && dv2 < 0.3f * 0.3f &&
+                fabsf(dot) > 0.99985f) ||
+               (c->follow == MP_NEARBY && !c->spring_near && error < MP_NEAR_LEAVE * MP_NEAR_LEAVE)) {
+        c->follow = MP_FOLLOWING; /* back on its poses away from our car: the last few cm are placed */
         mp_place(c->simable, &target);
         *out = target;
         return;
     }
     for (int k = 0; k < 3; ++k) {
-        car.v[k] += a[k] * scale * (float)dt;
+        car.v[k] = c->follow == MP_NEARBY ? target.v[k] + pull[k] : car.v[k] + a[k] * scale * (float)dt;
         car.w[k] += (target.w[k] - car.w[k]) * f;
     }
     for (int k = 0; k < 4; ++k) {
@@ -1256,10 +1827,35 @@ static void mp_place_all(MpPose *first, int late) {
     if (g_mp_local_paused)
         return;
     const double now = mp_now();
+    const uint32_t ours = g_mp_player_simable ? mp_state(get_u32(g_mp_player_simable - 0x24 + 0x70)) : 0;
+    float here[3];
+    for (int k = 0; ours && k < 3; ++k)
+        here[k] = bits_float(get_u32(ours + 0x10 + 4u * k));
     for (int i = 0; i < MP_SLOTS; ++i) {
         MpCar *c = &g_mp_remote[i];
+        if (!c->simable && c->tag_only && c->kept) { /* no car here: its name tag goes where its poses say */
+            MpPose tag;
+            mp_sample(c, mp_playback(c, now), &tag);
+            memcpy(c->drawn, tag.p, sizeof c->drawn);
+            continue;
+        }
         if (!c->simable || !c->kept)
             continue;
+        /* Near our car a solid car is driven onto its poses, never put there (NEAR OUR CAR): the
+         * nearer of where it was drawn and its newest pose, in by MP_SPRING_NEAR, out by MP_SPRING_FAR.
+         * Not a see-through or paused car, or one still clearing a shared spawn: none of those touches ours. */
+        float d2 = 1e30f;
+        for (int j = 0; ours && j < 2; ++j) {
+            const float *p = j ? c->pose[c->kept - 1].p : c->drawn, dx = p[0] - here[0], dy = p[1] - here[1],
+                        dz = p[2] - here[2];
+            d2 = fminf(d2, dx * dx + dy * dy + dz * dz);
+        }
+        const float edge = c->spring_near ? MP_SPRING_FAR : MP_SPRING_NEAR;
+        c->spring_near = c->kind != MP_GHOST && !c->paused && !c->visual_only && !c->spawn_overlap && d2 < edge * edge;
+        if (c->spring_near && c->follow == MP_FOLLOWING) {
+            c->follow = MP_NEARBY; /* out of the band it is put again once within MP_NEAR_LEAVE (mp_follow) */
+            c->pull_at = now;
+        }
         MpPose pose;
         mp_follow(c, now, late, &pose);
         memcpy(c->drawn, pose.p, sizeof c->drawn);
@@ -1310,12 +1906,12 @@ static void mp_view_ready(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocati
         return;
     for (int i = 0; i < MP_SLOTS; ++i) {
         const MpCar *c = &g_mp_remote[i];
-        MpLabel *l = &sh->labels[i];
+        MpLabel *l = mp_label(sh, i);
         if (g_mp_racer && g_mp_racer(g_mp_seen_slot[i].id))
             continue; /* race.h labels its racers' cars */
         float s[2];
         const float above[3] = {c->drawn[0], c->drawn[1] + MP_LABEL_UP, c->drawn[2]};
-        const float depth = c->simable && c->kept ? mp_project(g_mp_view + 0x80, above, 1, s) : 0.0f;
+        const float depth = (c->simable || c->tag_only) && c->kept ? mp_project(g_mp_view + 0x80, above, 1, s) : 0.0f;
         l->x = s[0];
         l->y = s[1];
         l->depth = depth > 0.5f && s[0] > -0.2f && s[0] < 1.2f && s[1] > -0.2f && s[1] < 1.2f ? depth : 0.0f;
@@ -1365,19 +1961,89 @@ static void mp_render_view(uint32_t id, uint32_t self) {
 static double g_mp_build_after;
 #define MP_BUILD_GAP_MS 100.0
 
+/* MODELS. A friend's car is built only in its owner's model. Until 2026-11-05 the third refused try
+ * built it in this player's own model (always loaded here) and tried the real one again later, and a
+ * car the gate 006d86f0 freed (ROOM) was built again that way: friends saw another player's car, the
+ * "RX-8 instead of his Lotus" report. Now a refused model is asked for again every MP_RETRY_MS, every
+ * other try spooled (VehicleParams flags 1), and until it is here the friend has only its name tag
+ * (tag_only). There is no fall-back to another model at all: a wrong car says the wrong thing about
+ * who is there, it costs the same place and memory as the right one, and a model this game does not
+ * have would stay wrong for good. A refusal costs under 0.1 ms (measured 2026-11-04), so trying
+ * again every 2 s costs nothing to speak of. */
+#define MP_RETRY_MS 2000.0
+#define MP_ROOM_RETRY_MS 500.0 /* no room now: asked again this soon (a kept car may be on its way out) */
+#define MP_SWAP 0.7f           /* a friend without a car this much nearer than the farthest with one */
+#define MP_SWAP_HOLD_MS 3000.0 /* takes its car's place, once that car has been here this long */
+#define MP_NOTE_MS 5000.0      /* the room and the friends' cars, in the log this often */
+
+/* PAINT (logs/paint-20261105/findings.md): a car of a model with a composite skin takes one of 30
+ * skin ids (CarRenderConn + 0x68, list 0x00b77db0), and its RideInfo ([conn + 0x3c]) names the
+ * texture DUMMY_SKIN<id> at +0x48, but the game data has only DUMMY_SKIN1-8. Which ids have their
+ * texture (GetTextureInfo 0055cfd0, cdecl (hash, return_default 0, include_unloaded 1)), as a line
+ * whenever that changes, so a run shows how many friends' cars can wear their own paint. */
+#define MP_RENDER_LIST 0x00b77db0u
+#define MP_TEXTURE_INFO 0x0055cfd0u
+static void mp_paint_line(void) {
+    static char said[160];
+    char with[80] = "", without[80] = "";
+    const uint32_t list = get_u32(MP_RENDER_LIST + 4), count = get_u32(MP_RENDER_LIST + 0xc);
+    for (uint32_t i = 0; list && i < count && i < 40; ++i) {
+        const uint32_t conn = get_u32(list + 4u * i), id = conn ? get_u32(conn + 0x68) : 0;
+        const uint32_t ride = id ? get_u32(conn + 0x3c) : 0, skin = ride ? get_u32(ride + 0x48) : 0;
+        if (!skin)
+            continue;
+        const uint32_t args[3] = {skin, 0, 1};
+        uint32_t info = 0;
+        if (g_api->guest_call(g_api, MP_TEXTURE_INFO, 0, args, 3, &info) != POP_OK)
+            info = 0;
+        char *to = info ? with : without;
+        const size_t at = strlen(to);
+        if (at + 8 < sizeof with)
+            snprintf(to + at, sizeof with - at, "%s%u", at ? "," : "", id);
+    }
+    char line[160];
+    snprintf(line, sizeof line, "core.nfsc: mp paint: skin ids with their texture [%s], without [%s]", with, without);
+    if (strcmp(line, said)) {
+        memcpy(said, line, sizeof said);
+        log_line(line);
+    }
+}
+
+/* Every MP_NOTE_MS: what the friends' cars and the game's own use of the room are now. */
+static void mp_room_line(double now, int slots, int built, int tags) {
+    static double at;
+    if (now - at < MP_NOTE_MS)
+        return;
+    at = now;
+    uint32_t budget = 0;
+    const uint32_t used = mp_memory_kb(&budget);
+    int kept = 0, cops = 0, trailers = 0;
+    for (int i = 0; i < MP_KEPT; ++i) {
+        kept += g_mp_kept[i].simable != 0;
+        cops += g_mp_kept[i].simable && g_mp_kept[i].cop;
+    }
+    const int traffic = mp_traffic_count(&trailers);
+    char line[320];
+    snprintf(line, sizeof line, "core.nfsc: mp cars: list 0 %u/%u, humans %u/%u, memory %u/%u KB; friends %d in slots, %d with a car, "
+             "%d name tag only, %d kept (%d police); traffic %d + %d trailers; %u reused, %u kept, %u kept removed, %u evictions",
+             mp_list0(), MP_LIST0_MAX, mp_humans(), MP_HUMANS_MAX, used, budget, slots, built, tags, kept, cops, traffic, trailers, g_mp_reused,
+             g_mp_parked, g_mp_kept_removed, g_mp_evictions);
+    log_line(line);
+    mp_paint_line();
+}
+
 static void mp_remotes(MpShared *sh, uint32_t player) {
     const double now = mp_now();
-    int build_slot = -1;
-    float build_d2 = MP_NEAR * MP_NEAR;
+    int build_slot = -1, far_slot = -1, slots = 0, built = 0, tags = 0, waiting = 0;
+    float build_d2 = MP_NEAR * MP_NEAR, far_d2 = 0;
     float here[3] = {0, 0, 0};
     const uint32_t state = player ? mp_state(get_u32(player + 0x70)) : 0;
     g_mp_page_ghost = (__atomic_load_n(&sh->flags, __ATOMIC_RELAXED) & MP_PAGE_GHOST) != 0;
     for (int i = 0; i < 3 && state; ++i)
         here[i] = bits_float(get_u32(state + 0x10 + 4u * i));
-    mp_spares(here, state != 0);
     if (!state) g_mp_build_after = 0;
     for (int i = 0; i < MP_SLOTS; ++i) {
-        MpSlot *src = &sh->slots[i], copy;
+        MpSlot *src = mp_slot(sh, i), copy;
         const uint32_t before = __atomic_load_n(&src->seq, __ATOMIC_ACQUIRE);
         if (!(before & 1)) {
             memcpy(&copy, src, sizeof copy);
@@ -1395,6 +2061,8 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
                 g_mp_friend_car(i, c->id, 0);
             c->simable = 0;
         }
+        if (c->simable && (c->kind == MP_REMOTE || c->kind == MP_REMOTE_HUMAN))
+            mp_sync_contacts(c->simable); /* drive through switched while it exists */
         /* Mode 0 is a connected player in a menu. Keep its last car visible; only an empty
          * slot (`left` from the page) removes it. The page zeros its speed, and the collision
          * hook treats it as display-only until mode 1 returns. */
@@ -1404,15 +2072,22 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         const int relook = !freeze && c->simable && active && c->id == s->id && g_mp_relook &&
                            g_mp_relook(i, s->id, s->key);
         if (c->simable && (!active || c->id != s->id || (!freeze &&
-            (c->key != s->key || c->kind != mp_friend_kind(s->id) || relook)))) {
+            (c->key != s->key || !mp_kind_fits(c->kind, mp_friend_kind(s->id)) || relook)))) {
             if (g_mp_friend_car)
                 g_mp_friend_car(i, c->id, 0);
-            mp_drop_friend(c, active ? "another player, car or look" : "left or stopped driving");
+            /* Out of the slots while this player drives: kept for when that friend comes back (KEPT
+             * CARS). A new model, look or class, a race taking the friend, or this player not driving:
+             * gone for good. */
+            if (state && (!s->id || c->id != s->id) && !(g_mp_racer && g_mp_racer(c->id)))
+                mp_park_friend(c, s->id ? "another player took its slot" : "out of the slots");
+            else
+                mp_remove_friend(c, active ? "another car or look" : "left or stopped driving");
         }
         if (relook)
             c->tries = 0; /* it was built, so its model is here: build it again in its own model */
         if (!active) {
             c->id = 0;
+            c->tag_only = 0;
             continue;
         }
         if (!freeze && (c->id != s->id || c->key != s->key)) {
@@ -1420,6 +2095,8 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
             c->key = s->key;
             c->wait = 0;
             c->tries = 0;
+            c->retry_at = 0;
+            c->tag_only = 0;
             c->taken = s->count + 1; /* start over in mp_take */
             c->applied = c->sent = c->ack = 0;
             c->pending = c->holding = 0;
@@ -1432,6 +2109,7 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         mp_take(c, s, now);
         if (!c->kept)
             continue;
+        ++slots;
         const MpPose *last = &c->pose[c->kept - 1];
         float d2 = 0;
         for (int k = 0; k < 3; ++k)
@@ -1453,23 +2131,47 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         c->lag = MP_DELAY + (MP_NEAR_DELAY - MP_DELAY) * near;
         /* Keep the paused frame's existing cars. Do not remove one because its owner drove far,
          * rebuild it for a model/look change, or introduce a new car behind the frozen menu. */
-        if (g_mp_local_paused)
+        if (g_mp_local_paused) {
+            built += c->simable != 0;
+            tags += !c->simable && c->tag_only;
             continue;
+        }
         if (c->simable) {
             if (d2 > MP_FAR * MP_FAR) {
                 if (g_mp_friend_car)
                     g_mp_friend_car(i, c->id, 0);
-                mp_drop_friend(c, "far away");
+                mp_park_friend(c, "far away");
+            } else if (g_mp_lite_from > 0 && d2 < (g_mp_lite_from * MP_LITE_NEAR) * (g_mp_lite_from * MP_LITE_NEAR) &&
+                       mp_car_lite(c->simable) && !mp_dying_pending()) {
+                if (g_mp_friend_car)
+                    g_mp_friend_car(i, c->id, 0);
+                mp_remove_friend(c, "a lite car came near: built again in full");
+                c->retry_at = now;
+                ++g_mp_lite_rebuilt;
+            } else {
+                ++built;
+                if (d2 > far_d2 && now - c->built_at >= MP_SWAP_HOLD_MS) {
+                    far_slot = i;
+                    far_d2 = d2;
+                }
+                continue;
             }
-            continue;
         }
-        if (d2 > MP_NEAR * MP_NEAR || (c->wait && --c->wait))
+        c->tag_only = d2 <= MP_FAR * MP_FAR; /* no car: the name tag alone (MODELS) */
+        tags += c->tag_only;
+        if (d2 > MP_NEAR * MP_NEAR)
+            continue;
+        ++waiting; /* near, no car */
+        if (now < c->retry_at)
             continue;
         if (build_slot < 0 || d2 < build_d2) {
             build_slot = i;
             build_d2 = d2;
         }
     }
+    mp_kept_frame(sh, here, state != 0);
+    if (state)
+        mp_room_keep(0);
     /* Select after reading every slot. Slot order must not make a farther car
      * consume the construction budget before a newly arrived nearby racer. */
     if (build_slot >= 0 && now >= g_mp_build_after) {
@@ -1478,46 +2180,100 @@ static void mp_remotes(MpShared *sh, uint32_t player) {
         MpCar *c = &g_mp_remote[i];
         const MpPose *last = &c->pose[c->kept - 1];
         const float d2 = build_d2;
-        /* Another model may not be loaded: the first try builds it as it is, the second asks
-         * for it to be spooled. Both were refused for a friend whose car this game had not
-         * loaded (2026-10-24: one window never saw the other), so from the third try the
-         * friend is shown in this player's own model, which is always loaded, rather than
-         * not at all. */
         g_mp_build_after = now + MP_BUILD_GAP_MS;
-        const int own_model = c->tries >= 2;
-        const uint32_t flags = 2u | 8u | (!own_model && (c->tries & 1) ? 1u : 0u);
-        const uint32_t look = g_mp_look ? g_mp_look(i, s->id, own_model ? 0u : s->key) : 0;
         c->kind = mp_friend_kind(s->id);
-        c->follow = MP_FOLLOWING;
-        c->spawn_overlap = d2 < 6.0f * 6.0f;
-        const uint32_t model = own_model ? mp_model_key(player) : s->key;
-        const uint32_t kept = !look && c->kind != MP_GHOST && mp_cop_model(model) ? mp_spare_take(model, c->kind) : 0;
-        c->simable = kept ? kept : mp_build(player, c->kind, own_model ? 0u : s->key, last->p, flags, look);
-        if (kept) {
-            mp_place(kept, last); /* at the friend's pose, then active again (IVehicle::Activate) */
-            if (get_u32(kept - 0x24 + 0xb8 + 0xa8) == 0) {
+        const uint32_t look = g_mp_look ? g_mp_look(i, s->id, s->key) : 0;
+        const uint32_t hash = mp_look_hash(look);
+        /* The friend's own kept car first (no build, no new place), then a new one if there is room. */
+        /* Not over "Players' cars shown": a kept car taken back past it was parked again at once (cycle-64b). */
+        uint32_t car = c->kind != MP_GHOST && built < (int)g_mp_cars_cap ? mp_kept_take(s->id, s->key, c->kind, hash, look != 0) : 0;
+        if (car)
+            c->kind = g_mp_kept_kind;
+        else if (c->kind == MP_REMOTE_HUMAN && !mp_humans_room())
+            c->kind = MP_REMOTE; /* HUMANS: the list is full */
+        char why[96];
+        if (car) {
+            mp_place(car, last); /* at the friend's pose, then active again (IVehicle::Activate) */
+            if (get_u32(car - 0x24 + 0xb8 + 0xa8) == 0) {
                 const uint32_t on = 1;
-                mp_call(MP_SET_PHYSICS, kept - 0x24 + 0xb8, &on, 1);
+                mp_call(MP_SET_PHYSICS, car - 0x24 + 0xb8, &on, 1);
             }
-            char line[128];
-            snprintf(line, sizeof line, "core.nfsc: mp car of player %u took a kept car (police model %08x)", s->id, model);
-            log_line(line);
             c->tries = 0;
+        } else if ((g_mp_build_lite = g_mp_lite_from > 0 && d2 > g_mp_lite_from * g_mp_lite_from && c->kind != MP_GHOST),
+                   built >= (int)g_mp_cars_cap ? (snprintf(why, sizeof why, "players' cars shown: %u", g_mp_cars_cap), 1)
+                                               : !mp_room_fits(c->kind, why, sizeof why)) {
+            /* Room first: the oldest kept car goes; with none, the farthest friend's car goes when
+             * this one is clearly nearer and its model has not been refused twice (a model that never
+             * comes would otherwise take every car in turn; seen 2026-11-05, runs/bots-2: parking the
+             * farthest car instead let it be taken back at once, every half second). The farthest
+             * friend then waits MP_SWAP_HOLD_MS with its name tag. */
+            c->retry_at = now + (c->tries >= 2 ? MP_RETRY_MS : MP_ROOM_RETRY_MS); /* a refused model: not so often */
+            static uint32_t told;
+            const int pending = mp_dying_pending();
+            const int freed = !pending && mp_kept_free_oldest("room for a nearer friend's car");
+            int swapped = 0;
+            if (!pending && !freed && far_slot >= 0 && far_slot != i && c->tries < 2 && d2 < MP_SWAP * MP_SWAP * far_d2) {
+                MpCar *f = &g_mp_remote[far_slot];
+                if (g_mp_friend_car)
+                    g_mp_friend_car(far_slot, f->id, 0);
+                mp_remove_friend(f, "a nearer friend needs its place");
+                f->retry_at = now + MP_SWAP_HOLD_MS;
+                c->retry_at = now; /* first in line once the place is free */
+                swapped = 1;
+            }
+            if (++told <= 24u || told % 100u == 0) {
+                char line[224];
+                snprintf(line, sizeof line, "core.nfsc: mp car of player %u (model %08x, %.0f m) waits for room (%s)%s: %u so far",
+                         s->id, s->key, sqrtf(d2), why, pending ? ", a removed car is still going" : freed ? ", a kept car removed"
+                         : swapped ? ", the farthest friend's car removed" : "", told);
+                log_line(line);
+            }
+        } else {
+            /* Another model may not be loaded: the first try builds it as it is, the next asks for
+             * it to be spooled, and so on every MP_RETRY_MS (MODELS). */
+            const uint32_t flags = 2u | 8u | (c->tries & 1 ? 1u : 0u) | (g_mp_build_lite ? MP_LITE_FLAG : 0u);
+            car = mp_build(player, c->kind, s->key, last->p, flags, look);
+            g_mp_lite_built += car && g_mp_build_lite;
+            if (!g_mp_no_room)
+                ++c->tries;
+            c->retry_at = now + (g_mp_no_room ? MP_ROOM_RETRY_MS : MP_RETRY_MS);
+            if (!car && g_mp_look)
+                g_mp_look(i, s->id, 0); /* not built: no look in use for this slot */
+            if (!g_mp_no_room && (c->tries <= 4 || car || c->tries % 15 == 0)) {
+                char line[192];
+                snprintf(line, sizeof line, "core.nfsc: mp car of player %u (model %08x) %s%s%s, try %d", s->id, s->key,
+                         car ? "built" : "refused, its name tag only until its model is here", flags & 1 ? " (spooled)" : "",
+                         look ? " in its owner's look" : "", c->tries);
+                log_line(line);
+            }
         }
-        if (c->simable && g_mp_friend_car)
-            g_mp_friend_car(i, s->id, c->simable);
-        ++c->tries;
-        if (!kept && (c->tries <= 4 || c->simable)) {
-            char line[160];
-            snprintf(line, sizeof line, "core.nfsc: mp car of player %u (model %08x) %s%s%s%s", s->id, s->key,
-                     c->simable ? "built" : "refused", flags & 1 ? " (spooled)" : "", look ? " in its owner's look" : "",
-                     own_model ? " in this player's own model (theirs is not loaded here)" : "");
-            log_line(line);
+        if (car) {
+            c->simable = car;
+            c->built_at = now;
+            c->look_hash = hash;
+            c->tag_only = 0;
+            c->follow = MP_FOLLOWING;
+            c->spawn_overlap = d2 < 6.0f * 6.0f;
+            if (g_mp_friend_car)
+                g_mp_friend_car(i, s->id, car);
         }
-        if (!c->simable)
-            c->wait = 120;
     }
 
+    g_mp_build_lite = 0; /* only friends' cars are built lite */
+    /* The setting (or Auto) went down: the farthest friend's car goes, one every MP_ROOM_EVERY. */
+    static double lowered_at;
+    if (state && built > (int)g_mp_cars_cap && far_slot >= 0 && now - lowered_at >= MP_ROOM_EVERY) {
+        lowered_at = now;
+        MpCar *f = &g_mp_remote[far_slot];
+        if (g_mp_friend_car)
+            g_mp_friend_car(far_slot, f->id, 0);
+        mp_park_friend(f, "players' cars shown lowered");
+        f->retry_at = now + MP_SWAP_HOLD_MS;
+    }
+    g_mp_built_now = built;
+    g_mp_waiting_now = waiting;
+    if (state)
+        mp_room_line(now, slots, built, tags);
     mp_place_all(NULL, 0);
 }
 
@@ -1672,7 +2428,20 @@ static void mp_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation 
     mp_hit_service(player);
 }
 
+/* CAR MEMORY. Construct's gate 006d86f0 sums each car's memory estimate (006d41d0: 6397 KB for a
+ * player's or racer's car) against the "Cars" pool, [0x00a62c48] KB (65000). Over it, the game does
+ * not refuse the new car: it frees another one through the vehicle cache, often a friend's car.
+ * Player and traffic models take 13011 KB, so 8 friends' cars fill it exactly and a ninth car of any
+ * kind removed a friend, who was built again, sometimes in this player's model (crowd test 2026-11-05,
+ * logs/crowd-test-20261105). The pool is raised at mod start, before the game sizes it (006bbdf0 reads
+ * it at each world load), to NFSCO's 102400 KB: room for about 13 such cars. The track streaming pool
+ * grows by the same amount (006b6eb1). */
+#define MP_CARS_POOL 0x00a62c48u
+#define MP_CARS_POOL_KB 102400u
+
 static void mp_install(void) {
+    /* The Cars pool size is carlimit.h's now (Step B, 2026-11-05): carlimit_install, which runs after this, is the
+     * only writer of MP_CARS_POOL (a phone keeps the game's 65000 KB; logs/mobile-crash-20261105). */
     if (g_api->guest_alloc(g_api, 0x100, &g_mp_buf) != POP_OK ||
         g_api->guest_alloc(g_api, sizeof(MpShared), &g_mp_block) != POP_OK) {
         log_line("core.nfsc: other players' cars unavailable (no guest memory)");
@@ -1686,6 +2455,8 @@ static void mp_install(void) {
     memset(sh, 0, sizeof *sh);
     sh->magic = MP_MAGIC;
     sh->version = 2;
+    sh->more.magic = MP_MORE_MAGIC; /* MORE FRIENDS: a page that knows MpMore uses all the slots */
+    sh->more.count = MP_SLOTS;
     if (install(MP_FE_SERVICE, mp_service, POP_HOOK_BEFORE, 26) != POP_OK) {
         log_line("core.nfsc: other players' cars unavailable");
         return;

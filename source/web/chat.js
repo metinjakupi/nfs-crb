@@ -15,6 +15,23 @@
 // where the car is on their screen. A horn stops by itself after 4 s, for
 // everyone, so a lost "off" cannot leave one sounding.
 //
+// THE LOOK (plans/chat-redesign, approved 2026-11-04): Carbon's style, as the
+// F9 menu (teal on near-black, bars slanted -14 degrees, Saira Condensed
+// italic capitals; menu.js loads the fonts). It keeps out of the way while
+// driving: at most FEED_LINES messages middle-left, above the game's minimap,
+// one row each (name and text together, at most two lines), each fading out
+// SHOW_MS after it came, so with nothing new there is nothing but a small chat
+// chip beside net.js's online badge at the top (one group with the ☰ and the
+// badge), with the key and how many messages came since the chat was last open. The chat key
+// opens a compact window that slides up from the bottom edge, at the left
+// (history, then the input line with its channel, Send and the status); the command list
+// takes the history's place while one is being picked (arrows move, Tab or
+// Enter fills it in). Crewmates joining or leaving get a line; other players
+// do not (a room can hold a hundred). On touch screens (navigator.maxTouchPoints,
+// as touch.js) the feed sits at the top under the chip, clear of the touch
+// controls, and the window docks a little above the bottom, above them and
+// the on-screen keyboard.
+//
 // KEYS. NFS Carbon's default keyboard controls (the bindings template in
 // NFSC.exe at 0xa61c88, see mods/core/nfsc/pad.h) put Next song on T and bind
 // Y and H to nothing, so chat is on Y and the horn on H. But a player
@@ -42,9 +59,10 @@
   const cleanText = (text) => typeof text === "string" ? text.replace(/\p{Cc}/gu, " ").trim().slice(0, 120) : "";
   const CHAT_KEYS = ["KeyY", "KeyU", "KeyJ", "KeyK"]; // first free one wins (KEYS above)
   const HORN_KEYS = ["KeyH", "KeyB", "KeyN", "KeyV"];
-  const SHOW_MS = 8000;      // a line in the feed stays this long, then fades
-  const MAX_LINES = 2; // temporary hints, separate from conversation
-  const HISTORY_LIMIT = 200, RECENT_LIMIT = 5;
+  const SHOW_MS = 8000;      // a line in the feed stays this long, then fades out
+  const HINT_MS = 10000;     // a hint about the keys stays a little longer
+  const FEED_LINES = 3;      // at most this many lines over the game
+  const HISTORY_LIMIT = 200;
   const HORN_MAX_MS = 4000;
   const HEAR_M = 150;        // other players' horns are silent beyond this
   // The relay's limits (LIMITS in tools/carbon-net-relay.mjs), kept a little
@@ -66,111 +84,160 @@
   let chatKey = CHAT_KEYS[0], hornKey = HORN_KEYS[0], keysWord = 0;
 
   const css = `
-  .cc { --ink: #e9f6ff; --dim: #8fa6bd; --cyan: #5fe4f2; --line: rgba(95, 228, 242, .22);
-        --u: clamp(12px, 1.9vh, 18px); --card: min(calc(var(--u) * 20), calc(100vw - 32px));
-        font: 600 var(--u)/1.3 "Avenir Next", "Segoe UI", system-ui, sans-serif; color: var(--ink); }
+  .cc { --ink: #e6f3f8; --dim: #87a0ad; --faint: #4b5f69; --teal: #3fe0e8; --teal-deep: #0e8f9a; --teal-glow: rgba(63, 224, 232, .45);
+        --line: rgba(63, 224, 232, .18); --amber: #f3b54a; --red: #ff5a4e; --skew: -14deg;
+        --cond: "Saira Condensed", "Avenir Next Condensed", "Arial Narrow", system-ui, sans-serif;
+        --body: "Saira", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+        --u: clamp(12.5px, 1.04vw, 15px); font: 500 var(--u)/1.32 var(--body); color: var(--ink); }
   .cc * { box-sizing: border-box; }
-  .cc-feed { position: fixed; left: 16px; bottom: 42vh; z-index: 7; display: flex; flex-direction: column; align-items: flex-start;
-        gap: calc(var(--u) * .3); max-width: min(calc(var(--u) * 30), calc(100vw - 32px)); pointer-events: none;
-        transition: transform .18s ease-out, opacity .18s ease-out; }
-  .cc-line { max-width: 100%; padding: calc(var(--u) * .3) calc(var(--u) * .8) calc(var(--u) * .3) calc(var(--u) * .65);
-        background: linear-gradient(90deg, rgba(6, 12, 22, .8), rgba(6, 12, 22, .5)); border-left: 2px solid var(--cyan);
-        transform: skewX(-12deg); text-shadow: 0 1px 2px rgba(0, 0, 0, .8); transition: opacity .6s ease; animation: cc-in .18s ease-out; }
-  .cc-line > span { display: block; transform: skewX(12deg); overflow: hidden; text-overflow: ellipsis; white-space: normal; overflow-wrap: anywhere; }
-  .cc-line.mine { border-left-color: var(--ink); }
-  .cc-line.note { border-left-color: transparent; background: rgba(6, 12, 22, .55); color: var(--dim); font-style: italic; font-weight: 500; }
-  .cc-line.out { opacity: 0; }
-  .cc-name { font: italic 800 .92em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .08em;
-        text-transform: uppercase; color: var(--cyan); margin-right: .5em; }
-  .cc-line.note .cc-name { margin-right: .25em; }
-  .cc kbd { display: inline-block; min-width: 1.7em; padding: .2em .4em; text-align: center; font: 700 .78em/1 system-ui, sans-serif;
-        color: var(--cyan); background: rgba(95, 228, 242, .1); border: 1px solid var(--line); }
-  .cc-card { position: fixed; left: 16px; top: 22vh; z-index: 8; width: var(--card); background: rgba(6, 12, 22, .9);
-        border: 1px solid var(--line); padding: calc(var(--u) * .9) calc(var(--u) * .9) calc(var(--u) * .75);
-        clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
-        animation: cc-in .16s ease-out; }
-  .cc-card::before, .cc-card::after { content: ""; position: absolute; width: 20px; height: 1px; background: var(--line);
-        transform-origin: left center; transform: rotate(45deg); }
-  .cc-card::before { left: calc(100% - 15px); top: -1px; }
-  .cc-card::after { left: -1px; top: calc(100% - 15px); }
-  .cc-card h2 { margin: 0 0 calc(var(--u) * .7); font: italic 800 .95em/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif;
-        letter-spacing: .2em; text-transform: uppercase; color: var(--cyan); display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-  .cc-card h2::after { content: ""; flex: 1; height: 2px; transform: skewX(-30deg);
-        background: linear-gradient(90deg, var(--cyan), transparent); opacity: .5; }
-  .cc-foot { margin-top: calc(var(--u) * .5); font-size: .72em; font-weight: 500; color: var(--dim); }
-  .cc-compose input { width:100%;padding:.65em;background:#091321;color:var(--ink);border:1px solid var(--line);font:inherit; }
-  .cc-compose input:focus-visible, .cc-compose button:focus-visible { outline:2px solid var(--cyan);outline-offset:2px; }
-  .cc-compose-actions { display:flex;gap:8px;margin-top:10px; }
-  .cc-compose button { padding:.5em .75em;background:#102735;color:var(--ink);border:1px solid var(--line);font:inherit;cursor:pointer; }
-  .cc-recent { position:fixed;left:16px;bottom:42vh;z-index:7;display:flex;flex-direction:column;
-    align-items:flex-start;gap:4px;width:min(380px,calc(100vw - 32px));pointer-events:none; }
-  .cc-recent .cc-line > span { display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
-  .cc-line.quiet { background:rgba(6,12,22,.35); }
-  .cc-feed { bottom:18vh; }
-  .cc.composing .cc-recent, .cc.composing .cc-feed { visibility:hidden; }
-  .cc-compose { top:8vh;max-height:84vh;overflow:auto;width:min(460px,calc(100vw - 32px)); }
-  .cc-history { height:32vh;min-height:80px;overflow-y:auto;overscroll-behavior:contain;
-    margin:8px 0 12px;padding:4px 8px;scrollbar-color:var(--dim) #09121e; }
-  .cc-history .cc-line { transform:none;animation:none;margin-bottom:6px;background:transparent;padding:5px 8px; }
-  .cc-history .cc-line > span { transform:none; }
-  .cc-empty { color:var(--dim);font-size:.85em;font-weight:500; }
-  .cc-history:focus-visible { outline:2px solid var(--cyan);outline-offset:2px; }
-  .cc-compose button:hover { background:#193d50; }
-  .cc-compose button:active { background:#24546a; }
-  .cc [hidden] { display: none !important; }
-  .cc { --u:clamp(14px,1.2vw,17px); }
-  .cc-compose {left:max(20px,env(safe-area-inset-left));top:auto;bottom:max(24px,env(safe-area-inset-bottom));
-    width:min(580px,calc(100vw - 40px));height:min(660px,88dvh);max-height:88dvh;display:flex;flex-direction:column;
-    overflow:hidden;padding:20px;gap:12px;clip-path:none;border-radius:8px;background:rgba(7,17,28,.97);box-shadow:0 16px 64px #0008;animation:none;}
-  .cc-compose::before,.cc-compose::after {display:none;}
-  .cc-header {display:flex;align-items:center;justify-content:space-between;gap:12px;}
-  .cc-card h2 {margin:0;font-size:17px;letter-spacing:.12em;}
-  .cc-card h2::after {display:none;}
-  .cc-channel {margin:4px 0 0;color:var(--dim);font-size:13px;font-weight:500;}
-  .cc-compose button {min-height:42px;border-radius:4px;font-size:14px;}
-  .cc-compose .cc-close {width:42px;padding:0;font-size:24px;line-height:1;background:transparent;}
-  .cc-history {flex:1;min-height:72px;height:auto;margin:0;padding:4px 10px 4px 0;scrollbar-width:thin;}
-  .cc-history .cc-line {padding:10px 12px;margin:0 0 6px;border-left:2px solid #31516a;background:#10202d55;border-radius:0 4px 4px 0;text-shadow:none;}
-  .cc-history .cc-line.mine {border-left-color:var(--cyan);background:#12313955;}
-  .cc-history .cc-line.note {font-style:normal;color:#b8cbd9;background:#13212a;border-left-color:#4a6578;}
-  .cc-message-meta {display:flex;align-items:baseline;gap:12px;margin-bottom:5px;}
-  .cc-message-meta .cc-name {font:700 13px/1.4 "Avenir Next","Segoe UI",system-ui,sans-serif;letter-spacing:.02em;text-transform:none;margin:0;}
-  .cc-message-meta time {font-size:11px;color:var(--dim);font-weight:400;}
-  .cc-message-text {display:block;font-weight:400;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap;}
-  .cc-compose label {font-size:13px;color:#c3d4df;}
-  .cc-input-row {display:flex;gap:8px;}
-  .cc-compose input {min-width:0;flex:1;width:auto;min-height:46px;border-radius:4px;font-size:16px;font-weight:400;}
-  .cc-compose .cc-send {background:var(--cyan);color:#071722;border-color:var(--cyan);font-weight:700;padding:0 18px;}
-  .cc-compose .cc-send:hover {background:#a1f5fc;}
-  .cc-compose button:disabled {opacity:.4;cursor:default;}
-  .cc-compose-actions {margin:0;display:flex;justify-content:space-between;align-items:center;gap:10px;}
-  .cc-compose-actions span {color:var(--dim);font-size:12px;font-weight:400;}
-  .cc-foot {margin:0;min-height:1.4em;font-size:13px;line-height:1.4;}
-  .cc-foot.bad {color:#ffb1a4;}
-  .cc-suggestions {overflow-y:auto;max-height:32dvh;flex-shrink:0;border:1px solid var(--line);border-radius:4px;background:#0b1d2a;padding:4px;}
-  .cc-suggestions button {width:100%;display:flex;text-align:left;align-items:baseline;justify-content:space-between;gap:12px;border:0;background:transparent;padding:9px 10px;}
-  .cc-suggestions strong {font:700 14px/1.4 ui-monospace,monospace;color:var(--cyan);white-space:nowrap;}
-  .cc-suggestions small {font-size:12px;color:#bed0de;font-weight:400;}
-  .cc-open {position:fixed;left:max(20px,env(safe-area-inset-left));bottom:max(24px,env(safe-area-inset-bottom));z-index:7;
-    min-height:42px;padding:8px 14px;display:flex;align-items:center;gap:14px;background:#0a1929e8;color:var(--ink);border:1px solid var(--line);border-radius:4px;font:600 14px/1.4 system-ui,sans-serif;cursor:pointer;}
-  .cc-open:hover {background:#163549;}.cc-open:focus-visible {outline:2px solid var(--cyan);outline-offset:3px;}
-  .cc.composing .cc-open {display:none;}
-  .cc-recent .cc-message-meta {margin-bottom:2px;}
-  @media(max-width:600px) {.cc-compose {left:10px;bottom:max(10px,env(safe-area-inset-bottom));width:calc(100vw - 20px);padding:14px;height:88dvh;gap:10px;}.cc-suggestions button {align-items:flex-start;flex-direction:column;gap:2px;}.cc-compose-actions span {font-size:11px;}}
-  @media(max-height:500px) {.cc-compose {bottom:8px;height:calc(100dvh - 16px);max-height:calc(100dvh - 16px);padding:12px;gap:8px;}.cc-history .cc-line {padding:6px 10px;}.cc-suggestions {max-height:25dvh;}}
-  .cc-conversation {position:relative;flex:1;min-height:64px;}
-  .cc-conversation .cc-history {height:100%;min-height:0;}
-  .cc-conversation .cc-suggestions {position:absolute;inset:0;max-height:none;}
-  @media(max-height:500px) {.cc-compose {gap:6px;}.cc-header h2 {font-size:15px;}.cc-channel {font-size:12px;}.cc-compose .cc-close {min-height:36px;height:36px;}.cc-compose-actions button {min-height:36px;}}
-  @keyframes cc-in { from { opacity: 0; translate: -8px 0; } }
+  .cc [hidden] { display: none; }
+  .cc :where(button, input) { font: inherit; color: inherit; } /* :where keeps it below every rule after it */
+  /* The chip: with the chat key and the unread count, right of net.js's online badge (layout() places it). */
+  .cc-chip { position: fixed; z-index: 7; left: var(--chip-x, 62px); top: var(--chip-y, 10px);
+        height: var(--chip-h, 32px); min-width: 40px; padding: 0 9px; display: flex; align-items: center; gap: 6px; cursor: pointer;
+        background: rgba(6, 12, 22, .62); border: 1px solid rgba(63, 224, 232, .22); transform: skewX(-12deg); opacity: .55;
+        transition: opacity .3s ease, border-color .15s ease; }
+  .cc-chip > * { transform: skewX(12deg); }
+  .cc-chip:hover, .cc-chip:focus-visible, .cc-chip.lit { opacity: 1; border-color: var(--teal); outline: none; }
+  .cc-chip svg { width: 15px; height: 15px; fill: none; stroke: var(--teal); stroke-width: 1.8; }
+  .cc-chip kbd { font: 700 11px/1 var(--cond); color: var(--ink); letter-spacing: .04em; }
+  .cc-unread { min-width: 18px; padding: 2px 4px 1px; font: italic 800 11px/1 var(--cond); text-align: center; color: #021015;
+        background: var(--teal); box-shadow: 0 0 10px var(--teal-glow); }
+  .cc.composing .cc-chip { opacity: 0; pointer-events: none; }
+  /* The feed: middle-left, above the game's minimap (its top edge is 37% up the screen). */
+  .cc-feed { position: fixed; z-index: 7; left: max(16px, env(safe-area-inset-left)); bottom: 40vh; width: calc(var(--u) * 25); max-width: calc(100vw - 32px);
+        display: flex; flex-direction: column; align-items: flex-start; gap: 3px; pointer-events: none; }
+  .cc.composing .cc-feed { visibility: hidden; }
+  .cc-ln { --c: var(--teal); --sk: var(--skew); position: relative; max-width: 100%; padding: .2em 1em .24em .95em; isolation: isolate;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, .85); animation: cc-in .24s cubic-bezier(.2, .8, .2, 1) both; transition: opacity .6s ease, translate .6s ease; }
+  .cc-ln::before { content: ""; position: absolute; inset: 0; z-index: -1; transform: skewX(var(--sk));
+        background: linear-gradient(90deg, rgba(4, 8, 11, .84), rgba(4, 8, 11, .66) 75%, rgba(4, 8, 11, .4)); border-left: 2px solid var(--c); }
+  .cc-ln.cc-new::after { content: ""; position: absolute; inset: 0; z-index: -1; transform: skewX(var(--sk)); pointer-events: none;
+        background: linear-gradient(90deg, color-mix(in srgb, var(--c) 34%, transparent), transparent 70%); animation: cc-flash 1.4s ease-out both; }
+  .cc-ln.cc-out { opacity: 0; translate: -8px 0; }
+  .cc-body { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .cc-nm { font: italic 700 .92em/1 var(--cond); letter-spacing: .06em; text-transform: uppercase; color: var(--c); margin-right: .5em; }
+  .cc-tag { display: inline-block; margin-right: .55em; padding: .18em .45em .1em; font: 700 .68em/1 var(--cond); letter-spacing: .14em; text-transform: uppercase;
+        font-style: normal; color: var(--tc, var(--teal)); border: 1px solid currentColor; transform: skewX(var(--skew)); vertical-align: .12em; }
+  .cc-ln.mine::before { background: linear-gradient(90deg, rgba(14, 60, 66, .78), rgba(4, 8, 11, .62) 75%, rgba(4, 8, 11, .38)); }
+  .cc-ln.sys { --c: #5d7682; color: #b5c9d1; }
+  .cc-ln.sys .cc-tx { font-style: italic; }
+  .cc-ln.admin { --c: var(--amber); --tc: #1b1203; }
+  .cc-ln.admin .cc-tag { background: var(--amber); border-color: var(--amber); }
+  .cc-ln.admin .cc-nm { color: var(--amber); }
+  .cc-ln.pm { --tc: #ff8fd8; }
+  .cc-ln.err { --c: var(--red); --tc: var(--red); color: #ffd0cb; }
+  .cc-ln kbd { display: inline-grid; place-items: center; min-width: 1.6em; height: 1.45em; padding: 0 .35em; margin: 0 .3em 0 0; border: 1px solid rgba(255, 255, 255, .35);
+        border-radius: 3px; font: 700 .82em/1 var(--cond); color: #fff; background: rgba(255, 255, 255, .06); vertical-align: .06em; }
+  .cc-gap { display: inline-block; width: 1.2em; }
+  /* The chat window: docked to the bottom edge, left, sliding up from below. While it is open it
+     covers the game's minimap (bottom-left), which is not needed while typing; it keeps clear of
+     the car and the road in the middle, the game's centre prompts and the speedometer. */
+  .cc-box { position: fixed; z-index: 8; left: max(16px, env(safe-area-inset-left)); bottom: 0; width: min(calc(var(--u) * 32), calc(100vw - 32px));
+        display: flex; flex-direction: column; gap: 7px; padding: 9px 12px calc(8px + env(safe-area-inset-bottom));
+        border: 1px solid var(--line); border-bottom: 0; background-color: rgba(6, 11, 15, .92);
+        background-image: linear-gradient(160deg, rgba(63, 224, 232, .08), transparent 45%),
+          linear-gradient(27deg, rgba(13, 19, 23, .8) 5px, transparent 5px), linear-gradient(207deg, rgba(13, 19, 23, .8) 5px, transparent 5px),
+          linear-gradient(27deg, rgba(16, 23, 28, .8) 5px, transparent 5px), linear-gradient(207deg, rgba(16, 23, 28, .8) 5px, transparent 5px),
+          linear-gradient(90deg, rgba(12, 18, 22, .8) 10px, transparent 10px);
+        background-size: 100% 100%, 20px 20px, 20px 20px, 20px 20px, 20px 20px, 20px 20px;
+        background-position: 0 0, 0 5px, 10px 0, 0 10px, 10px 5px, 0 0;
+        clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%);
+        animation: cc-up .26s cubic-bezier(.2, .8, .2, 1) both; }
+  .cc-box.cc-closing { animation: cc-down .2s ease-in both; pointer-events: none; }
+  .cc-head { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+  .cc-head h2 { margin: 0; font: italic 700 12px/1 var(--cond); letter-spacing: .26em; text-transform: uppercase; color: var(--teal); white-space: nowrap; }
+  .cc-channel { font: 500 11px/1.2 var(--body); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .cc-rule { flex: 1; min-width: 12px; height: 1px; background: linear-gradient(90deg, var(--line), transparent); }
+  .cc-ib { flex: none; display: grid; place-items: center; width: 28px; height: 24px; padding: 0; cursor: pointer; background: transparent;
+        border: 1px solid var(--line); transform: skewX(-12deg); font: 700 13px/1 var(--cond); color: var(--dim); }
+  .cc-ib > * { transform: skewX(12deg); }
+  .cc-ib:hover, .cc-ib:focus-visible, .cc-ib[aria-expanded="true"] { color: var(--teal); border-color: var(--teal); background: rgba(63, 224, 232, .1); outline: none; }
+  .cc-history { max-height: min(30vh, 250px); min-height: 60px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 3px;
+        padding: 2px 8px 2px 2px; scrollbar-width: thin; scrollbar-color: var(--teal-deep) transparent;
+        -webkit-mask-image: linear-gradient(transparent, #000 12px); mask-image: linear-gradient(transparent, #000 12px); }
+  .cc-history:focus-visible { outline: 1px solid var(--teal); outline-offset: 2px; }
+  .cc-history .cc-ln { --sk: -9deg; animation: none; text-shadow: none; display: flex; align-items: baseline; gap: 8px; padding-right: .7em; flex: none; }
+  .cc-history .cc-ln::before { background: rgba(255, 255, 255, .03); }
+  .cc-history .cc-ln.mine::before { background: rgba(63, 224, 232, .08); }
+  .cc-history .cc-body { display: block; flex: 1; min-width: 0; }
+  .cc-history time { flex: none; margin-left: auto; font: 500 10px/1 var(--body); color: var(--faint); }
+  .cc-empty { margin: 6px 4px; color: var(--dim); font-size: .9em; }
+  .cc-suggestions { max-height: min(30vh, 250px); overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 1px;
+        padding: 2px 6px 2px 2px; scrollbar-width: thin; scrollbar-color: var(--teal-deep) transparent; }
+  .cc-cmd { position: relative; flex: none; display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 10px; padding: 5px 10px 5px 12px;
+        border: 0; background: none; text-align: left; cursor: pointer; isolation: isolate; }
+  .cc-cmd::before { content: ""; position: absolute; inset: 0; z-index: -1; transform: skewX(var(--skew)); border-left: 2px solid transparent; }
+  .cc-cmd:hover::before { background: rgba(63, 224, 232, .07); }
+  .cc-cmd.focus::before, .cc-cmd:focus-visible::before { background: linear-gradient(90deg, rgba(63, 224, 232, .26), rgba(63, 224, 232, .05)); border-left-color: var(--teal); }
+  .cc-cmd:focus { outline: none; }
+  .cc-cmd b { font: italic 700 13px/1.2 var(--cond); letter-spacing: .05em; color: var(--teal); white-space: nowrap; }
+  .cc-cmd span { font-size: 12px; color: #c1d4db; min-width: 0; }
+  .cc-cmd small { display: block; font-size: 11px; color: var(--faint); }
+  .cc-adm { margin-left: 6px; font: normal 700 9px/1 var(--cond); letter-spacing: .14em; text-transform: uppercase; color: var(--amber); }
+  .cc-row { display: flex; align-items: stretch; gap: 6px; height: 34px; }
+  .cc-chtag { flex: none; display: grid; place-items: center; padding: 0 10px; font: italic 700 11px/1 var(--cond); letter-spacing: .16em; text-transform: uppercase;
+        color: var(--teal); background: rgba(63, 224, 232, .1); border: 1px solid var(--line); transform: skewX(var(--skew)); max-width: 40%; }
+  .cc-chtag > span { transform: skewX(14deg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .cc-chtag.pm { color: #ff8fd8; background: rgba(255, 143, 216, .1); border-color: rgba(255, 143, 216, .35); }
+  .cc-field { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; isolation: isolate; }
+  .cc-field::before { content: ""; position: absolute; inset: 0; z-index: -1; transform: skewX(var(--skew)); background: rgba(0, 0, 0, .45);
+        border: 1px solid var(--line); transition: border-color .15s ease, box-shadow .15s ease; }
+  .cc-field:focus-within::before { border-color: var(--teal); box-shadow: 0 0 12px rgba(63, 224, 232, .25); }
+  .cc-field input { flex: 1; min-width: 0; height: 100%; margin: 0; padding: 0 6px 0 12px; border: 0; border-radius: 0; outline: none; background: transparent;
+        color: var(--ink); font: 400 14px/1 var(--body); }
+  .cc-field input::placeholder { color: var(--faint); }
+  .cc-count { flex: none; visibility: hidden; padding-right: 12px; font: 600 10.5px/1 var(--cond); letter-spacing: .08em; color: var(--faint); }
+  .cc-count.show { visibility: visible; }
+  .cc-count.near { color: var(--amber); }
+  .cc-send { flex: none; padding: 0 16px; border: 0; cursor: pointer; background: var(--teal); color: #031317; transform: skewX(var(--skew));
+        font: italic 800 13px/1 var(--cond); letter-spacing: .14em; text-transform: uppercase; box-shadow: 0 0 14px rgba(63, 224, 232, .3); }
+  .cc-send > span { display: inline-block; transform: skewX(14deg); }
+  .cc-send:hover { background: #8ff3f8; }
+  .cc-send:disabled { background: rgba(63, 224, 232, .18); color: rgba(230, 243, 248, .4); box-shadow: none; cursor: default; }
+  .cc-send:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .cc-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 16px; font-size: 11px; color: var(--dim); }
+  .cc-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cc-status.bad { color: #ffb1a4; }
+  .cc-keys { flex: none; display: flex; gap: 10px; font: 700 10px/1 var(--cond); letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .cc-keys kbd { display: inline-grid; place-items: center; min-width: 18px; height: 16px; padding: 0 4px; margin-right: 4px; border: 1px solid rgba(255, 255, 255, .25);
+        border-radius: 3px; font: 700 10px/1 var(--cond); color: var(--dim); }
+  /* Touch: the feed at the top (touch.js's controls own the bottom corners), the window docked at the bottom above them. */
+  .cc.touch { --u: 13px; }
+  .cc.touch .cc-chip { min-width: 46px; opacity: .8; }
+  /* Touch: the feed at the top under the chip (layout() places it), clear of touch.js's controls at the bottom. */
+  .cc.touch .cc-feed { left: var(--feed-x, 16px); top: var(--feed-y, 110px); bottom: auto; max-width: var(--feed-max, calc(100vw - 32px)); }
+  .cc.touch .cc-chip kbd { display: none; }
+  .cc.touch .cc-box { left: max(8px, env(safe-area-inset-left)); bottom: max(8px, env(safe-area-inset-bottom)); width: min(560px, calc(100vw - 16px)); z-index: 21; padding: 10px;
+        border-bottom: 1px solid var(--line); clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px)); }
+  .cc.touch .cc-history, .cc.touch .cc-suggestions { max-height: 30dvh; }
+  .cc.touch .cc-row { height: 44px; }
+  .cc.touch .cc-field input { font-size: 16px; } /* 16 px: iOS does not zoom into the field */
+  .cc.touch .cc-send { padding: 0 18px; }
+  .cc.touch .cc-ib { width: 40px; height: 34px; font-size: 16px; }
+  .cc.touch .cc-keys { display: none; }
+  .cc.touch .cc-foot { min-height: 18px; font-size: 12px; }
+  /* A phone held sideways: the keyboard leaves room for the message line alone, at the top of what is
+     visible. Closing the keyboard brings the whole window back, with its close button. */
+  .cc.touch.keyboard .cc-box { padding: 6px; }
+  .cc.touch.keyboard .cc-head, .cc.touch.keyboard .cc-history, .cc.touch.keyboard .cc-foot { display: none; }
+  .cc.touch.keyboard .cc-suggestions { max-height: var(--kb-room, 64px); }
+  @media (max-height: 500px) {
+    .cc.touch .cc-history, .cc.touch .cc-suggestions { max-height: max(64px, 32dvh); }
+  }
+  @keyframes cc-in { from { opacity: 0; translate: -10px 0; } }
+  @keyframes cc-flash { to { opacity: 0; } }
+  @keyframes cc-up { from { translate: 0 calc(100% + 24px); } }
+  @keyframes cc-down { to { translate: 0 calc(100% + 24px); } }
   @media (prefers-reduced-motion: reduce) {
-    .cc-feed, .cc-line { transition: none; } .cc-line, .cc-card { animation: none; }
+    .cc-ln, .cc-box, .cc-box.cc-closing { animation: none; } .cc-ln.cc-new::after { display: none; } .cc-ln { transition: opacity .2s linear; }
   }
   `;
 
-  let root, feed, composer, messageInput, composeStatus;
-  let composing = false;
-  let recent, history;
+  let root, feed, chip, composer, messageInput, composeStatus, history;
+  let composing = false, unread = 0;
+  // Touch screens get the touch layout, as touch.js shows its controls.
+  const touch = !!navigator.maxTouchPoints;
   let enabled = true;
   try { enabled = localStorage.getItem("nfsc.chatEnabled") !== "false"; } catch {}
   function setEnabled(on) {
@@ -191,36 +258,51 @@
     active = true;
     activeAt = performance.now();
     root = document.createElement("div");
-    root.className = "cc";
+    root.className = touch ? "cc touch" : "cc";
     root.hidden = !enabled;
     root.innerHTML = `
     <style>${css}</style>
-    <div class="cc-recent" role="log" aria-live="polite" aria-label="Recent messages"></div>
+    <button class="cc-chip" type="button" aria-label="Open online chat" title="Chat"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" stroke-linejoin="round"/></svg><kbd>Y</kbd><b class="cc-unread" hidden>0</b></button>
     <div class="cc-feed" role="log" aria-live="polite" aria-label="Chat"></div>
-    <button class="cc-open" type="button" aria-label="Open online chat">Chat <kbd>Y</kbd></button>
-    <form class="cc-card cc-compose" role="dialog" aria-modal="true" aria-label="Online chat" hidden>
-      <div class="cc-header"><div><h2>Online chat</h2><p class="cc-channel">Everyone in this room</p></div><button class="cc-close" type="button" aria-label="Close chat">×</button></div>
-      <div class="cc-conversation"><div class="cc-history" role="log" aria-label="Session messages" tabindex="0"><p class="cc-empty">Say hello to the room. Use Commands to invite friends or send a private message.</p></div>
-      <div class="cc-suggestions" aria-label="Chat commands" hidden></div></div>
-      <label for="cc-message">Message <span class="cc-count">0 / 120</span></label>
-      <div class="cc-input-row"><input id="cc-message" maxlength="120" autocomplete="off" placeholder="Message the room, or type / for commands"><button class="cc-send" type="submit">Send</button></div>
-      <div class="cc-foot" role="status"></div>
-      <div class="cc-compose-actions"><button class="cc-commands" type="button" aria-expanded="false">Commands</button><span>Enter to send · Esc to return to game</span></div>
+    <form class="cc-box" role="dialog" aria-modal="true" aria-label="Online chat" autocomplete="off" hidden>
+      <div class="cc-head"><h2>Chat</h2><span class="cc-channel">Everyone in this room</span><span class="cc-rule"></span><button class="cc-ib cc-commands" type="button" aria-expanded="false" aria-label="Commands" title="Commands (/)"><span>/</span></button><button class="cc-ib cc-close" type="button" aria-label="Close chat" title="Close (Esc)"><span>✕</span></button></div>
+      <div class="cc-history" role="log" aria-label="Session messages" tabindex="0"><p class="cc-empty">Say hello to the room. Type / to invite friends or send a private message.</p></div>
+      <div class="cc-suggestions" role="listbox" aria-label="Chat commands" hidden></div>
+      <div class="cc-row"><span class="cc-chtag"><span>Room</span></span><label class="cc-field"><input id="cc-message" maxlength="120" autocomplete="off" enterkeyhint="send" placeholder="Message, or / for commands" aria-label="Message"><span class="cc-count" aria-hidden="true">0/120</span></label><button class="cc-send" type="submit" disabled><span>Send</span></button></div>
+      <div class="cc-foot"><span class="cc-status" role="status"></span><span class="cc-keys"><span><kbd>↵</kbd>Send</span><span><kbd>Esc</kbd>Back</span></span></div>
     </form>`;
     document.body.append(root);
-    recent = root.querySelector(".cc-recent");
+    addEventListener("resize", layout);
     history = root.querySelector(".cc-history");
     feed = root.querySelector(".cc-feed");
-    composer = root.querySelector(".cc-compose");
+    chip = root.querySelector(".cc-chip");
+    composer = root.querySelector(".cc-box");
     messageInput = composer.querySelector("input");
     composeStatus = composer.querySelector("[role=status]");
     composer.querySelector(".cc-close").addEventListener("click", closeComposer);
-    root.querySelector(".cc-open").addEventListener("click", openComposer);
-    composer.querySelector(".cc-commands").addEventListener("click", () => {showCommands = !showCommands; renderCommands(); messageInput.focus();});
-    messageInput.addEventListener("input", updateComposer);
+    chip.addEventListener("click", openComposer);
+    composer.querySelector(".cc-commands").addEventListener("click", () => {showCommands = !showCommands; cmdFocus = 0; renderCommands(); messageInput.focus();});
+    messageInput.addEventListener("input", () => { cmdFocus = 0; arrowed = false; updateComposer(); });
+    // With the command list up: arrows move its highlight, Tab (or Enter on a
+    // part-typed command) fills the highlighted one in. Enter on a whole command
+    // name (/players) runs it, unless the arrows picked another one.
     messageInput.addEventListener("keydown", e => {
-      const first = composer.querySelector(".cc-suggestions:not([hidden]) button");
-      if (first && (e.key === "Tab" || e.key === "ArrowDown") && !e.shiftKey) {e.preventDefault(); if (e.key === "Tab") first.click(); else first.focus();}
+      if (composer.querySelector(".cc-suggestions").hidden) return;
+      const rows = commandRows().rows;
+      if (!rows.length) return;
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        cmdFocus = (cmdFocus + (e.key === "ArrowDown" ? 1 : rows.length - 1)) % rows.length;
+        arrowed = true;
+        renderCommands();
+        return;
+      }
+      const row = rows[Math.min(cmdFocus, rows.length - 1)], value = messageInput.value;
+      const whole = !arrowed && rows.some(([name]) => value === `/${name}`);
+      if ((e.key === "Tab" && !e.shiftKey) || (e.key === "Enter" && (value === "" || /^\/[a-z]*$/i.test(value)) && !whole)) {
+        e.preventDefault();
+        pickCommand(row[0], row[2]);
+      }
     });
     composer.addEventListener("keydown", e => {
       if (e.key !== "Tab" || e.defaultPrevented) return;
@@ -231,8 +313,14 @@
     composer.addEventListener("submit", (e) => { e.preventDefault(); sendTyped(); });
     for (const type of ["keydown", "keypress"]) composer.addEventListener(type, (e) => {
       e.stopPropagation();
-      if (type === "keydown" && e.code === "Escape") { e.preventDefault(); closeComposer(); }
+      if (type !== "keydown" || e.code !== "Escape") return;
+      e.preventDefault();
+      if (showCommands && !composer.querySelector(".cc-suggestions").hidden) { showCommands = false; renderCommands(); messageInput.focus(); }
+      else closeComposer();
     });
+    // On a phone the on-screen keyboard covers the bottom: keep the window above it.
+    window.visualViewport?.addEventListener("resize", placeComposer);
+    window.visualViewport?.addEventListener("scroll", placeComposer);
     navigator.keyboard?.getLayoutMap?.().then((map) => {
       for (const code of [...CHAT_KEYS, ...HORN_KEYS]) {
         const k = map.get(code);
@@ -326,79 +414,113 @@
   }
   const chatLimit = limiter(CHAT_LIMIT), hornLimit = limiter(HORN_LIMIT);
 
-  // ---- The feed ----
+  // ---- The feed and the history ----
   // A name in its crew's colour, the one net.js gives the crew on the name
-  // tags and the badge (window.recompCrewColor); cyan without a crew.
+  // tags and the badge (window.recompCrewColor); teal without a crew. The
+  // colour is the line's --c, which also colours its left edge.
   function who(name, crew) {
     const b = document.createElement("b");
-    b.className = "cc-name";
-    b.textContent = name || "Player";
-    const color = crew ? window.recompCrewColor?.(crew) : "";
-    if (color) {
-      b.style.color = color;
-      b.title = `Crew ${crew}`;
-    }
+    b.className = "cc-nm";
+    b.textContent = name;
+    if (crew) b.title = `Crew ${crew}`;
     return b;
+  }
+  function span(cls, text) {
+    const s = document.createElement("span");
+    s.className = cls;
+    s.textContent = text;
+    return s;
   }
   function kbd(text) {
     const k = document.createElement("kbd");
     k.textContent = text;
     return k;
   }
-  function line(parts, kind, ms = SHOW_MS) {
+  // One line, for the feed or (with its time) the history. item: {kind, tag,
+  // name, crew, text, keys: [[key, what]], at}. kind: "" (a message), mine,
+  // pm (private), sys (replies, crewmates coming and going), admin, err, hint.
+  function build(item, withTime) {
     const el = document.createElement("div");
-    el.className = kind ? `cc-line ${kind}` : "cc-line";
-    const inner = document.createElement("span");
-    inner.append(...parts);
-    el.append(inner);
+    el.className = item.kind ? `cc-ln ${item.kind}` : "cc-ln";
+    const color = item.crew && ["", "mine", "pm"].includes(item.kind || "") ? window.recompCrewColor?.(item.crew) : "";
+    if (color) el.style.setProperty("--c", color);
+    const body = span("cc-body", "");
+    if (item.tag) body.append(span("cc-tag", item.tag));
+    if (item.name) body.append(who(item.name, item.crew));
+    for (const [key, what] of item.keys || []) body.append(kbd(key), what, span("cc-gap", ""));
+    if (item.text) body.append(span("cc-tx", item.text));
+    el.append(body);
+    if (withTime) {
+      const time = document.createElement("time");
+      time.dateTime = item.at.toISOString();
+      time.textContent = item.at.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+      el.append(time);
+    }
+    return el;
+  }
+  // Over the game: the newest at the bottom, at most FEED_LINES, each fading
+  // out on its own. Returns a function that takes the line away early.
+  function toFeed(item, ms = SHOW_MS) {
+    const el = build(item, false);
+    el.classList.add("cc-new");
     feed.append(el);
-    while (feed.children.length > MAX_LINES) feed.firstElementChild.remove();
+    while (feed.children.length > FEED_LINES) feed.firstElementChild.remove();
+    let gone = false;
     const out = () => {
-      el.classList.add("out");
-      setTimeout(() => el.remove(), 700);
+      if (gone) return;
+      gone = true;
+      el.classList.add("cc-out");
+      setTimeout(() => el.remove(), 650);
     };
     setTimeout(out, ms);
     return out;
   }
-  function say(name, crew, text, kind) {
-    const t = document.createElement("span");
-    t.textContent = text;
-    const el = document.createElement("div");
-    el.className = `cc-line ${kind || ""}`;
-    const inner = document.createElement("span");
-    const meta = document.createElement("span"), time = document.createElement("time");
-    meta.className = "cc-message-meta"; t.className = "cc-message-text";
-    const now = new Date(); time.dateTime = now.toISOString(); time.textContent = now.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
-    meta.append(who(name, crew), time); inner.append(meta, t);
-    el.append(inner);
+  const COUNTED = new Set(["", "pm", "admin"]); // what the chip's unread number counts
+  function showUnread() {
+    if (!chip) return;
+    const badge = chip.querySelector(".cc-unread");
+    badge.hidden = !unread;
+    badge.textContent = unread > 99 ? "99+" : String(unread);
+    chip.classList.toggle("lit", unread > 0);
+    chip.setAttribute("aria-label", unread ? `Open online chat, ${unread} new` : "Open online chat");
+  }
+  // A line for the history (kept until reload) and, while the window is
+  // closed, for the feed. Received text goes in with textContent only.
+  function say(name, crew, text, kind = "", tag = "") {
+    const item = { kind, tag, name, crew, text, at: new Date() };
     const follow = history.scrollHeight - history.scrollTop - history.clientHeight < 40;
     history.querySelector(".cc-empty")?.remove();
-    history.append(el.cloneNode(true));
+    history.append(build(item, true));
     while (history.children.length > HISTORY_LIMIT) history.firstElementChild.remove();
-    if (composing && follow) history.scrollTop = history.scrollHeight;
-    recent.append(el);
-    while (recent.children.length > RECENT_LIMIT) recent.firstElementChild.remove();
-    setTimeout(() => el.classList.add("quiet"), SHOW_MS);
+    if (composing) { if (follow) history.scrollTop = history.scrollHeight; return; }
+    toFeed(item);
+    if (COUNTED.has(kind)) { unread++; showUnread(); }
   }
 
   // The keys, once the player is in a car and again whenever they move (the
-  // old hint goes, so no line names a key that no longer works).
+  // old hint goes, so no line names a key that no longer works). Hints are not
+  // kept in the history.
   let hinted = false, unhint = [];
   function hint() {
     hinted = true;
     for (const out of unhint.splice(0)) out();
-    const parts = [];
-    if (hornKey) parts.push(kbd(label(hornKey)), " Horn (hold)");
-    if (parts.length) unhint.push(line(parts, "note", 10000));
+    const keys = [];
+    if (chatKey && !touch) keys.push([label(chatKey), "Chat"]);
+    if (hornKey) keys.push([label(hornKey), "Horn (hold)"]);
+    if (keys.length) unhint.push(toFeed({ kind: "hint", keys }, HINT_MS));
     const all = (codes) => `${codes.slice(0, -1).map(label).join(", ")} and ${label(codes.at(-1))}`;
-    if (!chatKey) unhint.push(line([`Chat off: ${all(CHAT_KEYS)} are all bound in Controls`], "note", 10000));
-    if (!hornKey) unhint.push(line([`Horn off: ${all(HORN_KEYS)} are all bound in Controls`], "note", 10000));
+    if (!chatKey) unhint.push(toFeed({ kind: "sys", text: `Chat off: ${all(CHAT_KEYS)} are all bound in Controls` }, HINT_MS));
+    if (!hornKey) unhint.push(toFeed({ kind: "sys", text: `Horn off: ${all(HORN_KEYS)} are all bound in Controls` }, HINT_MS));
   }
 
   // Who is here, from the online client's list: a horn stops when its player
-  // leaves. No "joined"/"left" lines: a room can hold a hundred players or more,
-  // and the feed would be nothing else (the user, 2026-10-24).
+  // leaves. Only crewmates get a "joined"/"left" line: a room can hold a
+  // hundred players or more, and the feed would be nothing else (the user,
+  // 2026-10-24; crewmates only, 2026-11-04). The first list after connecting
+  // is who was already there, so it says nothing; several at once make one line.
   let known = null;
+  const crewKeyOf = (c) => window.recompCrewKey ? window.recompCrewKey(c) : String(c || "").toLowerCase().replace(/\s+/g, "");
+  const lastSaid = new Map(); // "name|what" -> when, so a flaky connection does not repeat itself
   function people(s) {
     if (!s || !active) return;
     if (!s.open) {
@@ -408,25 +530,39 @@
     }
     const here = new Map((s.people || []).map((p) => [p.id, p]));
     for (const id of [...horns.keys()]) if (!here.has(id)) stopRemote(id);
+    const crew = crewKeyOf(myCrew());
+    if (known && crew && enabled) {
+      const mate = (p) => p && p.name && crewKeyOf(p.crew) === crew;
+      comings([...here.values()].filter((p) => !known.has(p.id) && mate(p)), "joined the room");
+      comings([...known.values()].filter((p) => !here.has(p.id) && mate(p)), "left the room");
+    }
     known = here;
+  }
+  function comings(list, what) {
+    const now = performance.now();
+    list = list.filter((p) => !(now - (lastSaid.get(`${p.name}|${what}`) ?? -Infinity) < 60000));
+    for (const p of list) lastSaid.set(`${p.name}|${what}`, now);
+    if (list.length > 2) say("", "", `${list.length} crewmates ${what}`, "sys", "Crew");
+    else for (const p of list) say(p.name, p.crew, what, "sys", "Crew");
   }
 
   function heard(m) {
     if (!m || typeof m !== "object") return;
     if (m.t === "chat") {
       if (!enabled) return;
-      const text = cleanText(m.text);
-      if (m.error) commandReply(m.error === "profanity" ? "Message blocked. Swearing is not allowed." : m.error === "muted" ? `Chat muted until ${new Date(m.until * 1000).toLocaleTimeString()}.` : "Message was not delivered. The player may have left, or you sent messages too quickly.");
-      else if (text) say(m.to ? (m.id === window.recompOnlineState?.me ? `To ${m.targetName}` : `Private · ${m.name}`) : m.name, m.crew, text);
-      if (composing && (m.error || m.ack || m.to && m.id === window.recompOnlineState?.me)) {
+      const text = cleanText(m.text), me = window.recompOnlineState?.me, fromMe = me != null && m.id === me;
+      if (m.error) say("", "", m.error === "profanity" ? "Message blocked. Swearing is not allowed." : m.error === "muted" ? `Chat muted until ${new Date(m.until * 1000).toLocaleTimeString()}.` : "Message was not delivered. The player may have left, or you sent messages too quickly.", "err", m.error === "profanity" ? "Blocked" : m.error === "muted" ? "Muted" : "Not sent");
+      else if (text && m.to) say(fromMe ? `To ${m.targetName}` : m.name || "Player", m.crew, text, "pm", "Private");
+      else if (text) say(m.name || "Player", m.crew, text, fromMe ? "mine" : "");
+      if (composing && (m.error || m.ack || m.to && fromMe)) {
         composeStatus.classList.toggle("bad", !!m.error);
         composeStatus.textContent = m.error === "profanity" ? "Message blocked. Swearing is not allowed." : m.error === "muted" ? "You are muted. See the message above for the end time." : m.error ? "Message was not delivered." : "Message delivered.";
       }
     } else if (m.t === "moderation" && m.k === "disconnect") {
-      commandReply(`${m.text} Reload to reconnect.`);
+      say("", "", `${m.text} Reload to reconnect.`, "err", "Disconnected");
       if (composing) {composeStatus.textContent = "Disconnected. Press Esc to return to the game."; composeStatus.classList.add("bad");updateComposer();}
     } else if (m.t === "moderation" && m.k === "announcement") {
-      say("Admin announcement", "", m.text, "note");
+      say("Announcement", "", String(m.text ?? ""), "admin", "Admin");
     } else if (m.t === "horn") {
       remoteHorn(m);
     }
@@ -436,22 +572,77 @@
     if (!active || !enabled || !linkOpen() || menuOpen()) return;
     hornUp();
     composing = true;
+    clearTimeout(closing);
+    composer.classList.remove("cc-closing");
     composer.hidden = false;
     root.classList.add("composing");
     globalThis.recompMenuOpen = true; // suppress controller driving while typing
+    unread = 0;
+    showUnread();
+    feed.replaceChildren(); // all of it is in the history
     composeStatus.classList.remove("bad");
     composeStatus.textContent = "Messages stay here until you reload.";
     updateComposer();
+    placeComposer();
     history.scrollTop = history.scrollHeight;
     messageInput.focus();
   }
   function closeComposer() {
     if (!composing) return;
     composing = false;
-    composer.hidden = true;
+    showCommands = false;
+    // Slides down, then hides (at once with reduced motion: no animation runs).
+    composer.classList.add("cc-closing");
+    clearTimeout(closing);
+    closing = setTimeout(() => { composer.classList.remove("cc-closing"); if (!composing) composer.hidden = true; },
+      matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 200);
     root.classList.remove("composing");
     globalThis.recompMenuOpen = menuOpen();
     if (!menuOpen()) document.getElementById("canvas")?.focus();
+    if (touch) scrollTo(0, 0); // iOS can leave the page pushed up where the keyboard moved it
+  }
+  let closing = 0;
+  // The chip joins net.js's online badge (top-left, right of the ☰); on touch
+  // screens the feed hangs under the chip (elsewhere it sits above the minimap,
+  // in CSS). The chip right of the badge, the feed under the chip, both clear of the
+  // game's own heat/crew icon at the top left (x 55-250, y 45-95 at 1280x720,
+  // measured 2026-11-04; the HUD scales with the screen's height, so: right
+  // edge 35% of the height, bottom 13.5%). Where the row has no room (a phone
+  // held upright, a narrow window), the chip goes under the ☰ and the feed
+  // under both, at the left edge. Run every tick; only a change moves anything.
+  let placed = "";
+  function layout() {
+    if (!root) return;
+    const badge = document.querySelector('button[aria-label="Online players (F8)"]');
+    const r = badge && badge.getClientRects().length ? badge.getBoundingClientRect() : null;
+    const W = innerWidth, H = innerHeight;
+    const key = `${W}x${H}:${r ? [r.left, r.top, r.right, r.bottom].map(Math.round) : "-"}`;
+    if (key === placed) return;
+    placed = key;
+    const top = r ? Math.round(r.top) : 10, h = r ? Math.round(r.height) : 32, right = r ? Math.round(r.right) : 54;
+    const iconRight = Math.round(H * 0.35) + 8, iconBottom = Math.round(H * 0.135) + 6;
+    let chipX = right + 8, chipY = top, feedX = Math.max(chipX, iconRight), feedY = top + h + 6;
+    const beside = chipX + 84 <= W - 16;
+    if (!beside) { chipX = 14; chipY = top + h + 6; }
+    if (!beside || W - feedX - 16 < 240) { feedX = 16; feedY = Math.max((beside ? top : chipY) + h + 6, iconBottom); }
+    const set = (name, px) => root.style.setProperty(name, `${px}px`);
+    set("--chip-x", chipX); set("--chip-y", chipY); set("--chip-h", h);
+    set("--feed-x", feedX); set("--feed-y", feedY); set("--feed-max", W - feedX - 16);
+  }
+  // Touch: the docked window sits above the on-screen keyboard (what of the
+  // layout viewport the visual viewport no longer shows at the bottom). With too
+  // little height left for all of it, only the message line shows, measured from
+  // the top of the visible area, so what is typed stays in view.
+  const KEYBOARD_MIN = 60, ROOM_FOR_ALL = 260;
+  function placeComposer() {
+    if (!composer || !touch) return;
+    const vv = window.visualViewport;
+    const covered = vv ? Math.round(innerHeight - vv.height - vv.offsetTop) : 0;
+    const tight = !!vv && innerHeight - vv.height > KEYBOARD_MIN && vv.height < ROOM_FOR_ALL;
+    root.classList.toggle("keyboard", tight);
+    root.style.setProperty("--kb-room", `${vv ? Math.max(40, Math.round(vv.height) - 76) : 64}px`);
+    composer.style.top = tight ? `${Math.round(vv.offsetTop) + 6}px` : "";
+    composer.style.bottom = tight ? "auto" : covered > 0 ? `calc(${covered}px + 8px)` : "";
   }
   let commandBusy = false, showCommands = false;
   const commands = [
@@ -463,33 +654,57 @@
     ["unmute", "Restore a player's chat", "\"Player Name\"", true], ["muted", "Active mutes", "[page]", true],
     ["kick", "Disconnect a player", "\"Player Name\" [reason]", true], ["announce", "Message all rooms", "message", true], ["reports", "Review player reports", "[page]", true],
   ];
+  let cmdFocus = 0, arrowed = false;
+  // The commands the list shows: all of them (the / button, /help) or those
+  // starting with what is typed after a lone "/".
+  function commandRows() {
+    const prefix = /^\/([a-z]*)$/i.exec(messageInput.value)?.[1]?.toLowerCase();
+    return { prefix, rows: commands.filter(([name,,,adminOnly]) => (!adminOnly || window.recompOnlineState?.admin) && (prefix === undefined || name.startsWith(prefix))) };
+  }
   function renderCommands() {
     if (!composer) return;
-    const list = composer.querySelector(".cc-suggestions"), prefix = /^\/([a-z]*)$/i.exec(messageInput.value)?.[1]?.toLowerCase();
-    const rows = commands.filter(([name,,,adminOnly]) => (!adminOnly || window.recompOnlineState?.admin) && (prefix === undefined || name.startsWith(prefix)));
-    const visible = showCommands || prefix !== undefined;
-    list.replaceChildren(); list.hidden = !visible || !rows.length;
-    history.hidden = !list.hidden;
-    composer.querySelector(".cc-commands").setAttribute("aria-expanded", String(!list.hidden));
-    for (const [name, description, syntax] of rows) {
-      const button = document.createElement("button"), title = document.createElement("strong"), hint = document.createElement("small");
-      button.type = "button"; title.textContent = `/${name}`; hint.textContent = description;
+    const list = composer.querySelector(".cc-suggestions"), { prefix, rows } = commandRows();
+    const visible = (showCommands || prefix !== undefined) && rows.length > 0, was = !list.hidden;
+    list.replaceChildren(); list.hidden = !visible;
+    history.hidden = visible; // the list takes the history's place
+    if (was && !visible) history.scrollTop = history.scrollHeight;
+    composer.querySelector(".cc-commands").setAttribute("aria-expanded", String(visible));
+    if (!visible) return;
+    cmdFocus = Math.min(cmdFocus, rows.length - 1);
+    rows.forEach(([name, description, syntax, adminOnly], i) => {
+      const button = document.createElement("button"), title = document.createElement("b"), hint = document.createElement("span");
+      button.type = "button"; button.className = i === cmdFocus ? "cc-cmd focus" : "cc-cmd";
+      button.setAttribute("role", "option"); button.setAttribute("aria-selected", String(i === cmdFocus));
+      title.textContent = `/${name}`; hint.textContent = description;
+      if (adminOnly) hint.append(span("cc-adm", "Admin"));
+      if (syntax) { const small = document.createElement("small"); small.textContent = `/${name} ${syntax}`; hint.append(small); }
       button.title = `/${name}${syntax ? " " + syntax : ""}`; button.append(title, hint);
-      button.addEventListener("click", () => {
-        messageInput.value = `/${name} `; showCommands = false; updateComposer(); messageInput.focus();
-        composeStatus.textContent = `/${name}${syntax ? " " + syntax : ""}`;
-      }); list.append(button);
-    }
+      button.addEventListener("click", () => pickCommand(name, syntax));
+      list.append(button);
+    });
+    const at = list.children[cmdFocus];
+    if (at && (at.offsetTop < list.scrollTop || at.offsetTop + at.offsetHeight > list.scrollTop + list.clientHeight)) list.scrollTop = at.offsetTop - list.clientHeight / 2;
+  }
+  function pickCommand(name, syntax) {
+    messageInput.value = `/${name} `; showCommands = false; cmdFocus = 0; arrowed = false; updateComposer(); messageInput.focus();
+    composeStatus.classList.remove("bad");
+    composeStatus.textContent = `/${name}${syntax ? " " + syntax : ""}`;
   }
   function updateComposer() {
     if (!composer) return;
-    composer.querySelector(".cc-count").textContent = `${messageInput.value.length} / 120`;
+    const n = messageInput.value.length, count = composer.querySelector(".cc-count");
+    count.textContent = `${n}/120`;
+    count.classList.toggle("show", n >= 90); // only near the limit, so the field keeps its width
+    count.classList.toggle("near", n >= 110);
     composer.querySelector(".cc-send").disabled = commandBusy || !messageInput.value.trim() || !linkOpen();
-    composer.querySelector(".cc-channel").textContent = /^\/w\s/i.test(messageInput.value) ? "Private message · only you and the recipient" : "Everyone in this room";
+    const pm = /^\/w\s+(?:"([^"\n]+)"|(\S+))/i.exec(messageInput.value), tag = composer.querySelector(".cc-chtag");
+    tag.classList.toggle("pm", !!pm);
+    tag.firstElementChild.textContent = pm ? `To ${pm[1] || pm[2]}` : "Room";
+    composer.querySelector(".cc-channel").textContent = /^\/w\s/i.test(messageInput.value) ? "Private · only you and the recipient" : "Everyone in this room";
     renderCommands();
   }
 
-  const commandReply = text => say("System", "", text, "note");
+  const commandReply = text => say("", "", text, "sys");
   async function runCommand(text) {
     const match = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(text);
     if (!match) throw new Error("Type /help for commands.");
@@ -751,9 +966,10 @@
     const inCar = driving(), menu = menuOpen();
     if (enabled && inCar && !hinted) hint();
     if (root) {
-      const button = root.querySelector(".cc-open");
-      button.hidden = menu || !linkOpen();
-      const key = button.querySelector("kbd"); key.hidden = !chatKey || !drivingShortcuts(); if (chatKey) key.textContent = label(chatKey);
+      layout();
+      chip.hidden = menu || !linkOpen();
+      const key = chip.querySelector("kbd"); key.hidden = touch || !chatKey || !drivingShortcuts(); if (chatKey) key.textContent = label(chatKey);
+      chip.title = chatKey && !key.hidden ? `Chat (${label(chatKey)})` : "Chat";
     }
     if (composing && menu) closeComposer();
     if (mine && (!inCar || menu)) hornUp();

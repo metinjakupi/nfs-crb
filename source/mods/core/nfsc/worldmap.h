@@ -171,7 +171,7 @@ static const WmFriend *wm_person(uint32_t id) {
 /* Slot i's player and newest pose, if they are driving. A slot the page is
  * writing just now keeps the pose read last time. */
 static uint32_t wm_slot(MpShared *mp, int i, MpPose *out) {
-    MpSlot *s = &mp->slots[i];
+    MpSlot *s = mp_slot(mp, i);
     uint32_t seq = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     if (!(seq & 1)) {
         uint32_t id = s->id, mode = s->mode, count = s->count;

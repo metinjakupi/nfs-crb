@@ -121,6 +121,7 @@
 #define PU_SEEN_MS 700.0 /* a friend's "seen" holds this long */
 #define PU_ENDED_MS                                                            \
   8000.0 /* after a friend's chase ends: no new assist on it for this long */
+#define PU_PURSUIT_LIST 0x00a83e90u /* the game's pursuit list: capacity +8, count +0xc */
 #define PU_ASSIST_RANGE                                                        \
   250.0f /* metres: a police player reports on a friend's car this near */
 #define PU_BESIDE                                                              \
@@ -322,7 +323,7 @@ static int pu_boxed(uint32_t car, const char **why) {
     return 0;
   }
   uint32_t node = get_u32(MP_CARS);
-  for (int n = 0; node && node != MP_CARS && n < 64;
+  for (int n = 0; node && node != MP_CARS && n < 256;
        ++n, node = get_u32(node)) {
     const uint32_t other = node - 0xd0;
     float at[3];
@@ -877,8 +878,9 @@ static void pu_police_siren(uint32_t player, double now) {
   }
 }
 
-/* Our cop manager's maximum: PU_TOGETHER_COPS while together, the game's own
- * otherwise. */
+/* Our cop manager's maximum: 0 while a nearer friend's game runs the police here
+ * and nobody is chased (cops.h, SHARED PATROLS), PU_TOGETHER_COPS while
+ * together in a chase, the game's own otherwise. */
 static void pu_budget(int together) {
   const uint32_t mgr = pu_mgr();
   if (mgr != g_pu_max_mgr) { /* another world: its manager starts with the
@@ -889,13 +891,16 @@ static void pu_budget(int together) {
   if (!mgr)
     return;
   const uint32_t max = get_u32(mgr + 0x94);
-  if (together && !g_pu_max_saved && max > PU_TOGETHER_COPS && max <= 16) {
+  const int quiet = cop_patrol_quiet();
+  const uint32_t want = quiet ? 0u : PU_TOGETHER_COPS;
+  together = together || quiet;
+  if (together && !g_pu_max_saved && max > want && max <= 16) {
     g_pu_max_saved = max;
-    pu_log(
-        "core.nfsc: pursuit: chased together: our police run at most 4 cops");
+    pu_log(quiet ? "core.nfsc: pursuit: a friend's police patrol here: ours run no cops"
+                 : "core.nfsc: pursuit: chased together: our police run at most 4 cops");
   }
-  if (together && g_pu_max_saved && max != PU_TOGETHER_COPS)
-    mp_put(mgr + 0x94, PU_TOGETHER_COPS);
+  if (together && g_pu_max_saved && max != want)
+    mp_put(mgr + 0x94, want);
   if (!together && g_pu_max_saved) {
     mp_put(mgr + 0x94, g_pu_max_saved);
     g_pu_max_saved = 0;
@@ -978,8 +983,11 @@ static void pu_assists(PuShared *sh, uint32_t player, double now) {
      * shown with its own cops (cops.h's copies), and ours on top read as police
      * appearing out of nowhere (user, 2026-10-26). Patrols here may still pick
      * a friend's car up on their own. */
+    /* The game's pursuit list (AIPursuit, 0x00a83e90) holds 8 (begin, ?, capacity +8, count +0xc): a new
+     * assist only while it has room (logs/stability-20261105: 8 assists plus ours reached its end). */
     if (!a && !ended && pu_cops_on() && now - f->tried_at > 3000.0 &&
-        g_pu_mine && !g_pu_busted && d < PU_BESIDE) {
+        g_pu_mine && !g_pu_busted && d < PU_BESIDE &&
+        get_u32(PU_PURSUIT_LIST + 0xc) < get_u32(PU_PURSUIT_LIST + 8)) {
       f->tried_at = now;
       const uint32_t mgr = pu_mgr(), car = f->simable;
       a = mp_call(PU_PURSUIT_FOR, mgr, &car, 1);
@@ -1168,6 +1176,7 @@ static void pu_service(const PopModApi *api, pop_cpu_v1 *cpu,
   if (player && mp_online_game())
     player = 0;
   if (!player || !__atomic_load_n(&sh->me, __ATOMIC_ACQUIRE)) {
+    pu_budget(0); /* offline or not driving: the game's own number of cops */
     if (!player && g_pu_police_idle)
       g_pu_police_idle();
     g_pu_mine = 0;

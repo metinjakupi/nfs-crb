@@ -25,7 +25,7 @@ static void ai_arrest_notice(const PopModApi *api, pop_cpu_v1 *cpu,
         return;
     const uint32_t owner = get_u32(cpu->ecx + 0x10);
     uint32_t node = get_u32(MP_CARS);
-    for (int n = 0; node && node != MP_CARS && n < 64; ++n, node = get_u32(node)) {
+    for (int n = 0; node && node != MP_CARS && n < 256; ++n, node = get_u32(node)) {
         const uint32_t car = node - 0xd0;
         if (get_u32(car + 0x148) != 3 || get_u32(car + 0x7c) ||
             get_u32(car + 0x5c) != owner)

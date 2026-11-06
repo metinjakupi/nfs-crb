@@ -12,6 +12,10 @@
 //!   name-keyed Messenger and Player Stats records without moving or rewriting them;
 //! - problem reports (reports.rs): POST /reports, the game page's log as text, with
 //!   CARBON_REPORTS_DIR set (CARBON_REPORTS_MAX_MB for all of them, default 200);
+//! - GET /leaderboard (leaderboard.rs): the public leaderboards as JSON, for nfscrb.xyz; only
+//!   results the race host saw confirmed by the other players' games, for claimed names, unless
+//!   CARBON_LEADERBOARD_GAME=1 adds what players' games report themselves; and the admin's
+//!   /leaderboard/admin (review queue, boards bans, audit log);
 //! - GET /lan (lan.rs): the switch of the virtual network that the game's own Online mode
 //!   talks through (plans/lan-protocol.md), with the trace host at 10.77.0.1 (trace.rs).
 //!   (So a free-roam room cannot be called "lan".)
@@ -27,7 +31,11 @@
 //! and one thread keeps the memory small. File work runs on a few helper threads, so a disk
 //! never holds up the players.
 //!
-//! Also: CARBON_ROOM_MAX (players a room holds, default 256), CARBON_INTEREST_K (cars each
+//! Also: CARBON_LEADERBOARD_SECS (how often /leaderboard is rebuilt, default 60),
+//! CARBON_LEADERBOARD_GAME (1: also the boards of what the games report themselves),
+//! CARBON_LEADERBOARD_RESET (seconds since 1970: the public wins and win streaks count from
+//! then; changing it starts them again),
+//! CARBON_ROOM_MAX (players a room holds, default 256), CARBON_INTEREST_K (cars each
 //! player gets, default 24).
 
 mod ea;
@@ -35,6 +43,7 @@ mod host;
 mod http;
 mod identity;
 mod crews;
+mod leaderboard;
 mod lan;
 mod messenger;
 mod moderation;
@@ -54,6 +63,11 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 
+// See Cargo.toml: musl's allocator was a fifth of the relay's time.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 pub struct App {
     /// CARBON_RELAY_KEY, "" for none
     pub key: String,
@@ -62,6 +76,8 @@ pub struct App {
     pub saves: Option<saves::Saves>,
     pub reports: Option<reports::Reports>,
     pub lan: lan::Switch,
+    /// GET /leaderboard's cached answer and limits (leaderboard.rs)
+    pub boards: leaderboard::Public,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -122,6 +138,7 @@ fn main() {
         saves,
         reports,
         lan: lan::Switch::new(trace),
+        boards: leaderboard::Public::from_env(),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

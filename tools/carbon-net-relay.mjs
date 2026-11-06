@@ -200,24 +200,29 @@
 //   the page sends none and gets none. Pages that did not ask never get any.
 //   COPS, both ways, a binary frame of 10 + 38 * n bytes, little-endian:
 //     0  u8   3
-//     1  u8   n, cops in this frame: 0 to COPS_MAX (8); 0 = the chase is over
+//     1  u8   n, cops in this frame: 0 to COPS_MAX (16 since Step B, 2026-11-05: shared traffic; 8 before,
+//              and welcome {copsMax} says it, so a page sends no more than its relay passes); 0 = the chase is over
 //     2  u32  id: relay -> page, the chased player's relay id; page -> relay, 0 (not read)
 //     6  u32  ts, the sender's clock in ms (the clock of its poses)
 //     10 n x 38 bytes, one per cop:
-//        +0  u8   the cop's number, 1-255, different for each cop in the frame (it keeps it
-//                 while it stays in the chase)
-//        +1  u8   flags: bit 0 the light bar is on, bit 1 the cop is chasing, bits 4-7 the
-//                 game's siren state + 1 (0 = not known); passed on as they came
+//        +0  u8   the cop's number, 1-255, different for each cop in the frame (the game keeps it
+//                 for the car's whole life, sent or not: logs/traffic-stable-20261105)
+//        +1  u8   flags: bit 0 the light bar is on, bit 1 the cop is chasing, bit 2 the cop is
+//                 wrecked, bit 3 a traffic car (not a cop), bits 4-7 the game's siren state + 1
+//                 (0 = not known; a traffic car's bit 4: a truck's trailer); passed on as they came
 //        +2  u32  the cop car's model key
 //        +6  the cop car's 13 pose numbers as in a POSE frame from its offset 14 (4 x i16
 //            quaternion, 3 x i32 position mm, 3 x i16 speed cm/s, 3 x i16 spin 1/500 rad/s)
-//   A page sends one while its player is chased, up to about 15 a second, the nearest COPS_MAX
+//   A page sends one while its player is chased, up to about 18 a second, the nearest COPS_MAX
 //   cops, and one with n = 0 when the chase ends. The relay passes it on, with the sender's id
 //   written in, to the players that picked the sender (Interest) and asked for cops: each frame
 //   while the two cars are within MID_RANGE (700 m) or the receiver follows the sender, an
 //   n = 0 frame to all of them. A reader that falls behind gets only the newest unsent frame of
 //   each sender. A frame of another size, with a number 0 or used twice, or from a page that did
-//   not ask, is dropped. Limit: burst 10, then 20 a second. The relay keeps the newest frame's
+//   not ask, is dropped. So is one with a car farther than COPS_NEAR (500 m) from the sender's car
+//   (its newest pose, of any kind; a page with no pose yet may send only n = 0): a player sends only
+//   its own game's cars around itself (cops.h: within 400 m), never cars put by another player's.
+//   Limit: burst 10, then 20 a second. The relay keeps the newest frame's
 //   cops (number, model, place) to check hits against for COP_FRESH (1 s).
 //   {t:"cophit", to, c, seq, k, ts, s:[at(3), dv(3), dw(3)]}: this player's car hit cop c of
 //   player `to` (as shown here): where the cop car was (physics space, metres) and the change
@@ -373,6 +378,7 @@
 // No dependencies: a minimal WebSocket server (RFC 6455, unfragmented frames).
 // Regression checks (Node 22+): node --test tools/tests/carbon-net-relay.test.mjs
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -385,6 +391,10 @@ function envInt(name, fallback, min, max) {
   return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 const MAX_ROOM = envInt("CARBON_ROOM_MAX", 256, 1, 10000);
+// Connections one internet address may hold across all rooms (0: no limit), so one machine
+// cannot fill rooms or the server. High on purpose: a phone network can put many real players
+// behind one address.
+const CLIENT_MAX = envInt("CARBON_CLIENT_MAX", 32, 0, 100000);
 // Interest (see the header).
 const INTEREST_K = envInt("CARBON_INTEREST_K", 24, 1, 1000);
 const INTEREST_MS = 500, WHERE_MS = 1000, FAR_MS = 250, MID_MS = 100;
@@ -399,6 +409,7 @@ const HELLO_TIMEOUT = 10000, BLOCKED_TIMEOUT = 15000;
 const PING_INTERVAL = 15000, PONG_TIMEOUT = 10000;
 const KEY = process.env.CARBON_RELAY_KEY || "";
 const rooms = new Map(); // room name -> Set of peers
+const clients = new Map(); // limitKey -> connections it holds
 let nextId = 1;
 // Per player: a burst of `burst` messages, then `rate` a second.
 const LIMITS = { chat: { burst: 5, rate: 0.5 }, horn: { burst: 12, rate: 6 }, crew: { burst: 3, rate: 0.2 },
@@ -415,7 +426,7 @@ const BIN_POSE = 1, BIN_WHERE = 2, POSE_BYTES = 46, ACK_BYTES = 8, WHERE_BYTES =
 // Driving (see the header): flags bit 3 = this many DRIVE bytes follow a pose's acks.
 const DRIVE_BIT = 8, DRIVE_BYTES = 8;
 // Police chases (see the header).
-const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COPS_MAX = 8, COP_FRESH = 1000, COP_REACH = 25;
+const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COPS_MAX = 16, COP_FRESH = 1000, COP_REACH = 25, COPS_NEAR = 500;
 // s[i] travels as a whole number of 1/SCALE[i], at most LIMIT[i] either way.
 const SCALE = [32767, 32767, 32767, 32767, 1000, 1000, 1000, 100, 100, 100, 500, 500, 500];
 const LIMIT = SCALE.map((_, i) => (i >= 4 && i < 7 ? 0x7fffffff : 0x7fff));
@@ -494,6 +505,26 @@ function others(peer, message) {
   for (const p of rooms.get(peer.room) ?? []) if (p !== peer && p.named) send(p, message);
 }
 
+// What a connection counts under for CARBON_CLIENT_MAX: a public IPv4 address, or an IPv6
+// address's /64 (one home holds a whole /64). Null for an internal address or anything else:
+// that may be a proxy standing in for every player, so such connections are never limited.
+function limitKey(address) {
+  let text = address.replace(/^::ffff:/i, "");
+  if (net.isIPv4(text)) {
+    const [a, b] = text.split(".").map(Number);
+    const internal = a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b < 128) || text === "255.255.255.255";
+    return internal ? null : text;
+  }
+  if (!net.isIPv6(text)) return null;
+  const [left, right = ""] = text.split("::");
+  const head = left ? left.split(":") : [], tail = right ? right.split(":") : [];
+  const all = text.includes("::") ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail] : head;
+  const s = all.map((h) => parseInt(h, 16));
+  if (s.every((n, i) => n === (i === 7 ? 1 : 0)) || s.every((n) => n === 0) || (s[0] & 0xfe00) === 0xfc00 || (s[0] & 0xffc0) === 0xfe80) return null;
+  return `${s.slice(0, 4).map((n) => n.toString(16)).join(":")}::/64`;
+}
+
 function leave(peer) {
   // The close frame and TCP close can both arrive; remove a peer only once.
   // Ignore further bytes on the half-closed socket after its room is gone.
@@ -503,6 +534,10 @@ function leave(peer) {
   peer.pendingBytes = 0;
   const room = rooms.get(peer.room);
   if (!room || !room.delete(peer)) return;
+  if (peer.client) {
+    const held = clients.get(peer.client) - 1;
+    if (held > 0) clients.set(peer.client, held); else clients.delete(peer.client);
+  }
   if (!room.size) rooms.delete(peer.room);
   for (const r of peer.audience.keys()) r.interest.delete(peer);
   for (const s of peer.interest.keys()) s.audience.delete(peer);
@@ -814,9 +849,16 @@ function copsReach(s, r) {
   return r.follow.has(s.id) || !s.at || !r.at || length3(s.at[0] - r.at[0], s.at[1] - r.at[1], s.at[2] - r.at[2]) <= MID_RANGE;
 }
 
+// Whether every car of a cops frame is near the sender's own car (see the header): its newest
+// pose of any kind (a page in a background tab sends m = 0 poses, at its car's real place).
+function copsNear(peer, list) {
+  const at = peer.pose ? peer.pose.s.slice(4, 7) : peer.at;
+  return !list.length || (at && list.every((x) => distance(at, x.p) <= COPS_NEAR));
+}
+
 function copsFrame(peer, bytes) {
   const list = peer.cops ? readCops(bytes) : null;
-  if (!list || !allow(peer, "cops")) return;
+  if (!list || !copsNear(peer, list) || !allow(peer, "cops")) return;
   peer.chase = { at: Date.now(), list };
   const out = Buffer.from(bytes);
   out.writeUInt32LE(peer.id, 2);
@@ -886,7 +928,16 @@ function streetMessage(peer, m) {
   send(target, { t: "street", id: peer.id, k: m.k, r: m.r, a: m.a, f: m.f });
 }
 
-function reservedAdmin(name) { return name.normalize("NFKC").toLowerCase().replace(/[4@]/g,"a").replace(/[1!]/g,"i").replace(/[^a-z0-9]/g, "").includes("admin"); }
+// The Latin letter a Cyrillic or Greek letter cannot be told from, case by case (moderation.rs).
+const LATIN_TWIN = new Map(Object.entries({A:"АΑ",B:"ВΒ",C:"СϹ",E:"ЕΕ",H:"НΗ",I:"ІΙӀ",J:"Ј",K:"КΚ",M:"МΜ",N:"Ν",O:"ОΟ",P:"РΡ",S:"Ѕ",T:"ТΤ",Y:"ΥҮ",X:"ХΧ",Z:"Ζ",
+  a:"аα",c:"сϲ",d:"ԁ",e:"е",h:"һ",i:"іιӏ",j:"ј",n:"ոη",o:"оο",p:"рρ",s:"ѕ",v:"ν",x:"хχ",y:"уγ"}).flatMap(([latin, twins]) => [...twins].map((t) => [t, latin])));
+function reservedAdmin(name) {
+  const low = name.toLowerCase();
+  if (low.includes("админ") || low.includes("адмін") || low.includes("αδμιν")) return true;
+  return [...name.normalize("NFKC")].map((c) => LATIN_TWIN.get(c) ?? c).join("").toLowerCase()
+    .replace(/[4@àáâãäåāăą]/g,"a").replace(/[ďđ]/g,"d").replace(/[1!|ìíîïīįı]/g,"i").replace(/[ñńņňп]/g,"n").replace(/м/g,"m")
+    .replace(/[^a-z0-9]/g, "").includes("admin");
+}
 const profanityWords = ["fuck", "fucks", "fucked", "fucker", "fuckers", "fucking", "motherfucker", "motherfuckers", "motherfucking", "shit", "shits", "shitty", "bullshit", "bitch", "bitches", "asshole", "assholes", "bastard", "bastards", "cunt", "cunts", "dick", "dicks", "cock", "cocks", "pussy", "pussies", "nigger", "niggers", "nigga", "niggas", "fag", "fags", "faggot", "faggots"];
 function profane(text) {
   const raw = Array.from(text.replace(/[\u200b-\u200d\ufeff]/g, "")).map(c => c >= "！" && c <= "～" ? String.fromCharCode(c.charCodeAt(0) - 0xfee0).toLowerCase() : c.toLowerCase());
@@ -917,7 +968,7 @@ function handle(peer, text) {
     // Driving: controls inside compact poses, so only for a page that also got them.
     peer.drive = !!peer.bin && m.drive === 1;
     send(peer, { t: "welcome", id: peer.id, whispers: 1, ...(m.rivals === 1 ? {rivals: 1} : {}), ...(m.physics === 0 || m.physics === 1 ? { physics: 1 } : {}),
-      ...(peer.bin ? { bin: peer.bin } : {}), ...(peer.cops ? { cops: 1 } : {}), ...(peer.drive ? { drive: 1 } : {}),
+      ...(peer.bin ? { bin: peer.bin } : {}), ...(peer.cops ? { cops: 1, copsMax: COPS_MAX } : {}), ...(peer.drive ? { drive: 1 } : {}),
       peers: [...rooms.get(peer.room)].filter((p) => p !== peer && p.named).map(identity) });
     if (peer.closed) return;
     peer.named = true;
@@ -1260,6 +1311,9 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
   if (!key || (rooms.get(room)?.size ?? 0) >= MAX_ROOM) { socket.destroy(); return; }
+  const client = limitKey(savesClient(req));
+  if (client && CLIENT_MAX > 0 && (clients.get(client) ?? 0) >= CLIENT_MAX) { socket.destroy(); return; }
+  if (client) clients.set(client, (clients.get(client) ?? 0) + 1);
   const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
                `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -1267,7 +1321,7 @@ server.on("upgrade", (req, socket, head) => {
   const now = performance.now();
   // interest: the players whose cars this one gets -> since when; audience: the players
   // that get this one's car -> {sent, owed: ms a held-back pose waits for} (see forward); at, vel: from its newest driving pose.
-  const peer = { id: nextId++, socket, room, name: "Player", crew: "", crewKey: "", named: false, closed: false, buckets: {},
+  const peer = { id: nextId++, socket, room, client, name: "Player", crew: "", crewKey: "", named: false, closed: false, buckets: {},
     pending: new Map(), pendingBytes: 0, blockedAt: null, joinedAt: now, lastPing: now, ping: null,
     physics: false, bin: 0, pose: null, impactSeq: 0, receipts: new Map(), look: null, lights: 0, cops: false, drive: false, chase: null, copHitSeq: 0,
     at: null, vel: null, interest: new Map(), audience: new Map(), follow: new Set(), hornTo: new Set() };

@@ -208,7 +208,7 @@ test("reports stay private; Admin announcements and kick are server-owned",async
 
 test("Admin nickname and crew variants are reserved, including protected claims",async t=>{
  const f=await fixture(t,16,{admin:true}),a=await f.connect(0,{name:"Admin"}),b=await f.connect(1);
- for(const name of ["Admin","aDmIn","A_d-m.i.n","FakeAdmin","Ａｄｍｉｎ","4dm1n"]){
+ for(const name of ["Admin","aDmIn","A_d-m.i.n","FakeAdmin","Ａｄｍｉｎ","4dm1n","Аdmin","аԁміո","ádmín","АДМИН"]){
   const ws=new WebSocket(f.url());await once(ws,"open");const closed=once(ws,"close");
   ws.send(JSON.stringify({t:"hi",name,claim:token(1),crew:"Admin",admin:true}));
   const [event]=await closed;assert.equal(event.code,1008);

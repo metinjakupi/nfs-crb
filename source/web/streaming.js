@@ -9,7 +9,7 @@
   let requestId = 0;
   window.recompStream.waitForModel = key => new Promise(resolve => {
     const request = session + ':' + (++requestId);
-    const timer = setTimeout(() => { requests.delete(request); resolve(false); }, 1500);
+    const timer = setTimeout(() => { requests.delete(request); resolve(false); }, 6000); // net.js HOLD_FAR_MS
     requests.set(request, { resolve, timer });
     readiness.postMessage({ type: 'prefetch-models', keys: [key], request });
   });

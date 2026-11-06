@@ -1,3 +1,4 @@
+#include <chrono>
 // d3d9.cpp - Direct3D 9, for a game that renders through shaders.
 //
 // The kit's other Direct3D module (d3d.cpp) models version 2: a fixed-function
@@ -3265,6 +3266,133 @@ static void rgba_to_surface(const std::vector<uint8_t> &in, ComObj *d, uint8_t *
         for (uint32_t x = 0; x < w; ++x)
             rgba_to_px(fmt, &in[(size_t(y) * w + x) * 4], dst + size_t(y) * d->pitch + size_t(x) * bpp);
 }
+// A8R8G8B8 / X8R8G8B8 straight into DXT1 of the same size (the car skin compositor's output,
+// 007d7580 -> 00732ca0, a 1024x1024 skin each time a friend's car with a vinyl is painted;
+// logs/paint-speed-20261105). The same encoder as surface_to_rgba + rgba_to_surface above, byte for
+// byte: endpoints at the block's colour bounding box, the nearest palette entry by squared RGB
+// distance (the first of equals), BC1's three-colour mode for blocks with alpha below 128. Only the
+// work around it is gone: the 4 MB RGBA copy of the source, the per-pixel format switch, and the
+// palette search of blocks whose two endpoints are one colour (all selectors 0 there).
+static bool argb_to_dxt1(ComObj *s, ComObj *d, uint8_t *dst) {
+    const uint32_t w = d->width, h = d->height;
+    if ((s->rmask != 21 && s->rmask != 22) || d->rmask != 0x31545844u || s->width != w || s->height != h || !w || !h)
+        return false;
+    if (size_t(h - 1) * s->pitch + size_t(w) * 4 > s->blob.size())
+        return false;
+    static uint8_t ex5[32], ex6[64];
+    static bool tables = false;
+    if (!tables) { // unpack_565's expansions
+        for (int i = 0; i < 32; ++i) ex5[i] = uint8_t(i * 255 / 31);
+        for (int i = 0; i < 64; ++i) ex6[i] = uint8_t(i * 255 / 63);
+        tables = true;
+    }
+    const bool opaque_src = s->rmask == 22;
+    const uint8_t *src = s->blob.data();
+    const uint32_t bw = std::max((w + 3) / 4, 1u), bh = std::max((h + 3) / 4, 1u);
+    for (uint32_t by = 0; by < bh; ++by)
+        for (uint32_t bx = 0; bx < bw; ++bx) {
+            uint8_t px[16][4], lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+            for (uint32_t k = 0; k < 16; ++k) {
+                const uint32_t x = std::min(bx * 4 + k % 4, w - 1), y = std::min(by * 4 + k / 4, h - 1);
+                const uint8_t *p = src + size_t(y) * s->pitch + size_t(x) * 4;
+                px[k][0] = p[2];
+                px[k][1] = p[1];
+                px[k][2] = p[0];
+                px[k][3] = opaque_src ? 255 : p[3];
+                for (int c = 0; c < 4; ++c) {
+                    lo[c] = std::min(lo[c], px[k][c]);
+                    hi[c] = std::max(hi[c], px[k][c]);
+                }
+            }
+            const bool transparent = lo[3] < 128;
+            if (transparent) {
+                for (int c = 0; c < 3; ++c) { lo[c] = 255; hi[c] = 0; }
+                bool opaque = false;
+                for (uint32_t k = 0; k < 16; ++k) {
+                    if (px[k][3] < 128) continue;
+                    opaque = true;
+                    for (int c = 0; c < 3; ++c) {
+                        lo[c] = std::min(lo[c], px[k][c]);
+                        hi[c] = std::max(hi[c], px[k][c]);
+                    }
+                }
+                if (!opaque) for (int c = 0; c < 3; ++c) lo[c] = hi[c] = 0;
+            }
+            uint8_t *cb = dst + size_t(by) * d->pitch + size_t(bx) * 8;
+            uint16_t c0 = uint16_t((hi[0] >> 3) << 11 | (hi[1] >> 2) << 5 | hi[2] >> 3),
+                     c1 = uint16_t((lo[0] >> 3) << 11 | (lo[1] >> 2) << 5 | lo[2] >> 3);
+            if (transparent ? c0 > c1 : c0 < c1)
+                std::swap(c0, c1);
+            uint32_t bits = 0;
+            if (c0 == c1) { // every selector 0, but 3 for a transparent pixel in three-colour mode
+                if (transparent)
+                    for (uint32_t k = 0; k < 16; ++k)
+                        if (px[k][3] < 128) bits |= 3u << (2 * k);
+            } else {
+                int pal[4][3];
+                pal[0][0] = ex5[c0 >> 11 & 31]; pal[0][1] = ex6[c0 >> 5 & 63]; pal[0][2] = ex5[c0 & 31];
+                pal[1][0] = ex5[c1 >> 11 & 31]; pal[1][1] = ex6[c1 >> 5 & 63]; pal[1][2] = ex5[c1 & 31];
+                for (int c = 0; c < 3; ++c) {
+                    pal[2][c] = uint8_t(transparent ? (pal[0][c] + pal[1][c]) / 2 : (2 * pal[0][c] + pal[1][c]) / 3);
+                    pal[3][c] = uint8_t(transparent ? 0 : (pal[0][c] + 2 * pal[1][c]) / 3);
+                }
+                const int n = transparent ? 3 : 4;
+                for (uint32_t k = 0; k < 16; ++k) {
+                    if (transparent && px[k][3] < 128) {
+                        bits |= 3u << (2 * k);
+                        continue;
+                    }
+                    int best = 0, bestd = 1 << 30;
+                    for (int i = 0; i < n; ++i) {
+                        const int d0 = px[k][0] - pal[i][0], d1 = px[k][1] - pal[i][1], d2 = px[k][2] - pal[i][2];
+                        const int dd = d0 * d0 + d1 * d1 + d2 * d2;
+                        if (dd < bestd) { bestd = dd; best = i; }
+                    }
+                    bits |= uint32_t(best) << (2 * k);
+                }
+            }
+            cb[0] = uint8_t(c0); cb[1] = uint8_t(c0 >> 8); cb[2] = uint8_t(c1); cb[3] = uint8_t(c1 >> 8);
+            memcpy(cb + 4, &bits, 4);
+        }
+    return true;
+}
+#ifndef PAINT_DXT_VERIFY
+#define PAINT_DXT_VERIFY 0
+#endif
+#if PAINT_DXT_VERIFY
+static void surface_to_rgba(ComObj *s, std::vector<uint8_t> &out);
+static void rgba_to_surface(const std::vector<uint8_t> &in, ComObj *d, uint8_t *dst);
+#endif
+// TEST: RECOMP_PAINT_DXT_FAST=0 takes the general path always (for before/after runs in one build).
+static bool paint_dxt_off() {
+    static const bool off = recomp_env("PAINT_DXT_FAST") && recomp_env("PAINT_DXT_FAST")[0] == '0';
+    return off;
+}
+// PAINT_DXT_VERIFY (test build): also encodes with the general path into a scratch copy, compares,
+// and logs both times for the first 64 calls and every mismatch.
+static bool argb_to_dxt1_timed(ComObj *s, ComObj *d, uint8_t *dst) {
+#if PAINT_DXT_VERIFY
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!argb_to_dxt1(s, d, dst))
+        return false;
+    const auto t1 = std::chrono::steady_clock::now();
+    const size_t n = size_t(d->pitch) * std::max((d->height + 3) / 4, 1u);
+    std::vector<uint8_t> ref(n), rgba;
+    surface_to_rgba(s, rgba);
+    rgba_to_surface(rgba, d, ref.data());
+    const auto t2 = std::chrono::steady_clock::now();
+    static uint32_t calls = 0, bad = 0;
+    const bool same = !memcmp(ref.data(), dst, n);
+    bad += !same;
+    if (++calls <= 64 || !same)
+        LOGW("d3d9: paint dxt1 verify %u: %ux%u %s, fast %.2f ms, general %.2f ms (%u differ so far)", calls, d->width, d->height,
+             same ? "same" : "DIFFERS", std::chrono::duration<double, std::milli>(t1 - t0).count(),
+             std::chrono::duration<double, std::milli>(t2 - t1).count(), bad);
+    return true;
+#else
+    return argb_to_dxt1(s, d, dst);
+#endif
+}
 // Returns 0 (D3D_OK) or an HRESULT.
 uint32_t d3d9_load_surface(uint32_t dst_view, uint32_t src_view, uint32_t color_key) {
     ComObj *d = dst_view ? com_this(dst_view) : nullptr, *s = src_view ? com_this(src_view) : nullptr;
@@ -3285,6 +3413,7 @@ uint32_t d3d9_load_surface(uint32_t dst_view, uint32_t src_view, uint32_t color_
         for (uint32_t r = 0; r < rows; ++r)
             if (size_t(r) * s->pitch + row <= s->blob.size())
                 memcpy(dst + size_t(r) * d->pitch, s->blob.data() + size_t(r) * s->pitch, row);
+    } else if (!color_key && !paint_dxt_off() && argb_to_dxt1_timed(s, d, dst)) {
     } else {
         std::vector<uint8_t> rgba, scaled;
         surface_to_rgba(s, rgba);

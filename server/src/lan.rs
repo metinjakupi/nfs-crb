@@ -169,6 +169,11 @@ impl Switch {
         lock(&self.st).trace.describe()
     }
 
+    /// Player Stats and the Leaderboard, for the HTTP routes (leaderboard.rs).
+    pub fn with_stats<R>(&self, f: impl FnOnce(&mut crate::stats::Stats) -> R) -> R {
+        f(lock(&self.st).trace.stats())
+    }
+
     /// A vip for a new connection, with the welcome already queued (so it is the first thing
     /// the page hears), or None when the client has its share or the network is full.
     fn admit(&self, client: &str, out: Arc<Outbox>) -> Option<u32> {
@@ -191,6 +196,7 @@ impl Switch {
         let welcome = format!(r#"{{"t":"lan","vip":"{}","netmask":"{}"}}"#, vip_str(vip), vip_str(NETMASK));
         out.push(0, ws::frame(welcome.as_bytes(), 1).into());
         st.peers.insert(vip, Peer { name: String::new(), client: client.to_string(), out, links: 0 });
+        st.trace.set_player_client(vip, client);
         println!("lan: {} joined, {} on the network", vip_str(vip), st.peers.len());
         Some(vip)
     }

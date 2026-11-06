@@ -55,6 +55,12 @@
  * of the same number as the player's MpShared slot: a ring of DRV_RING, each with its pose's
  * time. Each side guards its part with a sequence number, odd while it writes, as mp.h does.
  *
+ * COPIES OF FRIENDS' COPS have no owner's controls to replay: a cop's driver is the AI in its
+ * owner's game, and a cops frame carries only its pose. So cops.h works out what such a driver
+ * must be doing from the car's own playback (g_drv_cop) and they go in here the same way, so a
+ * copy's front wheels steer, its brake lights work and its engine follows, with nothing more on
+ * the wire. Beyond 220 m they are let go, as friends' cars are.
+ *
  * TEST (RECOMP_MP_TEST, mp.h): the escort test car (2) is driven by this player's own controls of
  * the moment, through the 8-byte form; the replaying one (1) replays them with its poses.
  */
@@ -125,7 +131,7 @@ typedef struct DrvShared {
 } DrvShared;
 _Static_assert(sizeof(DrvSnap) == 12 && sizeof(DrvSlot) == 0x70 && offsetof(DrvShared, own) == 0x10 &&
                    offsetof(DrvShared, page) == 0x18 && offsetof(DrvShared, slots) == 0x20 &&
-                   sizeof(DrvShared) == 0x3a0,
+                   sizeof(DrvShared) == 0x20 + 0x70 * MP_SLOTS, /* 0x8e0 with 20 slots (0x3a0 with 8) */
                "DrvShared layout");
 
 typedef struct DrvCtl {
@@ -149,6 +155,7 @@ static uint32_t g_drv_tables[4][2]; /* {game's IInput table, our copy} */
 static uint8_t g_drv_take[MP_TAKE][8]; /* the test car's take: this player's controls */
 static uint8_t g_drv_own[8];
 static uint32_t g_drv_nos; /* our copy of a nitrous attribute layout (see the header), 0 = none yet */
+static int (*g_drv_cop)(MpCar *c, double play, DrvCtl *out); /* cops.h: a cop copy's controls, worked out */
 
 static DrvShared *drv_shared(void) {
     void *p = NULL;
@@ -384,10 +391,11 @@ static int drv_sample(const DrvShared *sh, int slot, uint32_t id, double t, uint
 /* mp.h's g_mp_drive_car: a remote car mp_follow moves now, shown at its owner's time play. */
 static void drive_car(MpCar *c, double play, int late) {
     DrvShared *sh = drv_shared();
-    if (late || !sh || !c->simable || (g_mp_cop_car && g_mp_cop_car(c->simable) == c))
-        return; /* once a frame; a friend's cop copy has no driver here */
+    if (late || !sh || !c->simable)
+        return; /* once a frame */
+    const int cop = g_mp_cop_car && g_mp_cop_car(c->simable) == c; /* its controls come from cops.h */
     int slot = -1;
-    for (int i = 0; i < MP_SLOTS && slot < 0; ++i)
+    for (int i = 0; !cop && i < MP_SLOTS && slot < 0; ++i)
         if (g_mp_seen_slot[i].id == c->id && g_mp_seen_slot[i].mode == 1)
             slot = i;
     const uint32_t car = c->simable - 0x24;
@@ -397,7 +405,7 @@ static void drive_car(MpCar *c, double play, int late) {
     d->frame = g_drv_frame;
     /* Relay copies retain their body, pose and contacts. Beyond audible close
      * racing, stop replaying driven effects/rev/gear commands; never touch the
-     * local player, native race racers, police copies or their sound objects. */
+     * local player, native race racers or their sound objects. */
     MpShared *mp = mp_shared();
     const int native_racer = g_mp_racer_car && g_mp_racer_car(c->simable) == c;
     if (mp && mp->state == 1 && c->kept && !native_racer) {
@@ -416,13 +424,14 @@ static void drive_car(MpCar *c, double play, int late) {
     uint8_t bytes[8];
     DrvCtl ctl;
     const double now = mp_now();
-    if (slot < 0 || !drv_sample(sh, slot, c->id, play, bytes)) {
+    if (cop ? !(g_drv_cop && g_drv_cop(c, play, &ctl)) : (slot < 0 || !drv_sample(sh, slot, c->id, play, bytes))) {
         drv_release(car, d);
         return;
     }
     if (!drv_setup(car, d, now))
         return;
-    drv_decode(bytes, &ctl);
+    if (!cop)
+        drv_decode(bytes, &ctl);
     drv_apply(car, d, &ctl, now);
 }
 

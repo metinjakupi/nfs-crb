@@ -112,16 +112,17 @@ enum {
 };
 static const float k_lt_tune[LT_T_COUNT] = {0.06f, 0.06f, 0.04f, 0.02f, 3.0f, 1.0f, 1.0f, 1.0f};
 
-typedef struct LtShared { /* 0x58 bytes */
+typedef struct LtShared { /* 0x88 bytes */
     uint32_t magic, version;   /* LT_MAGIC, 1 */
     uint32_t mine;             /* +0x08 the game: this player's lights (LT_*) */
     uint32_t seq;              /* +0x0c the game: + 1 each time `mine` changes */
-    uint32_t remote[MP_SLOTS]; /* +0x10 the page: the lights of each mp.h slot's player (LT_*) */
-    float tune[LT_T_COUNT];    /* +0x30 the lamp values in use (tests may change them) */
-    uint32_t params;           /* +0x50 guest address of the four parameter blocks (tests) */
-    uint32_t draws;            /* +0x54 flares this file has drawn (tests) */
+    uint32_t remote[MP_SLOTS]; /* +0x10 the page: the lights of each mp.h slot's player (LT_*); 20 slots
+                                * since 2026-11-05 (a page that knows 8 writes the first 8, as before) */
+    float tune[LT_T_COUNT];    /* +0x60 the lamp values in use (tests may change them; +0x30 with 8 slots) */
+    uint32_t params;           /* +0x80 guest address of the four parameter blocks (tests) */
+    uint32_t draws;            /* +0x84 flares this file has drawn (tests) */
 } LtShared;
-_Static_assert(offsetof(LtShared, remote) == 0x10 && sizeof(LtShared) == 0x58, "LtShared layout");
+_Static_assert(offsetof(LtShared, remote) == 0x10 && sizeof(LtShared) == 0x38 + 4 * MP_SLOTS, "LtShared layout");
 
 /* Parameter blocks, as the game's (0x2c bytes): size at intensity 0 and 1, red, green, blue,
  * alpha, facing power, size scale, size clamp low / high, texture index. Tuned on screenshots
@@ -139,7 +140,7 @@ static const LtParams k_lt_params[4] = {
 
 static uint32_t g_lt_mem;   /* guest: 4 x LtParams, a flare (0x30), a matrix (0x40) */
 static uint32_t g_lt_block; /* guest address of the LtShared */
-static uint32_t g_lt_hooks[6];
+static uint32_t g_lt_hooks[8];
 static atomic_uint g_lt_keys_down;    /* bit per key (LT_KEY_*), from the key callback */
 static atomic_uint g_lt_keys_pressed; /* presses the frame has not taken yet */
 #define LT_KEY_Q 1u
@@ -605,14 +606,85 @@ static void lt_after(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *i
     lt_put_back();
 }
 
-/* UpdateLightTextures for car ecx: the unlit headlight lamps and glass when it is dark. */
+/* TextureInfo for a texture hash, 0 when no loaded texture has it (hd_ui.h: GetTextureInfo, cdecl). */
+static uint32_t lt_texture_info(const PopModApi *api, uint32_t hash) {
+    uint32_t info = 0;
+    const uint32_t args[3] = {hash, 0u, 0u};
+    if (!hash || !api->guest_call || api->guest_call(api, 0x0055cfd0u, 0, args, 3, &info) != POP_OK)
+        return 0;
+    return info && get_u32(info + 12) == hash ? info : 0;
+}
+
+/* UpdateLightTextures for car ecx: the unlit headlight lamps and glass when it is dark (the RX-7's
+ * pop-up headlights close this way). Only for a car whose unlit lamp AND glass textures are both
+ * loaded: the BMW GTR's draw as black holes, with no texture at all (2026-11-05), so it keeps its
+ * normal lamps. Its glare, road light and the world's beam still go off. */
 static void lt_textures(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
-    (void)api;
     (void)inv;
     (void)user;
     const LtCarLights *c = g_lt_ncars ? lt_car(cpu->ecx) : NULL;
-    if (c && lt_dark(c->state))
+    if (!c || !lt_dark(c->state))
+        return;
+    const uint32_t lamp = get_u32(cpu->ecx + 0x3080), glass = get_u32(cpu->ecx + 0x308c);
+    const int ok = lt_texture_info(api, lamp) && lt_texture_info(api, glass);
+    static uint32_t logged_car, logged_ok = 2;
+    if (logged_car != cpu->ecx || logged_ok != (uint32_t)ok) { /* the page log shows what a car has */
+        logged_car = cpu->ecx;
+        logged_ok = (uint32_t)ok;
+        char line[160];
+        snprintf(line, sizeof line, "core.nfsc: headlights off, car %08x unlit lamp %08x glass %08x: %s",
+                 (unsigned)cpu->ecx, (unsigned)lamp, (unsigned)glass, ok ? "unlit textures" : "no unlit textures, lamps kept");
+        log_line(line);
+    }
+    if (ok)
         lt_switch_off(cpu->ecx, 0);
+}
+
+/* ---- the world's headlight light, off with the headlights ----------------------------------- */
+
+/* 00713ca0 hands the world shaders the headlight views' position, direction (+0x10) and up
+ * direction (+0x20) every frame: eView 9 (0x00b48b70) is this player's lamps. The world shaders
+ * light a pixel by how well it lines up with that direction, and the game's own "headlights off"
+ * switch does not reach it, so a wall ahead kept its beam. For a dark car the two directions are
+ * zeroed for the length of the upload and put back after, so the beam has nothing to line up with. */
+#define LT_VIEW_UPLOAD 0x00713ca0u
+#define LT_HEADLIGHT_VIEW 0x00b48b70u
+static uint32_t g_lt_view_saved[6];
+static int g_lt_view_zeroed;
+
+static void lt_view_restore(void) {
+    if (!g_lt_view_zeroed)
+        return;
+    for (uint32_t k = 0; k < 3; ++k) {
+        g_api->guest_write_u32(g_api, LT_HEADLIGHT_VIEW + 0x10 + 4u * k, g_lt_view_saved[k]);
+        g_api->guest_write_u32(g_api, LT_HEADLIGHT_VIEW + 0x20 + 4u * k, g_lt_view_saved[3 + k]);
+    }
+    g_lt_view_zeroed = 0;
+}
+
+static void lt_view_before(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)api;
+    (void)cpu;
+    (void)inv;
+    (void)user;
+    lt_view_restore();
+    if (!lt_dark(g_lt_state))
+        return;
+    for (uint32_t k = 0; k < 3; ++k) {
+        g_lt_view_saved[k] = get_u32(LT_HEADLIGHT_VIEW + 0x10 + 4u * k);
+        g_lt_view_saved[3 + k] = get_u32(LT_HEADLIGHT_VIEW + 0x20 + 4u * k);
+        g_api->guest_write_u32(g_api, LT_HEADLIGHT_VIEW + 0x10 + 4u * k, 0);
+        g_api->guest_write_u32(g_api, LT_HEADLIGHT_VIEW + 0x20 + 4u * k, 0);
+    }
+    g_lt_view_zeroed = 1;
+}
+
+static void lt_view_after(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)api;
+    (void)cpu;
+    (void)inv;
+    (void)user;
+    lt_view_restore();
 }
 
 /* ---- install --------------------------------------------------------------------------------- */
@@ -656,6 +728,9 @@ static void lights_install(void) {
     if (LT_HOOK(LT_LIGHT_TEXTURES, lt_textures, POP_HOOK_BEFORE, 3) != POP_OK ||
         LT_HOOK(LT_LIGHT_TEXTURES, lt_after, POP_HOOK_AFTER, 4) != POP_OK)
         log_line("core.nfsc: headlights off keep their lit glass (hook 007adc90 unavailable)");
+    if (LT_HOOK(LT_VIEW_UPLOAD, lt_view_before, POP_HOOK_BEFORE, 5) != POP_OK ||
+        LT_HOOK(LT_VIEW_UPLOAD, lt_view_after, POP_HOOK_AFTER, 6) != POP_OK)
+        log_line("core.nfsc: headlights off keep the world's headlight beam (hook 00713ca0 unavailable)");
 #undef LT_HOOK
     uint32_t id;
     g_api->on_key(g_api, lt_key, NULL, &id);

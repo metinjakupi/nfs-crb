@@ -361,8 +361,9 @@ struct Peer {
     car_data: Option<Vec<u8>>,
     /// it loaded the race and said Ready
     ready: bool,
-    /// its GameResults for the race just over
+    /// its GameResults for the race just over, and when it came (our clock, ms)
     results: Option<Vec<u8>>,
+    results_at: u64,
     /// in the room (not on a race's results): other players' room news can reach it
     in_room: bool,
     /// room news (ActiveGame_Message) held while it is on the results
@@ -398,6 +399,7 @@ impl Peer {
             car_data: None,
             ready: false,
             results: None,
+            results_at: 0,
             in_room: true,
             held: Vec::new(),
             clock: None,
@@ -412,7 +414,7 @@ impl Peer {
 
     /// The player as the stats store knows it in a race report.
     fn racer(&self) -> Option<Racer> {
-        self.who.as_ref().map(|w| Racer { slot: self.slot, name: w.name.clone(), car: crate::stats::vehicle_key(self.car_data.as_deref()) })
+        self.who.as_ref().map(|w| Racer { slot: self.slot, name: w.name.clone(), car: crate::stats::vehicle_key(self.car_data.as_deref()), vip: self.vip, ..Racer::default() })
     }
 
     fn label(&self) -> String {
@@ -540,6 +542,8 @@ pub struct Host {
     finished: Vec<(u32, u32)>,
     /// when the first GameResults came, until FinalGameResults went out
     results_since: Option<u64>,
+    /// when StartRaceSyncBegin went out for the race under way (our clock, ms)
+    race_started_at: Option<u64>,
     /// Pursuit Tag: the racer id of the player who is the racer (everyone else is a cop)
     fugitive: Option<i16>,
     pub notes: Vec<Note>,
@@ -580,6 +584,7 @@ impl Host {
             races: BTreeMap::new(),
             finished: Vec::new(),
             results_since: None,
+            race_started_at: None,
             fugitive: None,
             notes: Vec::new(),
             reports: Vec::new(),
@@ -971,6 +976,7 @@ impl Host {
             olmsg::GAME_RESULTS => {
                 self.note(format!("{}: sent its GameResults ({} bytes)", peer.label(), msg.len()));
                 peer.results = Some(msg.to_vec());
+                peer.results_at = now;
                 if self.race != Race::Lobby {
                     self.results_since.get_or_insert(now);
                 }
@@ -1188,8 +1194,13 @@ impl Host {
         self.note(format!("FinalGameResults to everyone ({who}'s GameResults, {} s after the first)", now.saturating_sub(since) / 1000));
         let joined = self.peers.values().chain(current.as_deref()).filter(|p| p.stage == Stage::Joined);
         let players = joined.clone().filter_map(Peer::racer).collect();
-        let results = joined.filter_map(|p| Some((p.slot, p.results.clone()?))).collect();
-        self.reports.push(RaceReport::Ended { gid: self.gid, settings: self.settings(), players, results });
+        let results = joined.clone().filter_map(|p| Some((p.slot, p.results.clone()?))).collect();
+        // seconds from the start to each game's GameResults: no race time can be longer
+        let clock = match self.race_started_at.take() {
+            Some(t0) => joined.filter(|p| p.results.is_some()).map(|p| (p.slot, p.results_at.saturating_sub(t0) as f64 / 1000.0)).collect(),
+            None => Vec::new(),
+        };
+        self.reports.push(RaceReport::Ended { gid: self.gid, settings: self.settings(), players, results, clock });
     }
 
     /// A player id from a race message as a name: a joined player's GameManager pid, or
@@ -1236,6 +1247,7 @@ impl Host {
             p.game_send(&m, true, now);
         }
         self.race = Race::Racing;
+        self.race_started_at = Some(now);
         self.note("race started (StartRaceSyncBegin)".into());
         let players = self.peers.values().filter(|p| p.stage == Stage::Joined).filter_map(Peer::racer).collect();
         self.reports.push(RaceReport::Started { gid: self.gid, players });

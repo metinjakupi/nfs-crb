@@ -9,7 +9,7 @@ function fixture(t, fetch) {
   const before=keys.map(k=>[k,Object.getOwnPropertyDescriptor(globalThis,k)]);
   t.after(()=>{for(const[k,d]of before)if(d)Object.defineProperty(globalThis,k,d);else delete globalThis[k];});
   for(const[k,v]of Object.entries({fetch,navigator:{locks:{request:async(_name,_options,fn)=>fn()},storage:{getDirectory:async()=>{throw Error('Invalid catalogs must never open storage');}}},carbonDiagnostics:{downloads:[]}}))Object.defineProperty(globalThis,k,{value:v,configurable:true,writable:true});
-  return (assetBase='https://assets.example/custom/')=>prepareCustomization(()=>{},{assetBase});
+  return (assetBase='https://assets.example/custom/')=>prepareCustomization(()=>{},{assetBase,retryBaseMs:1});
 }
 for(const [name,first]of [
   ['connection failure',()=>{throw new TypeError('Failed to fetch');}],
@@ -28,10 +28,10 @@ test('missing files fail immediately and retain the exact resource and status',a
   await assert.rejects(run(),/HTTP 404/);assert.equal(calls,1);
   assert.deepEqual(carbonDiagnostics.downloads.map(x=>[x.url,x.status,x.attempt]),[['https://assets.example/custom/manifest.json',404,1]]);
 });
-test('persistent network failure stops after three attempts and removes URL secrets from diagnostics',async t=>{
+test('persistent network failure stops after five attempts and removes URL secrets from diagnostics',async t=>{
   let calls=0;const run=fixture(t,async()=>{calls++;throw new TypeError('Failed to fetch');});
   await assert.rejects(run('https://assets.example/custom/?token=private&next='),/Completed downloads are kept/);
-  assert.equal(calls,3);assert.deepEqual(carbonDiagnostics.downloads.map(x=>x.attempt),[1,2,3]);
+  assert.equal(calls,5);assert.deepEqual(carbonDiagnostics.downloads.map(x=>x.attempt),[1,2,3,4,5]);
   assert.equal(JSON.stringify(carbonDiagnostics.downloads).includes('private'),false);
 });
 test('invalid JSON and memory-allocation failures are not retried',async t=>{

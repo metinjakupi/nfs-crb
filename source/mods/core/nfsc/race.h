@@ -113,7 +113,7 @@ typedef struct RacePeer { /* 0x40 bytes; written by the page */
     uint32_t id;    /* relay id; 0 = empty */
     uint32_t key;   /* the car model they race (Attrib key); 0 = a copy of ours */
     uint32_t grid;  /* grid slot, 0 = front */
-    uint32_t done;  /* 1 once their own finish time has arrived */
+    uint32_t done;  /* bit 0: their finish time has arrived (or they were given up on). Bit 1: they left */
     float time;     /* that time, race seconds */
     /* Their progress as their own game works it out (GRacerInfo +0x3c, +0x48,
      * +0x4c, +0x50), at their physics clock ms, and how fast % race and % lap
@@ -180,6 +180,7 @@ typedef struct RaceCar {
     uint32_t row;   /* its row in the racer table */
     uint32_t key;
     int following;  /* follows the network (after go) */
+    int left;       /* their player left: the car is off the road */
     MpCar car;      /* the car and its playback, as mp.h keeps them */
 } RaceCar;
 
@@ -194,6 +195,11 @@ static int g_race_cars_n;
 static uint32_t g_race_session;        /* the session whose race this game launched */
 static uint32_t g_race_launched;       /* the last session launched (never launched twice) */
 static uint32_t g_race_type;
+static int g_race_cars_shown; /* the other players' cars may be active: go has come */
+static uint32_t g_race_caught_key; /* the Start caught for the lobby: the menus left it unfinished */
+static uint32_t g_race_helper;     /* the ISimable of the hidden third racer, see race_add_helper */
+static int g_race_helper_row = -1; /* its row, until go takes it out of the table */
+static const RacePeer *race_peer(uint32_t id);
 static int race_is_drift(void);
 static uint32_t race_drift_score(void);
 static int race_drift_failed(void);
@@ -296,7 +302,7 @@ static int race_alive(uint32_t simable) {
 /* The car (PVehicle) whose ISimable has this handle, or 0. */
 static uint32_t race_car_of(uint32_t handle) {
     uint32_t node = get_u32(MP_CARS);
-    for (int n = 0; handle && node && node != MP_CARS && n < 64; ++n, node = get_u32(node))
+    for (int n = 0; handle && node && node != MP_CARS && n < 256; ++n, node = get_u32(node))
         if (get_u32(node - 0xd0 + 0x24 + 8) == handle)
             return node - 0xd0;
     return 0;
@@ -440,9 +446,55 @@ static RaceCar *race_add(uint32_t rs, uint32_t player, uint32_t id, uint32_t key
     c->car.id = id;
     c->car.key = key;
     c->car.kind = MP_REMOTE;
+    /* Canyon Drift is one car's event: a touch costs the speed that keeps a run alive, or the
+     * run itself over the edge, so the others' cars pass through this player's (the user's
+     * decision, 2026-11-04). mp.h only clears this flag on its own free-roam cars. */
+    c->car.spawn_overlap = g_race_type == 12u;
+    /* Built now because a racer must exist when InitRacers ends, but not shown: each game loads at
+     * its own pace, and a car parked on the grid for a player still loading looks like a bot
+     * (reported 2026-11-04). All of them appear at go; race_show_racers. */
+    if (id && !g_race_encounter) {
+        const uint32_t off = 0;
+        g_race_cars_shown = 0;
+        mp_call(MP_SET_PHYSICS, sim - 0x24u + 0xb8u, &off, 1);
+    }
     race_log("core.nfsc: race: player %u (%.15s) is racer %u, model %08x, grid slot %u at %.1f %.1f %.1f",
              id, name, c->row, key, slot, pos[0], pos[1], pos[2]);
     return c;
+}
+
+/* The game plays its full race start (the starter between the cars lined up, the burnouts, its
+ * sound) for three racers or more: with two it plays a plain solo-style one, which looked fake to
+ * players (seen 2026-11-05: 2 players no; 2 + an AI yes; 2 + a third car that is no AI yes). So a
+ * race of two gets a third racer that nobody sees: a parked copy of this player's car, physics off
+ * (not simulated, not drawn, no contacts), no name. The table lets go of it at go, before any
+ * racer launches, so it is in no place, list or result. Drift keeps its own start, and a Canyon
+ * Duel is one against one. */
+static void race_add_helper(uint32_t rs, uint32_t player) {
+    g_race_helper = 0;
+    g_race_helper_row = -1;
+    if (g_race_encounter || race_count(rs) != 2u || g_race_type == 11u || g_race_type == 12u || g_race_type == 13u)
+        return;
+    RaceCar *c = race_add(rs, player, 0, 0, 2u, "", 0);
+    if (!c)
+        return;
+    const uint32_t off = 0, row = race_row(rs, (uint32_t)c->row);
+    g_race_helper = c->car.simable;
+    g_race_helper_row = c->row;
+    mp_call(MP_SET_PHYSICS, g_race_helper - 0x24u + 0xb8u, &off, 1);
+    for (uint32_t i = 0; i < 32; ++i)
+        g_api->guest_write_u8(g_api, row + 8 + i, 0);
+    race_log("core.nfsc: race: a race of two: hidden third racer for the game's full start");
+}
+
+/* Go, before NotifyCountdownDone launches the racers: the last row goes, its car stays parked. */
+static void race_drop_helper(void) {
+    const uint32_t rs = race_status();
+    if (g_race_helper_row < 0 || !rs)
+        return;
+    if ((int)race_count(rs) == g_race_helper_row + 1)
+        mp_put(rs + 0x6a08u, (uint32_t)g_race_helper_row);
+    g_race_helper_row = -1;
 }
 
 /* Forgets the race's cars once the world they were in is gone. */
@@ -465,6 +517,8 @@ static void race_forget(const char *why) {
     g_race_result_activity = g_race_result_simable = 0;
     g_race_path_n = 0;
     g_race_no_ai = 0; /* kept until now: a restart runs InitRacers again */
+    g_race_helper = 0;
+    g_race_helper_row = -1;
 }
 
 /* InitRacers has set up the players, the crew and the AI: the other players join. */
@@ -487,6 +541,8 @@ static void race_init_racers(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoc
             const uint32_t row = mp_call(RACE_ADD_SIMABLE, rs, &c->car.simable, 1);
             if (row)
                 c->row = (row - rs - 0x18u) / RACE_ROW_SIZE;
+            if (row && g_race_helper && c->car.simable == g_race_helper)
+                g_race_helper_row = c->row; /* back in the table for this start */
         }
         race_log("core.nfsc: race: restarted with %d other players", g_race_cars_n);
         return;
@@ -518,6 +574,7 @@ static void race_init_racers(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoc
         if (peer->id && peer->id != p->me)
             race_add(rs, player, peer->id, peer->key, base + peer->grid, peer->name, sizeof peer->name);
     }
+    race_add_helper(rs, player);
     g_race_phase = RACE_SET_UP;
 }
 
@@ -555,6 +612,18 @@ static int race_holding(void) {
     return g_race_page.go != g_race_session;
 }
 
+/* Go: the other players' cars appear, except a player the host started without. */
+static void race_show_racers(void) {
+    const uint32_t on = 1;
+    g_race_cars_shown = 1;
+    for (int i = 0; i < g_race_cars_n; ++i) {
+        const RaceCar *c = &g_race_cars[i];
+        const RacePeer *peer = race_peer(c->id);
+        if (c->id && c->car.simable && !(peer && peer->done))
+            mp_call(MP_SET_PHYSICS, c->car.simable - 0x24u + 0xb8u, &on, 1);
+    }
+}
+
 /* AFTER 00625b60: "still loading" while we hold. */
 static void race_cars_loaded(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
     (void)api;
@@ -582,6 +651,7 @@ static void race_cars_loaded(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoc
         m->taken = 0;
         m->played_at = 0;
     }
+    race_show_racers();
 }
 
 /* Whether mp.h has built another player's car in this world (free roam). */
@@ -592,17 +662,55 @@ static int race_any_remote(void) {
     return 0;
 }
 
+static int cop_chase_copy(uint32_t simable); /* cops.h: a copy of a friend's cop (not traffic) */
+
+/* Whether simable is another player's own car: a friend's (mp.h) or a racer's (this file). */
+static int race_player_car(uint32_t simable) {
+    for (int i = 0; i < MP_SLOTS; ++i)
+        if (g_mp_remote[i].simable == simable)
+            return 1;
+    for (int i = 0; i < g_race_cars_n; ++i)
+        if (g_race_cars[i].car.simable == simable && g_race_cars[i].id)
+            return 1;
+    return 0;
+}
+
 /* Other players' racer dots on the minimap: list 7 too, after the AI's list 3.
  * The minimap (005e5287) asks for list 3 every frame, races or not, so this
- * also puts friends driving near in free roam on the game's own minimap. */
+ * also puts friends driving near in free roam on the game's own minimap.
+ * List 7 holds every car of driver class 7, and cops.h's copies of friends' traffic and cops are
+ * class 7 too: each was an orange arrow where nothing was found (user report 2026-11-05; a test
+ * game's list 7: its own car, the friend's and 13 copies). So the game draws a copy of the list
+ * with only players' cars and copies of friends' cops in it (traffic copies left out; the vector's
+ * begin +4 and count +0xc swapped for the call). */
+#define RACE_LIST7 (0x00a9f158u + 7u * 0x88u) /* the vehicle lists, 0x88 bytes each (005d8ded) */
+static uint32_t g_race_map_buf; /* 64 IVehicle pointers */
 static void race_minimap(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
     (void)inv;
     (void)user;
     if (get_u32(cpu->esp + 4) != 3u || (!g_race_cars_n && !race_any_remote()))
         return;
+    if (!g_race_map_buf && api->guest_alloc(api, 64 * 4, &g_race_map_buf) != POP_OK) {
+        g_race_map_buf = 0;
+        return;
+    }
+    const uint32_t begin = get_u32(RACE_LIST7 + 4), count = get_u32(RACE_LIST7 + 0xc);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < count && kept < 64; ++i) {
+        const uint32_t vehicle = get_u32(begin + 4u * i); /* IVehicle = PVehicle + 0xb8 */
+        if (vehicle && (get_u32(vehicle - 0xb8u + 0x148) != MP_REMOTE || race_player_car(vehicle - 0xb8u + 0x24u) ||
+                        cop_chase_copy(vehicle - 0xb8u + 0x24u))) /* friends' chases stay on the map */
+            mp_put(g_race_map_buf + 4u * kept++, vehicle);
+    }
+    if (!kept)
+        return;
+    mp_put(RACE_LIST7 + 4, g_race_map_buf);
+    mp_put(RACE_LIST7 + 0xc, kept);
     const uint32_t args[2] = {7u, get_u32(cpu->esp + 8)};
     uint32_t eax = 0;
     api->guest_call(api, RACE_MINIMAP_RACERS, cpu->ecx, args, 2, &eax);
+    mp_put(RACE_LIST7 + 4, begin);
+    mp_put(RACE_LIST7 + 0xc, count);
 }
 
 /* The Quick Race options block of a race key's type, in this player's profile. */
@@ -638,6 +746,7 @@ static void race_start(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation 
                 sh->caught_opts[i] = race_u8(block + i);
             sh->caught++;
             __atomic_fetch_add(&sh->game_seq, 1u, __ATOMIC_SEQ_CST);
+            g_race_caught_key = key;
             race_log("core.nfsc: race: Quick Race %08x (type %u, %u laps) caught for the lobby", key, type,
                      race_u8(block + 4));
             api->hook_return(api, cpu, 0, 0);
@@ -654,7 +763,10 @@ static int race_menu_ready(void) {
     if (get_u32(RACE_FLOW) != 3) return 0;
     const uint32_t feng = get_u32(0x00a97a78u);
     if (!feng) return 0;
-    const uint32_t names[] = {0x009d0298u, 0x009d0284u, 0x009cfdccu, 0x009cfc50u};
+    /* FeMainMenu, FeMainMenu_Sub, FeQuickRaceOptions, FeCarSelect, FeWorldMapQuickList and
+     * FeQuickRaceWingman: without the last two a player browsing the race list or choosing a
+     * wingman never started, and the others waited for the timeout. */
+    const uint32_t names[] = {0x009d0298u, 0x009d0284u, 0x009cfdccu, 0x009cfc50u, 0x009d01a8u, 0x009cfc38u};
     for (uint32_t i = 0; i < sizeof names / sizeof names[0]; ++i)
         if (mp_call(0x00572350u, feng, &names[i], 1) & 0xffu) return 1;
     return 0;
@@ -664,9 +776,14 @@ static int race_menu_ready(void) {
 static void race_launch(void) {
     const RacePage *p = &g_race_page;
     if (p->flags & 4u) return; /* world-map sessions never launch from the frontend */
-    if (!p->launch || p->launch != p->session || p->launch == g_race_launched || !race_menu_ready())
+    /* A host's caught Start: the menus have already gone, some without leaving a screen
+     * race_menu_ready knows (after the Automatic or Manual question), and go on waiting for the
+     * race that Start asked for. Its own launch is what that Start would have done. */
+    if (!p->launch || p->launch != p->session || p->launch == g_race_launched ||
+        !(race_menu_ready() || (get_u32(RACE_FLOW) == 3 && p->launch_key == g_race_caught_key)))
         return;
     g_race_launched = p->launch;
+    g_race_caught_key = 0;
     uint32_t type = 0;
     const uint32_t block = race_options(p->launch_key, &type);
     if (!block) {
@@ -770,7 +887,7 @@ static void race_result(uint32_t rs, uint32_t player) {
     for (uint32_t k = 0; k < g_race_page.count && k < RACE_PEERS; ++k) {
         const RacePeer *p = &g_race_page.peers[k];
         if (!p->id) continue;
-        if (!p->done || !(p->time > 0)) return;
+        if (!(p->done & 1u) || !(p->time > 0)) return;
         int finished = 0;
         for (int i = 0; i < g_race_cars_n; ++i)
             if (g_race_cars[i].id == p->id)
@@ -839,7 +956,6 @@ static MpCar *race_racer_car(uint32_t owner) {
 }
 
 static void race_finish_peer(uint32_t rs, RaceCar *c, float time);
-static const RacePeer *race_peer(uint32_t id);
 
 /* Test car: the first AI racer's path, 0.6 s behind it. */
 /* The first AI racer's path, recorded once a frame with its progress. Returns its row, or 0. */
@@ -972,6 +1088,21 @@ static void race_finish_peer(uint32_t rs, RaceCar *c, float time) {
              was ? "their time replaces ours" : "from their game");
 }
 
+/* A player who left: mp.h does not remove a racer's car (g_mp_racer), so it would stay parked on
+ * the road until the race ended (seen 2026-11-05). It goes the way it waited for go, and comes
+ * back if the player does. Their row stays, so results still count them. */
+static void race_car_left(RaceCar *c) {
+    const RacePeer *peer = race_peer(c->id);
+    const int left = g_race_cars_shown && peer && (peer->done & 2u);
+    if (left == c->left)
+        return;
+    const uint32_t on = !left;
+    c->left = left;
+    c->following = !left;
+    mp_call(MP_SET_PHYSICS, c->car.simable - 0x24u + 0xb8u, &on, 1);
+    race_log("core.nfsc: race: player %u %s", c->id, left ? "left: car off the road" : "is back: car on the road");
+}
+
 /* The page's entry for a player, or NULL. */
 static const RacePeer *race_peer(uint32_t id) {
     for (uint32_t k = 0; id && k < g_race_page.count && k < RACE_PEERS; ++k)
@@ -1007,8 +1138,18 @@ static void race_progress(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocati
         cp = (uint32_t)g_race_test_row[3];
     } else {
         const RacePeer *p = race_peer(c->id);
-        if (!p || !p->ms)
+        if (!p)
             return;
+        if (!p->ms || (p->done & 2u)) {
+            /* Nothing reported yet, or they left (off the road): last among those racing. Left to the
+             * game, a car parked off the road counted as ahead of the grid (a player left out at the
+             * start was 1st, 2026-11-05). */
+            put_float(r + 0x3c, 0);
+            put_float(r + 0x48, 0);
+            mp_put(r + 0x4c, 0);
+            mp_put(r + 0x50, 0);
+            return;
+        }
         double dt = c->car.played_at > 0 ? (c->car.play - (double)p->ms) / 1000.0 : 0.0;
         dt = dt < -1.0 ? -1.0 : dt > 1.0 ? 1.0 : dt;
         pct = p->pct + p->rate * (float)dt;
@@ -1056,7 +1197,9 @@ static void race_publish(RaceShared *sh, uint32_t rs, uint32_t player) {
     sh->drift_score = race_drift_score();
     sh->drift_failed = race_drift_failed();
     sh->session = g_race_session;
-    sh->car = player ? mp_model_key(player) : race_menu_ready() ? g_race_car_key : 0;
+    /* After a caught Start the menus show no screen race_menu_ready knows, and the car announced
+     * in the lobby was 0: the others then saw a copy of their own car for the host. */
+    sh->car = player ? mp_model_key(player) : race_menu_ready() || g_race_caught_key ? g_race_car_key : 0;
     sh->loaded = g_race_loaded_at > 0;
     sh->ms = mp_ms();
     const uint32_t n = race_count(rs);
@@ -1147,18 +1290,47 @@ static void race_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
                     race_test_follow(rs, c);
                 continue;
             }
+            race_car_left(c);
             const MpSlot *s = c->following ? race_slot(c->id, NULL) : NULL;
             if (s)
                 mp_take(&c->car, s, now);
             for (uint32_t k = 0; k < g_race_page.count && k < RACE_PEERS; ++k) {
                 const RacePeer *peer = &g_race_page.peers[k];
-                if (peer->id == c->id && peer->done && peer->time > 0)
+                if (peer->id == c->id && (peer->done & 1u) && peer->time > 0)
                     race_finish_peer(rs, c, peer->time);
             }
         }
         race_place_all(0);
         if (g_race_test && g_race_frame % 120 == 0)
             race_dump(rs);
+    }
+    /* Finished, and held at the results until the others finish: offline those show at once, but
+     * here the game's after-race AI went on driving this player's car (reported 2026-11-04: it
+     * "accelerates until the others come"). It brakes to a stop; a fall still falls. The AI's gas
+     * stayed on, so the stopped car revved on the line (reported 2026-11-05): its controls are set
+     * to no gas, full brake and handbrake, no nitrous, through the game's own setters (as
+     * mp_drive.h's drv_apply; ai_fixes.h parks AI cars the same way). */
+    if (rs && player && g_race_session && g_race_session == g_race_page.session &&
+        (g_race_result_activity || race_drift_waiting())) {
+        const uint32_t in = get_u32(player + DRV_INPUT);
+        if (in && drv_method(in, 3) == DRV_GET_GAS && drv_method(in, 2) == DRV_GET_BRAKE &&
+            drv_method(in, 7) == DRV_GET_HAND) {
+            const uint32_t zero = 0, one = 0x3f800000u;
+            mp_call(drv_method(in, 11), in, &zero, 1); /* SetControlGas */
+            mp_call(drv_method(in, 12), in, &one, 1);  /* SetControlBrake */
+            mp_call(drv_method(in, 14), in, &one, 1);  /* SetControlHandBrake */
+            mp_call(drv_method(in, 13), in, &zero, 1); /* SetControlNOS */
+        }
+        const uint32_t body = get_u32(player + 0x70), state = mp_state(body);
+        MpPose pose;
+        if (state) {
+            mp_read(state, &pose);
+            if (mp_pose_ok(&pose)) {
+                pose.v[0] *= 0.9f;
+                pose.v[2] *= 0.9f;
+                mp_write(body, state, &pose);
+            }
+        }
     }
     /* This player's own grid slot while everyone loads. */
     if (rs && player && g_race_phase == RACE_HOLDING && g_race_session && !g_race_test) {
@@ -1222,7 +1394,7 @@ static void race_view_ready(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvoca
         float s[2];
         const float above[3] = {c->car.drawn[0], c->car.drawn[1] + MP_LABEL_UP, c->car.drawn[2]};
         const float depth = c->following && c->car.kept ? mp_project(g_mp_view + 0x80, above, 1, s) : 0.0f;
-        MpLabel *l = &sh->labels[slot];
+        MpLabel *l = mp_label(sh, slot);
         l->x = s[0];
         l->y = s[1];
         l->depth = depth > 0.5f && s[0] > -0.2f && s[0] < 1.2f && s[1] > -0.2f && s[1] < 1.2f ? depth : 0.0f;

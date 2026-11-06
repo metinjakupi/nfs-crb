@@ -8,7 +8,7 @@
 //!                     {t:"impact", to, seq, k, ts, s}  {t:"race", k, ...}  {t:"look", k, data}
 //!                     {t:"follow", ids}  {t:"cophit", to, c, seq, k, ts, s}  a cops frame
 //!                     {t:"pursuit", to, k, a, b, f}  {t:"lights", s}  {t:"ping", n}
-//!   relay -> browser: {t:"welcome", id, physics?, bin?, cops?, drive?, peers:[{id, name, crew, physics?}]}
+//!   relay -> browser: {t:"welcome", id, physics?, bin?, cops?, copsMax?, drive?, peers:[{id, name, crew, physics?}]}
 //!                     {t:"join", id, name, crew, physics?}  {t:"left", id}
 //!                     {t:"pose", id, k, s, m, ts, physics?, ghost?, acks?}
 //!                     {t:"chat", id, text}  {t:"horn", id, on}  {t:"crew", id, crew}
@@ -54,6 +54,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,10 @@ use crate::App;
 
 /// Players a room holds by default (CARBON_ROOM_MAX); the next is refused.
 pub const MAX_ROOM: usize = 256;
+/// Connections one internet address may hold across all rooms by default (CARBON_CLIENT_MAX,
+/// 0 for no limit), so one machine cannot fill rooms or the server. High on purpose: a phone
+/// network can put many real players behind one address.
+pub const CLIENT_MAX: usize = 32;
 /// Cars a player gets by default (CARBON_INTEREST_K).
 pub const INTEREST_K: usize = 24;
 /// Unsent data per player (see ws::Outbox).
@@ -99,11 +104,15 @@ const DRIVE_BYTES: usize = 8;
 const BIN_COPS: u8 = 3;
 const COPS_HEAD: usize = 10;
 const COP_BYTES: usize = 38;
-const COPS_MAX: usize = 8;
+/// Cops (and shared traffic cars) a frame may carry: 16 as the Node relay (Step B, 2026-11-05; 8 before), told to
+/// pages in the welcome (copsMax) so a page never sends more than this relay passes.
+const COPS_MAX: usize = 16;
 /// A hit counts against a cops frame at most this old.
 const COP_FRESH: Duration = Duration::from_millis(1000);
 /// Metres from the cop, and from the hitting car, a hit may be.
 const COP_REACH: f64 = 25.0;
+/// Metres from the sender's own car every car of its cops frame must be (the Node relay's header).
+const COPS_NEAR: f64 = 500.0;
 /// The outbox key of a player's cops frames (its id plus this; a pose's key is its id).
 const COPS_KEY: u64 = 1 << 40;
 /// s[i] travels as a whole number of 1/SCALE[i], at most limit(i) either way.
@@ -310,30 +319,46 @@ fn to_u32(x: f64) -> u32 {
     }
 }
 
-/// m / 10^places as JavaScript writes it (no trailing zeros, no exponent).
-fn decimal(m: i64, places: u32) -> String {
+/// m / 10^places as JavaScript writes it (no trailing zeros, no exponent), added to `out`.
+fn decimal_into(out: &mut String, m: i64, places: u32) {
+    use std::fmt::Write;
     let scale = 10u64.pow(places);
     let (sign, a) = if m < 0 { ("-", m.unsigned_abs()) } else { ("", m as u64) };
     let (whole, mut frac, mut digits) = (a / scale, a % scale, places as usize);
     if frac == 0 {
-        return format!("{sign}{whole}");
+        let _ = write!(out, "{sign}{whole}");
+        return;
     }
     while frac % 10 == 0 {
         frac /= 10;
         digits -= 1;
     }
-    format!("{sign}{whole}.{frac:0digits$}")
+    let _ = write!(out, "{sign}{whole}.{frac:0digits$}");
+}
+
+#[cfg(test)]
+fn decimal(m: i64, places: u32) -> String {
+    let mut s = String::new();
+    decimal_into(&mut s, m, places);
+    s
 }
 
 /// A binary pose's number as a JSON page gets it (the Node relay's jsonNumbers): the
 /// quaternion to 5 decimals, the rest exactly (whole mm, cm/s and 1/500 rad/s).
-fn json_number(n: i32, i: usize) -> String {
+fn json_number_into(out: &mut String, n: i32, i: usize) {
     match i {
-        0..=3 => decimal(js_round(n as f64 / SCALE[i] * 1e5) as i64, 5),
-        4..=6 => decimal(n as i64, 3),
-        7..=9 => decimal(n as i64, 2),
-        _ => decimal(2 * n as i64, 3),
+        0..=3 => decimal_into(out, js_round(n as f64 / SCALE[i] * 1e5) as i64, 5),
+        4..=6 => decimal_into(out, n as i64, 3),
+        7..=9 => decimal_into(out, n as i64, 2),
+        _ => decimal_into(out, 2 * n as i64, 3),
     }
+}
+
+#[cfg(test)]
+fn json_number(n: i32, i: usize) -> String {
+    let mut s = String::new();
+    json_number_into(&mut s, n, i);
+    s
 }
 
 /// One player that gets a car: its id, when it last got a pose of it, and whether a newer one
@@ -347,6 +372,8 @@ struct Edge {
 
 struct Member {
     id: u64,
+    /// what it counts under for CARBON_CLIENT_MAX (limit_key)
+    client: Option<String>,
     name: String,
     crew: String,
     /// the crew as compared: lower case, no spaces
@@ -472,10 +499,37 @@ pub struct Relay {
     rooms: HashMap<String, Room>,
     next_id: u64,
     room_max: usize,
+    /// connections per public address now, and how many it may have
+    clients: HashMap<String, usize>,
+    client_max: usize,
     k: usize,
     /// the binary format it speaks (CARBON_RELAY_BIN), 0 = JSON only
     bin: usize,
     ticks: u64,
+}
+
+/// What a connection counts under for CARBON_CLIENT_MAX: a public IPv4 address, or an IPv6
+/// address's /64 (one home holds a whole /64). None for an internal address or anything else:
+/// that may be a proxy standing in for every player, so such connections are never limited.
+pub fn limit_key(address: &str) -> Option<String> {
+    let ip: IpAddr = address.parse().ok()?;
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let internal = v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                || v4.is_broadcast() || (a == 100 && (64..128).contains(&b));
+            (!internal).then(|| v4.to_string())
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let internal = v6.is_loopback() || v6.is_unspecified() || s[0] & 0xfe00 == 0xfc00 || s[0] & 0xffc0 == 0xfe80;
+            (!internal).then(|| format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]))
+        }
+    }
 }
 
 /// A whole number from the environment within [min, max], else the default (unset and "" too).
@@ -495,6 +549,8 @@ impl Default for Relay {
             rooms: HashMap::new(),
             next_id: 0,
             room_max: env_count("CARBON_ROOM_MAX", MAX_ROOM, 1, 10000),
+            clients: HashMap::new(),
+            client_max: env_count("CARBON_CLIENT_MAX", CLIENT_MAX, 0, 100000),
             k: env_count("CARBON_INTEREST_K", INTEREST_K, 1, 1000),
             bin: env_count("CARBON_RELAY_BIN", BIN, 0, 1),
             ticks: 0,
@@ -985,10 +1041,17 @@ impl Relay {
             }
         }
     }
-    /// A place in the room, or None when it is full.
-    fn admit(&mut self, room: &str, out: Arc<Outbox>) -> Option<u64> {
+    /// A place in the room, or None when it is full or the address has its share.
+    fn admit(&mut self, room: &str, client: Option<String>, out: Arc<Outbox>) -> Option<u64> {
         if self.rooms.get(room).map_or(0, |r| r.members.len()) >= self.room_max {
             return None;
+        }
+        if let Some(c) = &client {
+            let held = self.clients.get(c).copied().unwrap_or(0);
+            if self.client_max > 0 && held >= self.client_max {
+                return None;
+            }
+            self.clients.insert(c.clone(), held + 1);
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -996,6 +1059,7 @@ impl Relay {
         r.at.insert(id, r.members.len());
         r.members.push(Member {
             id,
+            client,
             name: "Player".into(),
             crew: String::new(),
             crew_key: String::new(),
@@ -1045,6 +1109,12 @@ impl Relay {
         let Some(i) = r.index(id) else { return };
         let gone = r.members.remove(i);
         r.at.remove(&id);
+        if let Some(c) = &gone.client {
+            match self.clients.get_mut(c) {
+                Some(held) if *held > 1 => *held -= 1,
+                _ => { self.clients.remove(c); }
+            }
+        }
         for (j, p) in r.members.iter().enumerate().skip(i) {
             r.at.insert(p.id, j);
         }
@@ -1523,7 +1593,7 @@ fn hi(
         r#"{{"t":"welcome","whispers":1,"id":{id}{}{}{}{}{},"peers":[{}]}}"#,
         if physics == Some(0.0) || physics == Some(1.0) { r#","physics":1"# } else { "" },
         if members[i].bin != 0 { format!(r#","bin":{}"#, members[i].bin) } else { String::new() },
-        if members[i].cops { r#","cops":1"# } else { "" },
+        if members[i].cops { format!(r#","cops":1,"copsMax":{COPS_MAX}"#) } else { String::new() },
         if members[i].drive { r#","drive":1"# } else { "" },
         if number(m.get("rivals")) == Some(1.0) { r#","rivals":1"# } else { "" },
         peers.join(",")
@@ -1640,8 +1710,23 @@ fn pose_binary(room: &mut Room, i: usize, data: &[u8], now: Instant) {
         Vec::new()
     };
     let s: [f64; 13] = std::array::from_fn(|i| b.n[i] as f64 / SCALE[i]);
-    let numbers: Vec<String> = (0..13).map(|i| json_number(b.n[i], i)).collect();
-    let acks_json: Vec<String> = acks.iter().map(|(from, seq)| format!("[{from},{seq}]")).collect();
+    // Written straight into one string each: a pose arrives ~30 times a second per player.
+    let mut s_json = String::with_capacity(160);
+    s_json.push('[');
+    for i in 0..13 {
+        if i > 0 {
+            s_json.push(',');
+        }
+        json_number_into(&mut s_json, b.n[i], i);
+    }
+    s_json.push(']');
+    let mut acks_json = String::with_capacity(2 + acks.len() * 16);
+    acks_json.push('[');
+    for (j, (from, seq)) in acks.iter().enumerate() {
+        use std::fmt::Write;
+        let _ = write!(acks_json, "{}[{from},{seq}]", if j > 0 { "," } else { "" });
+    }
+    acks_json.push(']');
     let wire = Wire {
         k: b.k,
         m: b.m,
@@ -1649,10 +1734,10 @@ fn pose_binary(room: &mut Room, i: usize, data: &[u8], now: Instant) {
         physics: p.physics,
         ghost: b.ghost,
         ts_json: b.ts.to_string(),
-        s_json: format!("[{}]", numbers.join(",")),
+        s_json,
         n: b.n,
         acks,
-        acks_json: format!("[{}]", acks_json.join(",")),
+        acks_json,
         json: None,
         bin: None,
         drive: if p.drive { b.drive } else { None },
@@ -1742,6 +1827,13 @@ fn read_cops(b: &[u8]) -> Option<Vec<(u8, u32, [f64; 3])>> {
     Some(list)
 }
 
+/// Whether every car of a cops frame is within COPS_NEAR of the sender's car (its newest pose of any
+/// kind: a background tab sends m = 0 poses at its car's real place): a player sends only its own
+/// game's cars around itself. No pose yet: only an empty frame.
+fn cops_near(at: Option<[f64; 3]>, list: &[(u8, u32, [f64; 3])]) -> bool {
+    list.is_empty() || at.is_some_and(|a| list.iter().all(|x| distance(&a, &x.2) <= COPS_NEAR))
+}
+
 /// Whether r gets s's cops now: it follows s, or their cars are within MID_RANGE (or not known yet).
 fn cops_reach(s: &Member, r: &Member) -> bool {
     let (Some(a), Some(b)) = (s.at, r.at) else { return true };
@@ -1755,7 +1847,8 @@ fn cops(room: &mut Room, i: usize, data: &[u8], now: Instant) {
         return;
     }
     let Some(list) = read_cops(data) else { return };
-    if !room.members[i].allow(Limit::Cops, now) {
+    let at = room.members[i].pose.as_ref().map(|p| [p.s[4], p.s[5], p.s[6]]).or(room.members[i].at);
+    if !cops_near(at, &list) || !room.members[i].allow(Limit::Cops, now) {
         return;
     }
     let sid = room.members[i].id;
@@ -1844,10 +1937,10 @@ impl Session for Player {
 }
 
 /// A player's connection to a room, from the 101 answer to its departure.
-pub async fn join(app: Arc<App>, conn: Conn, room: String, accept: String) {
+pub async fn join(app: Arc<App>, conn: Conn, room: String, client: Option<String>, accept: String) {
     let out = Outbox::new(MAX_PENDING);
-    // A full room: the connection is closed without an answer, as the Node relay does.
-    let Some(id) = lock(&app.relay).admit(&room, out.clone()) else { return };
+    // No place: the connection is closed without an answer, as the Node relay does.
+    let Some(id) = lock(&app.relay).admit(&room, client, out.clone()) else { return };
     let Some((rd, buf, writer)) = ws::open(conn, &accept, &out).await else {
         lock(&app.relay).leave(&room, id);
         return;
@@ -1859,6 +1952,34 @@ pub async fn join(app: Arc<App>, conn: Conn, room: String, accept: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_public_addresses_count_for_the_client_limit() {
+        assert_eq!(limit_key("8.8.8.8").as_deref(), Some("8.8.8.8"));
+        assert_eq!(limit_key("::ffff:8.8.8.8").as_deref(), Some("8.8.8.8"));
+        assert_eq!(limit_key("2a01:4f8:1:2:aaaa::1").as_deref(), Some("2a01:4f8:1:2::/64"));
+        assert_eq!(limit_key("2a01:4f8:1:2:bbbb::9"), limit_key("2a01:4f8:1:2:aaaa::1"));
+        for internal in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "10.0.0.5", "172.18.0.2", "192.168.1.9", "169.254.1.1",
+                         "100.64.0.1", "fd00::1", "fe80::1", "0.0.0.0", "", "unknown", "1.2.3.4, 5.6.7.8"] {
+            assert_eq!(limit_key(internal), None, "{internal}");
+        }
+    }
+
+    #[test]
+    fn an_address_gets_its_share_back_when_a_player_leaves() {
+        let mut relay = Relay { client_max: 2, ..Relay::default() };
+        let who = || Some("8.8.8.8".to_string());
+        let out = || Outbox::new(MAX_PENDING);
+        let first = relay.admit("a", who(), out()).unwrap();
+        relay.admit("b", who(), out()).unwrap();
+        assert!(relay.admit("c", who(), out()).is_none(), "the share spans rooms");
+        assert!(relay.admit("a", Some("8.8.4.4".to_string()), out()).is_some(), "other addresses are not affected");
+        assert!(relay.admit("a", None, out()).is_some() && relay.admit("a", None, out()).is_some(), "no key, no limit");
+        relay.leave("a", first);
+        assert!(relay.admit("c", who(), out()).is_some());
+        relay.leave("a", first); // a second leave changes nothing
+        assert_eq!(relay.clients["8.8.8.8"], 2);
+    }
 
     #[test]
     fn headings_and_rounding_match_javascript() {
@@ -1909,11 +2030,18 @@ mod tests {
         assert_eq!(read_cops(&frame(&[])).unwrap().len(), 0);
         assert!(read_cops(&frame(&[(0, 1)])).is_none(), "number 0");
         assert!(read_cops(&frame(&[(4, 1), (4, 2)])).is_none(), "a number twice");
-        let nine: Vec<(u8, i32)> = (1..=9).map(|c| (c, 0)).collect();
-        assert!(read_cops(&frame(&nine)).is_none(), "more than COPS_MAX");
+        let sixteen: Vec<(u8, i32)> = (1..=16).map(|c| (c, 0)).collect();
+        assert_eq!(read_cops(&frame(&sixteen)).unwrap().len(), 16, "COPS_MAX (16) cars pass");
+        let seventeen: Vec<(u8, i32)> = (1..=17).map(|c| (c, 0)).collect();
+        assert!(read_cops(&frame(&seventeen)).is_none(), "more than COPS_MAX");
         let mut long = frame(&[(1, 0)]);
         long.push(0);
         assert!(read_cops(&long).is_none(), "wrong size");
+        // Only cars near the sender's own car, and none before it has one.
+        assert!(cops_near(Some([10.0, -2.5, 0.0]), &list));
+        assert!(!cops_near(Some([600.0, -2.5, 0.0]), &list), "a car beyond COPS_NEAR");
+        assert!(!cops_near(None, &list), "no pose yet");
+        assert!(cops_near(None, &[]), "the end of a chase always passes");
     }
 
     #[test]

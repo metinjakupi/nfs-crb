@@ -42,7 +42,7 @@
 #define LOOK_FORMAT 1u
 #define LOOK_REC (8u + LOOK_BYTES) /* LookRecord as it travels */
 #define LOOK_SPACE 0x440u
-#define LOOK_PEERS 8
+#define LOOK_PEERS MP_SLOTS /* 20 since 2026-11-05 (version 2); a page that knows version 1 uses the first 8 */
 #define LOOK_MAGIC 0x4b4c4d43u /* "CMLK" */
 #define LOOK_PART_DB 0x00b76690u
 #define LOOK_LAYERS 20u
@@ -63,7 +63,7 @@ typedef struct LookPeer { /* 0x460 bytes; written by the page */
 } LookPeer;
 
 typedef struct LookShared {
-    uint32_t magic, version;   /* LOOK_MAGIC, 1 */
+    uint32_t magic, version;   /* LOOK_MAGIC, 2 (1: LOOK_PEERS was 8) */
     uint32_t seq;              /* the game's part from here to rec: odd while written */
     uint32_t key, size, stamp; /* this player's car: base model, bytes in rec (0 = stock), changes */
     uint32_t parts, db;        /* this game's part database: count and fingerprint */
@@ -276,7 +276,7 @@ static void look_install(void) {
     }
     memset(sh, 0, sizeof *sh);
     sh->magic = LOOK_MAGIC;
-    sh->version = 1;
+    sh->version = LOOK_PEERS > 20 ? 3 : 2; /* 3: 64 peers (Step B) */
     if (g_api->hook_install(g_api, MP_FE_SERVICE, look_service, POP_HOOK_BEFORE, NULL, &g_look_hooks[0]) != POP_OK) {
         log_line("core.nfsc: other players' car looks unavailable");
         return;
