@@ -49,7 +49,7 @@ static void intro_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocati
 }
 
 static void intro_install(void) {
-    g_skip_intro = setting("skip_intro", 0) != 0;
+    g_skip_intro = setting("skip_intro", 1) != 0;
     if (g_skip_intro && install(0x00600c90u, intro_service, POP_HOOK_BEFORE, 17) != POP_OK)
         log_line("core.nfsc: intro skipping unavailable");
 }

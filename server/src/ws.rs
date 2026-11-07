@@ -68,7 +68,8 @@ pub async fn upgrade(app: Arc<App>, mut conn: Conn, req: Request) {
         let who = client(&conn, &req);
         crate::lan::join(app, conn, who, accept).await
     } else {
-        crate::relay::join(app, conn, room, accept).await
+        let who = crate::relay::limit_key(&client(&conn, &req));
+        crate::relay::join(app, conn, room, who, accept).await
     }
 }
 
@@ -181,8 +182,16 @@ pub struct Outbox {
 }
 
 struct Queue {
-    /// (key, frame): key 0 for a reliable message, else a pose's sender id
-    items: VecDeque<(u64, Arc<[u8]>)>,
+    /// (key, frame): key 0 for a reliable message, else a pose's sender id; None for a pose
+    /// that a newer one replaced (left in place so nothing has to move)
+    items: VecDeque<(u64, Option<Arc<[u8]>>)>,
+    /// the position of items[0] counted from the start, so a position stays valid as the
+    /// front is taken
+    head: usize,
+    /// while writing: each key's queued pose (key, position). A take empties the queue, so
+    /// every pose queued during a write is here, and one search over the cars this player gets
+    /// (a few dozen) finds the one a newer pose replaces, however long the queue.
+    keyed: Vec<(u64, usize)>,
     bytes: usize,
     /// a write is in progress, i.e. the socket did not take everything at once
     writing: bool,
@@ -205,17 +214,37 @@ enum Take {
 }
 
 impl Queue {
+    /// Drops every queued frame with this key (a departed player's poses; rare).
     fn remove(&mut self, key: u64) {
-        if let Some(i) = self.items.iter().position(|(k, _)| *k == key) {
-            if let Some((_, b)) = self.items.remove(i) {
+        for (k, b) in self.items.iter_mut() {
+            if *k == key {
+                if let Some(b) = b.take() {
+                    self.bytes -= b.len();
+                }
+            }
+        }
+        self.keyed.retain(|(k, _)| *k != key);
+    }
+
+    /// Drops the pose that a newer one with the same key replaces (only while writing).
+    fn replace(&mut self, key: u64) {
+        if let Some(j) = self.keyed.iter().position(|(k, _)| *k == key) {
+            let at = self.keyed.swap_remove(j).1 - self.head;
+            if let Some(b) = self.items[at].1.take() {
                 self.bytes -= b.len();
             }
         }
     }
 
-    fn die(&mut self) {
+    fn clear(&mut self) {
+        self.head += self.items.len();
         self.items.clear();
+        self.keyed.clear();
         self.bytes = 0;
+    }
+
+    fn die(&mut self) {
+        self.clear();
         self.state = State::Dead;
     }
 }
@@ -223,7 +252,14 @@ impl Queue {
 impl Outbox {
     pub fn new(limit: usize) -> Arc<Outbox> {
         Arc::new(Outbox {
-            q: Mutex::new(Queue { items: VecDeque::new(), bytes: 0, writing: false, state: State::Open }),
+            q: Mutex::new(Queue {
+                items: VecDeque::new(),
+                head: 0,
+                keyed: Vec::new(),
+                bytes: 0,
+                writing: false,
+                state: State::Open,
+            }),
             wake: Notify::new(),
             kill: Notify::new(),
             limit,
@@ -248,7 +284,7 @@ impl Outbox {
         }
         // Only behind a stuck write: a reader that keeps up gets every pose, in order.
         if key != 0 && q.writing {
-            q.remove(key);
+            q.replace(key);
         }
         let total = q.bytes + bytes.len();
         // Only a stuck write counts (the Node relay queued only then: a reader that keeps up
@@ -264,7 +300,11 @@ impl Outbox {
             return false;
         }
         q.bytes = total;
-        q.items.push_back((key, bytes));
+        if key != 0 && q.writing {
+            let at = q.head + q.items.len();
+            q.keyed.push((key, at));
+        }
+        q.items.push_back((key, Some(bytes)));
         drop(q);
         self.wake.notify_one();
         true
@@ -287,8 +327,7 @@ impl Outbox {
     pub fn finish(&self, last: Option<Vec<u8>>) {
         let mut q = lock(&self.q);
         if matches!(q.state, State::Open) {
-            q.items.clear();
-            q.bytes = 0;
+            q.clear();
             q.state = State::Finishing(last);
         }
         drop(q);
@@ -309,12 +348,16 @@ impl Outbox {
         match &mut q.state {
             State::Dead => Take::Stop,
             State::Finishing(last) => Take::Finish(last.take()),
-            State::Open if q.items.is_empty() => Take::Wait,
+            // Nothing left but replaced poses: nothing to send.
+            State::Open if q.bytes == 0 => {
+                q.clear();
+                Take::Wait
+            }
             State::Open => {
-                for (_, b) in q.items.drain(..) {
-                    chunk.extend_from_slice(&b);
+                for b in q.items.iter().filter_map(|(_, b)| b.as_ref()) {
+                    chunk.extend_from_slice(b);
                 }
-                q.bytes = 0;
+                q.clear();
                 q.writing = true;
                 Take::Write
             }
@@ -472,6 +515,54 @@ pub async fn run(mut rd: OwnedReadHalf, mut buf: Vec<u8>, out: Arc<Outbox>, writ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued(s: &str) -> Arc<[u8]> {
+        Arc::from(s.as_bytes())
+    }
+
+    fn sent(out: &Outbox) -> String {
+        let mut chunk = Vec::new();
+        assert!(matches!(out.take(&mut chunk), Take::Write));
+        lock(&out.q).writing = false;
+        String::from_utf8(chunk).unwrap()
+    }
+
+    #[test]
+    fn a_stuck_write_keeps_only_each_cars_newest_pose_at_the_end() {
+        let out = Outbox::new(1 << 20);
+        out.push(7, queued("a1 "));
+        out.push(7, queued("a2 "));
+        // Not writing: everything is kept, in order.
+        let mut chunk = Vec::new();
+        assert!(matches!(out.take(&mut chunk), Take::Write));
+        assert_eq!(chunk, b"a1 a2 ");
+        // A write is stuck now: a newer pose replaces the queued one and goes to the end.
+        out.push(7, queued("a3 "));
+        out.push(9, queued("b1 "));
+        out.push(0, queued("chat "));
+        out.push(7, queued("a4 "));
+        out.push(9, queued("b2 "));
+        assert_eq!(lock(&out.q).bytes, "chat a4 b2 ".len());
+        lock(&out.q).writing = false;
+        assert_eq!(sent(&out), "chat a4 b2 ");
+        // Positions stay right after the front was taken, and a departed car's poses all go.
+        let mut chunk = Vec::new();
+        out.push(0, queued("x "));
+        assert!(matches!(out.take(&mut chunk), Take::Write));
+        out.push(9, queued("b3 "));
+        out.push(7, queued("a5 "));
+        out.push(9, queued("b4 "));
+        out.remove(7);
+        assert_eq!(lock(&out.q).bytes, "b4 ".len());
+        lock(&out.q).writing = false;
+        assert_eq!(sent(&out), "b4 ");
+        // Only replaced poses left: nothing to write.
+        out.push(5, queued("c1 "));
+        out.remove(5);
+        let mut chunk = Vec::new();
+        assert!(matches!(out.take(&mut chunk), Take::Wait));
+        assert!(lock(&out.q).items.is_empty());
+    }
 
     fn masked(payload: &[u8], op: u8) -> Vec<u8> {
         let mask = [0x21, 0x43, 0x65, 0x87];

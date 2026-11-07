@@ -12,6 +12,7 @@ bool sched_free_run_enter(uint32_t esp);
 uint32_t sched_free_run_leave();
 bool sched_free_running();
 void sched_parallel_rejoin();
+bool sched_parallel();
 #include "memory.h"
 #include "../platform/ab_phase.h"
 #include "../platform/os.h"
@@ -559,7 +560,12 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         return done;
     }
     const bool done = imports_dispatch_holding(c, target);
-    sched_parallel_rejoin(); // RECOMP_SCHED=parallel: a worker that held the baton runs free again
+    // RECOMP_SCHED=parallel: a worker that held the baton runs free again. The mode is fixed at
+    // start, so the call is made only when it is on (2026-11-04: one call fewer on each of the
+    // ~50,000 imports a frame).
+    static const bool parallel = sched_parallel();
+    if (RECOMP_UNLIKELY(parallel))
+        sched_parallel_rejoin();
     return done;
 }
 
@@ -609,7 +615,10 @@ static bool imports_dispatch_holding(X86 *c, uint32_t target) {
     auto label = [&table, idx] { return table[idx].desc.c_str(); };
     ++table[idx].calls;
     ++g_import_calls;
-    profile_note_import(idx); // the thread map (profile.cpp); returns at once unless it is on
+    // The thread map (profile.cpp), fixed at start: off, no call (2026-11-04: one call fewer per import).
+    static const bool notes = profile_import_notes_on();
+    if (RECOMP_UNLIKELY(notes))
+        profile_note_import(idx);
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
     if (trace) {

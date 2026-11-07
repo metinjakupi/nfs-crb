@@ -401,6 +401,10 @@ pub struct Hub {
     pub identities: Arc<Mutex<Claims>>,
     /// Player Stats and the Leaderboard: FESL's rank service (stats.rs).
     pub stats: Stats,
+    /// Each browser's client address (X-Real-IP), by vip, for the limits below. Never logged.
+    pub player_clients: HashMap<u32, String>,
+    /// UpdateStats per client address and per name (leaderboard.rs).
+    pub limits: crate::leaderboard::Limits,
 }
 
 /// The trace host's game (CARBON_TRACE_GAME): its id, and the port its "host" listens on.
@@ -967,6 +971,12 @@ impl Session {
             "UpdateStats" => {
                 match &self.user {
                     Some(u) => {
+                        let from = hub.player_clients.get(&self.key.0).cloned().unwrap_or_else(|| self.key.0.to_string());
+                        if !hub.limits.allow(crate::leaderboard::Kind::UpdateFromClient, &from) || !hub.limits.allow(crate::leaderboard::Kind::UpdateForName, &u.name) {
+                            ev.push(Event::Note(format!("{}: UpdateStats over its limit: nothing kept", u.name)));
+                            Self::send(ev, reply());
+                            return true;
+                        }
                         let (kept, left) = hub.stats.update(&u.name, p, now);
                         if kept > 0 {
                             ev.push(Event::Note(format!("{}: {kept} stat(s) kept, {left} left out", u.name)));
@@ -1606,6 +1616,37 @@ clientPlatform=PC\nclientVersion=2.0\nSDKVersion=2.9.7.1.0\nprotocolVersion=2.0\
 
     fn out(events: &[Event]) -> Vec<Packet> {
         events.iter().filter_map(|e| if let Event::Out(raw, _) = e { Some(Packet::decode(raw)) } else { None }).collect()
+    }
+
+    #[test]
+    fn update_stats_is_limited_per_address_and_name_and_still_answered() {
+        let mut hub = Hub::default();
+        // four browsers from one address (X-Real-IP), each signed in under its own name
+        let names = ["RateA", "RateB", "RateC", "RateD"];
+        let mut sessions: Vec<Session> = (0..4u32)
+            .map(|i| {
+                hub.player_clients.insert(0x0a4d_0010 + i, "198.51.100.7".into());
+                Session::new(Service::Fesl, (0x0a4d_0010 + i, 50000 + i as u16, FESL_PORT, i + 1))
+            })
+            .collect();
+        for (s, name) in sessions.iter_mut().zip(names) {
+            s.feed(&Packet::new(b"acct", 1).with("TXN", "Login").with("name", name).encode(), &mut hub).unwrap();
+        }
+        let upd = |name: &str, i: usize| {
+            Packet::new(b"rank", 3).with("TXN", "UpdateStats").with("u.[]", 1).with("u.0.o", user_id(name)).with("u.0.ot", 1)
+                .with("u.0.s.[]", 1).with("u.0.s.0.k", "PK_Racer_Wins").with("u.0.s.0.v", 1).with("u.0.s.0.ut", 3).with("u.0.s.0.t", "")
+                .with("x", i)
+        };
+        let mut answered = 0;
+        for i in 0..100 {
+            let (s, name) = (&mut sessions[i % 4], names[i % 4]);
+            answered += out(&s.feed(&upd(name, i).encode(), &mut hub).unwrap()).iter().filter(|p| p.get("TXN") == Some("UpdateStats")).count();
+        }
+        // every request is answered (the game waits for it); a name's 20 and the address's 60
+        assert_eq!(answered, 100);
+        let wins = |n: &str| hub.stats.get(user_id(n), &["PK_Racer_Wins".into()], crate::stats::Period::All, 0, 0)[0].1;
+        assert_eq!(names.iter().map(|n| wins(n)).sum::<f64>(), 60.0);
+        assert!(names.iter().all(|n| wins(n) <= 20.0));
     }
 
     #[test]

@@ -413,13 +413,24 @@ function prepareAuxiliary(module, chunks) {
   return rebased && sha256Hex(rebased) === module.sha256 ? rebased : bytes;
 }
 
+// The manifest is rewritten while a game is copied. A tab closed or a full disk in the middle leaves a
+// cut-off file; that must not stop the game from starting: it reads as "nothing verified yet" and the
+// files are checked again (sizes and times) instead of throwing a JSON error.
+async function readManifest(store) {
+  try {
+    const m = JSON.parse((await store.readText(MANIFEST)) || "null");
+    if (m && typeof m === "object" && m.files && typeof m.files === "object") return m;
+  } catch {}
+  return { files: {} };
+}
+
 export async function importGame(game, source, store, { onProgress, signal, freeBytes } = {}) {
   const entries = await source.list();
   const plan = planImport(game, entries);
   if (plan.error) return { result: "noExecutable" };
   if (plan.missing.length) return { result: "incomplete", missing: plan.missing };
   await store.remove(STAMP);
-  const manifest = JSON.parse((await store.readText(MANIFEST)) || '{"files":{}}');
+  const manifest = await readManifest(store);
   const progress = { filesDone: 0, filesTotal: plan.files.length, bytesDone: 0, bytesTotal: 0, current: "" };
   let needed = 0;
   for (const f of plan.files) {
@@ -515,7 +526,7 @@ export async function importGame(game, source, store, { onProgress, signal, free
 
 export async function gameStatus(game, store) {
   const stamp = ((await store.readText(STAMP)) || "").trim();
-  const manifest = JSON.parse((await store.readText(MANIFEST)) || '{"files":{}}');
+  const manifest = await readManifest(store);
   const names = Object.keys(manifest.files);
   if (!names.some((n) => n.toLowerCase() === game.executable.toLowerCase())) return { state: "notFound" };
   const tops = new Set(names.filter((n) => n.includes("/")).map((n) => n.split("/")[0].toLowerCase()));

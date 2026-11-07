@@ -159,6 +159,15 @@ impl Trace {
         hub.messenger = crate::messenger::Messenger::new(keep);
         // Player Stats and the Leaderboard, the same way (stats.rs).
         hub.stats = crate::stats::Stats::open(std::env::var("CARBON_STATS_DIR").ok().filter(|v| !v.is_empty()).map(PathBuf::from));
+        // The public boards' wins and win streaks count from this moment (leaderboard.rs).
+        match std::env::var("CARBON_LEADERBOARD_RESET").ok().filter(|v| !v.is_empty()).map(|v| v.trim().parse::<u64>()) {
+            Some(Ok(at)) => {
+                hub.stats.set_reset(at);
+                println!("leaderboard: public wins and win streaks count from {at} (CARBON_LEADERBOARD_RESET)");
+            }
+            Some(Err(_)) => eprintln!("leaderboard: CARBON_LEADERBOARD_RESET is not a number of seconds; public wins count from the first race"),
+            None => {}
+        }
         Trace { dir, tx, conns: HashMap::new(), flows: HashMap::new(), seq: 0, dropped: 0, hub, host_files: HashMap::new() }
     }
 
@@ -541,8 +550,18 @@ impl Trace {
         for n in &notes {
             println!("host {gid}: {n}");
         }
-        // the race's results counted for Player Stats and the Leaderboard
-        reports.into_iter().flat_map(|r| self.hub.stats.race_report(r)).for_each(|l| println!("{l}"));
+        // the race's results counted for Player Stats and the Leaderboard, with who each racer
+        // is beyond its name: its address, and its claim when its browser proved it
+        for mut r in reports {
+            let racers = match &mut r {
+                crate::stats::RaceReport::Started { players, .. } | crate::stats::RaceReport::Ended { players, .. } => players,
+            };
+            for p in racers.iter_mut() {
+                p.client = self.hub.player_clients.get(&p.vip).cloned().unwrap_or_default();
+                p.owner = self.hub.player_claims.get(&p.vip).filter(|o| crate::util::lock(&self.hub.identities).verified_owner(&p.name, o)).cloned();
+            }
+            self.hub.stats.race_report(r).into_iter().for_each(|l| println!("{l}"));
+        }
         if self.dir.is_none() || (log.is_empty() && notes.is_empty()) {
             return;
         }
@@ -582,7 +601,18 @@ impl Trace {
         }
     }
 
+    /// The address a browser connected from (X-Real-IP behind nginx), for the limits on result
+    /// submissions and for telling apart the racers of a race (stats.rs). Never logged.
+    pub fn set_player_client(&mut self, vip: u32, client: &str) {
+        self.hub.player_clients.insert(vip, client.to_string());
+    }
+
+    pub fn stats(&mut self) -> &mut crate::stats::Stats {
+        &mut self.hub.stats
+    }
+
     pub fn gone(&mut self, vip: u32) {
+        self.hub.player_clients.remove(&vip);
         self.hub.player_keys.remove(&vip);
         self.hub.player_claims.remove(&vip);
         let keys: Vec<ConnKey> = self.conns.keys().filter(|k| k.0 == vip).copied().collect();

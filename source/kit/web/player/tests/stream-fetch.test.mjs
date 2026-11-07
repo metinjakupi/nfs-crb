@@ -46,6 +46,8 @@ async function setup(saved = new Map(), fault = '', rangeWait = () => {}, cacheW
         assert.ok(piece >= 0, 'a large asset must be fetched from independently cacheable pieces');
         const rangeRequest = requests.filter(r => r.headers).length;
         if (fault === 'network-once' && rangeRequest === 1) throw new TypeError('temporary network failure');
+        if (fault === 'network-six' && rangeRequest <= 6) throw new TypeError('Failed to fetch');
+        if (fault === 'network-down') throw new TypeError('Failed to fetch');
         const [, a, b] = /bytes=(\d+)-(\d+)/.exec(options.headers.Range);
         const start = Number(a), end = Number(b);
         assert.ok(end < pieces[piece].length, 'range must be relative to its piece');
@@ -132,14 +134,25 @@ test('retries a temporary network failure and a failed byte check before failing
   }
 });
 
+test('a connection that stays down for six tries still comes back; a dead one stops after eight', async () => {
+  const s = await setup(new Map(), 'network-six', () => {}, () => {}, true);
+  assert.equal(await s.api.read(1, 0, 20, 0), 20);
+  assert.equal(s.requests.filter(r => r.headers).length, 7, 'six failures, then the seventh try succeeds');
+  assert.equal(s.messages.some(m => m.type === 'unavailable'), false);
+  const dead = await setup(new Map(), 'network-down', () => {}, () => {}, true);
+  assert.equal(await dead.api.read(1, 0, 20, 0), -5);
+  assert.equal(dead.requests.filter(r => r.headers).length, 8);
+  assert.equal(dead.messages.find(m => m.type === 'unavailable')?.path, '/files/TRACKS/large.bun');
+});
+
 test('a permanently interrupted body stops after bounded retries without caching partial bytes', async () => {
   for (const path of ['TRACKS/large.bun', 'CARS/RX7/GEOMETRY.BIN']) {
     const s = await setup(new Map(), 'body-always', () => {}, () => {}, true, () => {}, path);
     assert.equal(await s.api.read(1, 0, 20, 0), -5);
     const ranges = s.requests.filter(r => r.headers);
-    assert.equal(ranges.filter(r => r.headers.Range === 'bytes=0-1048575').length, 5);
+    assert.equal(ranges.filter(r => r.headers.Range === 'bytes=0-1048575').length, 8);
     for (const range of new Set(ranges.map(r => r.headers.Range)))
-      assert.ok(ranges.filter(r => r.headers.Range === range).length <= 5, 'each background or required range has bounded retries');
+      assert.ok(ranges.filter(r => r.headers.Range === range).length <= 8, 'each background or required range has bounded retries');
     assert.equal(s.saved.size, 0);
     assert.equal(s.messages.find(m => m.type === 'unavailable')?.path, '/files/' + path);
   }

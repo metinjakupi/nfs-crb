@@ -13,15 +13,19 @@
 //
 // Messages are JSON text frames, but poses and the map feed travel as binary
 // frames for a page that asks for them in its hi (see "Compact poses" below).
-//   browser -> relay: {t:"hi", name, crew, bin, cops, drive}  {t:"pose", k, s, m, ts}
+// Player vehicle policy: carbon-player-vehicles.json excludes police, traffic,
+// utility and development vehicles. Both pose formats disconnect a player who
+// sends an excluded model key. AI cops frames retain their existing behavior.
+//   browser -> relay: {t:"hi", name, crew, bin, cops, drive, where}  {t:"pose", k, s, m, ts}
 //                     {t:"chat", text}  {t:"horn", on}  {t:"crew", crew}
 //                     {t:"follow", ids}  {t:"cophit", to, c, seq, k, ts, s}  a cops frame
 //                     {t:"pursuit", to, k, a, b, f}  {t:"lights", s}
 //                     {t:"ping", n}  {t:"street", to, k, r, a, f}
-//   relay -> browser: {t:"welcome", id, bin, cops, drive, peers:[{id, name, crew}]}  {t:"join", id, name, crew}
+//   relay -> browser: {t:"welcome", id, bin, cops, drive, where, peers:[{id, name, crew}]}  {t:"join", id, name, crew}
 //                     {t:"pose", id, k, s, m, ts}  {t:"left", id}
 //                     {t:"chat", id, text}  {t:"horn", id, on}  {t:"crew", id, crew}
-//                     {t:"where", p:[[id, x, z, heading], ...]}  {t:"pursuit", id, k, a, b, f}
+//                     {t:"where", p:[[id, x, z, heading], ...]} (hi where:2: [id, x, z, heading, state];
+//                     "Where, version 2")  {t:"pursuit", id, k, a, b, f}
 //                     {t:"cophit", id, c, seq, k, ts, s}  a cops frame  {t:"lights", id, s}
 //                     {t:"pong", n}  {t:"street", id, k, r, a, f}
 //   plus plain HTTP GET /stats, the start page's player count.
@@ -90,11 +94,18 @@
 // (those already picked first, then in the order they came; a player that has
 // never driven picks this way too). A player already picked counts at a quarter of its
 // distance for HOLD_MS (5 s), then at half: a newcomer must be much nearer to
-// take its place, so the cars shown do not flap. Rooms of up to K + 1 players
-// work as before this: everyone gets everyone.
+// take its place, so the cars shown do not flap; but only within KEEP_RANGE
+// (1000 m, where a game still shows a car in view): farther, it counts at its
+// whole distance. A player already picked that stops driving but still sends
+// (its pose is m 0, at most ACTIVE_MS old: its player is in a menu, and the game
+// keeps its car standing there) keeps its last driving place, standing, instead
+// of coming last, so it is not dropped for any driver while its car is shown
+// (logs/no-vanish-20261106). Rooms of up to K + 1 players work as before this:
+// everyone gets everyone.
 //   - Poses go only to the players that picked the sender: every one while the
-//     two cars are within FULL_RANGE (500 m; the game builds a car within 300 m
-//     and removes it beyond 500 m) or the receiver follows the sender; at most
+//     two cars are within FULL_RANGE (500 m; the game built a car within 300 m
+//     and removed it beyond 500 m; from logs/no-vanish-20261106 it builds within
+//     800 m and removes beyond 1000 m) or the receiver follows the sender; at most
 //     one per MID_MS (100 ms) within MID_RANGE (700 m), so a car coming nearer
 //     is known well before it is built; beyond, at most one per FAR_MS (250 ms).
 //     A pose held back that way is sent once that time has passed (checked every
@@ -117,6 +128,9 @@
 //     (the body's +z axis) points, in whole degrees from +z toward +x (0-359).
 //     For the world map and the far players' places; sent only while someone
 //     is driving.
+//   - Everyone in free roam (2026-11-06, "Where, version 2" below): a page whose hi
+//     says where:2 gets, instead, every named player with a free-roam place not
+//     older than WHERE_KEEP_MS, each with a state.
 // A player joining picks at once, and is added to the players that have room
 // for more, so its first pose reaches them without waiting for a pick.
 //
@@ -175,6 +189,35 @@
 //   WHERE, relay -> page, 1 + 14 * count bytes: u8 2, then for each player u32 id,
 //   i32 x, i32 z (whole metres), u16 heading (degrees), as in {t:"where"}.
 //
+// Where, version 2 (2026-11-06; source/web/net.js, worldmap.js): every player in free roam on
+// the world map, not only those driving this second. A page asks with hi {where:2}; the welcome
+// says where:2 back. Pages that do not ask (all from before) get the feed above, unchanged: the
+// players driving now, [id, x, z, heading], type 2 binary frames of 14 bytes a player.
+//   The relay keeps each player's last free-roam place: the place and heading of its newest pose
+//   with m 1 while its presence (Activity, below) is not "race" (no presence yet counts as free
+//   roam), and when that pose came. A player's poses with m 0 (net.js sends m 0 while the tab is
+//   hidden; the game sends 0 while it has no car: front end, safehouse, car lot, loading) do not
+//   move it. Every WHERE_MS each version-2 page gets every named player in the room (itself
+//   too) whose presence is not "race", that has such a place, not older than WHERE_KEEP_MS
+//   (CARBON_WHERE_KEEP seconds, default 600), and whose place is within WHERE2_LIMIT (32767 m)
+//   either way, as [id, x, z, heading, state]:
+//     state 1 driving: its newest pose has m 1, is at most ACTIVE_MS old, and its ts (the
+//             game's physics clock) moved within the last PAUSED_MS (2.5 s);
+//     state 2 paused: m 1 and fresh, but ts standing still for PAUSED_MS: the game is paused
+//             (its pause menu or world map, or the game's own pause when its window is not in
+//             front; net.js then sends the unchanged pose once a second);
+//     state 3 away: its newest pose has m 0 (the tab is hidden, or the player is out of the car
+//             in the front end, safehouse, car lot or a loading screen), or no pose for
+//             ACTIVE_MS, or its presence is "away".
+//   A player racing (presence "race") is left out: a race is not free roam (new pages leave
+//   racers off the map anyway). The heading and place are the last free-roam ones in each state.
+//   The feed goes while at least one player qualifies.
+//   JSON: {t:"where", p:[[id, x, z, heading, state], ...]}.
+//   WHERE2, relay -> page, 1 + 10 * count bytes: u8 4, then for each player u32 id, i16 x,
+//   i16 z (whole metres), u16 heading (degrees, bits 0-8) | state << 9 (bits 9-11; 12-15 zero).
+//   Type 4 is new, so a reader of type 2 never sees it; 10 bytes instead of 14 because many
+//   more players are listed (the Carbon world lies well within +-32767 m).
+//
 // Shared contacts (optional; legacy clients keep the original pose protocol):
 //   hi {physics:0|1} -> welcome {physics:1}; join/peers/pose include physics:1
 //   for capable players. {t:"physics",on:boolean} changes capability after the
@@ -200,24 +243,29 @@
 //   the page sends none and gets none. Pages that did not ask never get any.
 //   COPS, both ways, a binary frame of 10 + 38 * n bytes, little-endian:
 //     0  u8   3
-//     1  u8   n, cops in this frame: 0 to COPS_MAX (8); 0 = the chase is over
+//     1  u8   n, cops in this frame: 0 to COPS_MAX (16 since Step B, 2026-11-05: shared traffic; 8 before,
+//              and welcome {copsMax} says it, so a page sends no more than its relay passes); 0 = the chase is over
 //     2  u32  id: relay -> page, the chased player's relay id; page -> relay, 0 (not read)
 //     6  u32  ts, the sender's clock in ms (the clock of its poses)
 //     10 n x 38 bytes, one per cop:
-//        +0  u8   the cop's number, 1-255, different for each cop in the frame (it keeps it
-//                 while it stays in the chase)
-//        +1  u8   flags: bit 0 the light bar is on, bit 1 the cop is chasing, bits 4-7 the
-//                 game's siren state + 1 (0 = not known); passed on as they came
+//        +0  u8   the cop's number, 1-255, different for each cop in the frame (the game keeps it
+//                 for the car's whole life, sent or not: logs/traffic-stable-20261105)
+//        +1  u8   flags: bit 0 the light bar is on, bit 1 the cop is chasing, bit 2 the cop is
+//                 wrecked, bit 3 a traffic car (not a cop), bits 4-7 the game's siren state + 1
+//                 (0 = not known; a traffic car's bit 4: a truck's trailer); passed on as they came
 //        +2  u32  the cop car's model key
 //        +6  the cop car's 13 pose numbers as in a POSE frame from its offset 14 (4 x i16
 //            quaternion, 3 x i32 position mm, 3 x i16 speed cm/s, 3 x i16 spin 1/500 rad/s)
-//   A page sends one while its player is chased, up to about 15 a second, the nearest COPS_MAX
+//   A page sends one while its player is chased, up to about 18 a second, the nearest COPS_MAX
 //   cops, and one with n = 0 when the chase ends. The relay passes it on, with the sender's id
 //   written in, to the players that picked the sender (Interest) and asked for cops: each frame
 //   while the two cars are within MID_RANGE (700 m) or the receiver follows the sender, an
 //   n = 0 frame to all of them. A reader that falls behind gets only the newest unsent frame of
 //   each sender. A frame of another size, with a number 0 or used twice, or from a page that did
-//   not ask, is dropped. Limit: burst 10, then 20 a second. The relay keeps the newest frame's
+//   not ask, is dropped. So is one with a car farther than COPS_NEAR (500 m) from the sender's car
+//   (its newest pose, of any kind; a page with no pose yet may send only n = 0): a player sends only
+//   its own game's cars around itself (cops.h: within 400 m), never cars put by another player's.
+//   Limit: burst 10, then 20 a second. The relay keeps the newest frame's
 //   cops (number, model, place) to check hits against for COP_FRESH (1 s).
 //   {t:"cophit", to, c, seq, k, ts, s:[at(3), dv(3), dw(3)]}: this player's car hit cop c of
 //   player `to` (as shown here): where the cop car was (physics space, metres) and the change
@@ -373,9 +421,13 @@
 // No dependencies: a minimal WebSocket server (RFC 6455, unfragmented frames).
 // Regression checks (Node 22+): node --test tools/tests/carbon-net-relay.test.mjs
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+
+const blockedPlayerVehicles = new Set(JSON.parse(fs.readFileSync(
+  new URL("./carbon-player-vehicles.json", import.meta.url), "utf8")).blocked.map(v => v.key));
 
 const port = Number(process.argv[2] ?? 0);
 const host = process.argv[3] ?? "127.0.0.1";
@@ -385,12 +437,20 @@ function envInt(name, fallback, min, max) {
   return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
 }
 const MAX_ROOM = envInt("CARBON_ROOM_MAX", 256, 1, 10000);
+// Connections one internet address may hold across all rooms (0: no limit), so one machine
+// cannot fill rooms or the server. High on purpose: a phone network can put many real players
+// behind one address.
+const CLIENT_MAX = envInt("CARBON_CLIENT_MAX", 32, 0, 100000);
 // Interest (see the header).
 const INTEREST_K = envInt("CARBON_INTEREST_K", 24, 1, 1000);
 const INTEREST_MS = 500, WHERE_MS = 1000, FAR_MS = 250, MID_MS = 100;
 const CREW_RANGE = 1000, CREW_MAX = 16, FOLLOW_MAX = 8, ACKS_MAX = 8;
-const ACTIVE_MS = 5000, HOLD_MS = 5000, HELD = 0.25, KEPT = 0.5;
+const ACTIVE_MS = 5000, HOLD_MS = 5000, HELD = 0.25, KEPT = 0.5, KEEP_RANGE = 1000;
 const FULL_RANGE = 500, MID_RANGE = 700, TOP_SPEED = 100, FAR = 1e9, MAP_LIMIT = 1e6;
+// Where, version 2 (see the header): how long a free-roam place stays on the map, when a stopped
+// physics clock counts as paused, the place limit of the 16-bit layout, and the states.
+const WHERE_KEEP_MS = envInt("CARBON_WHERE_KEEP", 600, 0, 86400) * 1000, PAUSED_MS = 2500, WHERE2_LIMIT = 32767;
+const WHERE_DRIVING = 1, WHERE_PAUSED = 2, WHERE_AWAY = 3;
 const MAX_MESSAGE = 4096;
 // Bound unsent data per player. Keep only the newest unsent pose per car;
 // reliable messages retain their order. A permanently blocked reader is removed.
@@ -399,6 +459,7 @@ const HELLO_TIMEOUT = 10000, BLOCKED_TIMEOUT = 15000;
 const PING_INTERVAL = 15000, PONG_TIMEOUT = 10000;
 const KEY = process.env.CARBON_RELAY_KEY || "";
 const rooms = new Map(); // room name -> Set of peers
+const clients = new Map(); // limitKey -> connections it holds
 let nextId = 1;
 // Per player: a burst of `burst` messages, then `rate` a second.
 const LIMITS = { chat: { burst: 5, rate: 0.5 }, horn: { burst: 12, rate: 6 }, crew: { burst: 3, rate: 0.2 },
@@ -412,10 +473,11 @@ const LOOK_MAX = 2048;
 // speaks, CARBON_RELAY_BIN=0 for JSON only (as a relay from before it).
 const BIN = envInt("CARBON_RELAY_BIN", 1, 0, 1);
 const BIN_POSE = 1, BIN_WHERE = 2, POSE_BYTES = 46, ACK_BYTES = 8, WHERE_BYTES = 14;
+const BIN_WHERE2 = 4, WHERE2_BYTES = 10;
 // Driving (see the header): flags bit 3 = this many DRIVE bytes follow a pose's acks.
 const DRIVE_BIT = 8, DRIVE_BYTES = 8;
 // Police chases (see the header).
-const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COPS_MAX = 8, COP_FRESH = 1000, COP_REACH = 25;
+const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COPS_MAX = 16, COP_FRESH = 1000, COP_REACH = 25, COPS_NEAR = 500;
 // s[i] travels as a whole number of 1/SCALE[i], at most LIMIT[i] either way.
 const SCALE = [32767, 32767, 32767, 32767, 1000, 1000, 1000, 100, 100, 100, 500, 500, 500];
 const LIMIT = SCALE.map((_, i) => (i >= 4 && i < 7 ? 0x7fffffff : 0x7fff));
@@ -494,6 +556,26 @@ function others(peer, message) {
   for (const p of rooms.get(peer.room) ?? []) if (p !== peer && p.named) send(p, message);
 }
 
+// What a connection counts under for CARBON_CLIENT_MAX: a public IPv4 address, or an IPv6
+// address's /64 (one home holds a whole /64). Null for an internal address or anything else:
+// that may be a proxy standing in for every player, so such connections are never limited.
+function limitKey(address) {
+  let text = address.replace(/^::ffff:/i, "");
+  if (net.isIPv4(text)) {
+    const [a, b] = text.split(".").map(Number);
+    const internal = a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b < 128) || text === "255.255.255.255";
+    return internal ? null : text;
+  }
+  if (!net.isIPv6(text)) return null;
+  const [left, right = ""] = text.split("::");
+  const head = left ? left.split(":") : [], tail = right ? right.split(":") : [];
+  const all = text.includes("::") ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail] : head;
+  const s = all.map((h) => parseInt(h, 16));
+  if (s.every((n, i) => n === (i === 7 ? 1 : 0)) || s.every((n) => n === 0) || (s[0] & 0xfe00) === 0xfc00 || (s[0] & 0xffc0) === 0xfe80) return null;
+  return `${s.slice(0, 4).map((n) => n.toString(16)).join(":")}::/64`;
+}
+
 function leave(peer) {
   // The close frame and TCP close can both arrive; remove a peer only once.
   // Ignore further bytes on the half-closed socket after its room is gone.
@@ -503,6 +585,10 @@ function leave(peer) {
   peer.pendingBytes = 0;
   const room = rooms.get(peer.room);
   if (!room || !room.delete(peer)) return;
+  if (peer.client) {
+    const held = clients.get(peer.client) - 1;
+    if (held > 0) clients.set(peer.client, held); else clients.delete(peer.client);
+  }
   if (!room.size) rooms.delete(peer.room);
   for (const r of peer.audience.keys()) r.interest.delete(peer);
   for (const s of peer.interest.keys()) s.audience.delete(peer);
@@ -606,6 +692,16 @@ function whereBinary(p) {
   });
   return b;
 }
+// Version 2 (see the header): u32 id, i16 x, i16 z, u16 heading | state << 9.
+function where2Binary(p) {
+  const b = Buffer.alloc(1 + WHERE2_BYTES * p.length);
+  b[0] = BIN_WHERE2;
+  p.forEach(([id, x, z, h, st], j) => {
+    const at = 1 + WHERE2_BYTES * j;
+    b.writeUInt32LE(id, at); b.writeInt16LE(x, at + 4); b.writeInt16LE(z, at + 6); b.writeUInt16LE(h | (st << 9), at + 8);
+  });
+  return b;
+}
 function distance(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
 
 // ---- Interest: who gets whose car (see the header) ----
@@ -628,13 +724,16 @@ function active(p, now) {
 // How far c's car counts from r's: the nearer of the two cars 1 s and 4 s on at their
 // speeds. FAR when c is not driving now or r has never driven (r's last place stays
 // while it is in a menu: its picks do not change then).
-function apart(r, c, now) {
-  if (!r.at || !active(c, now)) return FAR;
-  const rv = active(r, now) ? r.vel : [0, 0, 0];
+// held: c is already picked by r, so a fresh pose of c that is not driving keeps c's last driving place
+// (standing) instead of FAR (see the header).
+function apart(r, c, now, held = false) {
+  const standing = held && !active(c, now) && !!c.pose && !!c.at && now - c.pose.at <= ACTIVE_MS;
+  if (!r.at || (!active(c, now) && !standing)) return FAR;
+  const rv = active(r, now) ? r.vel : [0, 0, 0], cv = standing ? [0, 0, 0] : c.vel;
   let best = FAR;
   for (const t of [1, 4]) {
-    const d = length3(r.at[0] + rv[0] * t - c.at[0] - c.vel[0] * t, r.at[1] + rv[1] * t - c.at[1] - c.vel[1] * t,
-                      r.at[2] + rv[2] * t - c.at[2] - c.vel[2] * t);
+    const d = length3(r.at[0] + rv[0] * t - c.at[0] - cv[0] * t, r.at[1] + rv[1] * t - c.at[1] - cv[1] * t,
+                      r.at[2] + rv[2] * t - c.at[2] - cv[2] * t);
     if (d < best) best = d; // NaN (from huge numbers) never is
   }
   return best;
@@ -664,8 +763,8 @@ function pick(r, now) {
   for (const c of room) {
     if (c === r || !c.named) continue;
     const since = r.interest.get(c);
-    let d = apart(r, c, now);
-    if (since !== undefined) d *= now - since < HOLD_MS ? HELD : KEPT;
+    let d = apart(r, c, now, since !== undefined);
+    if (since !== undefined && (d <= KEEP_RANGE || d >= FAR)) d *= now - since < HOLD_MS ? HELD : KEPT; // FAR: picked ones first
     const group = r.follow.has(c.id) ? 0 : r.crewKey && c.crewKey === r.crewKey && d <= CREW_RANGE ? 1 : 2;
     list.push({ c, group, d });
   }
@@ -734,19 +833,41 @@ function heading(s) {
   return ((h % 360) + 360) % 360;
 }
 
-// The map feed: every player driving now, to everyone in the room.
+// A player's state on the version-2 map (see the header), or 0: not listed.
+function whereState(x, now) {
+  const r = x.roam;
+  if (!x.named || !r || x.activity === "race" || now - r.at > WHERE_KEEP_MS) return 0;
+  if (x.activity === "away" || !active(x, now)) return WHERE_AWAY;
+  return now - r.moved > PAUSED_MS ? WHERE_PAUSED : WHERE_DRIVING;
+}
+
+// The map feed: every player driving now, to the pages from before; every player in free roam
+// with a state, to the pages that asked for version 2.
 function where(now) {
   for (const room of rooms.values()) {
-    const p = [];
+    const p = [], p2 = [];
+    let v2 = false;
     for (const x of room) {
+      if (x.named && x.where === 2) v2 = true;
       if (!x.named || !active(x, now)) continue;
       const px = Math.round(x.at[0]), pz = Math.round(x.at[2]);
       if (Math.abs(px) <= MAP_LIMIT && Math.abs(pz) <= MAP_LIMIT) p.push([x.id, px, pz, heading(x.pose.s)]);
     }
-    if (!p.length) continue;
-    let json = null, bin = null; // each kind made once, if a page here reads it
+    if (v2) for (const x of room) {
+      const st = whereState(x, now);
+      if (!st) continue;
+      const px = Math.round(x.roam.x), pz = Math.round(x.roam.z);
+      if (Math.abs(px) <= WHERE2_LIMIT && Math.abs(pz) <= WHERE2_LIMIT) p2.push([x.id, px, pz, x.roam.h, st]);
+    }
+    if (!p.length && !p2.length) continue;
+    let json = null, bin = null, json2 = null, bin2 = null; // each kind made once, if a page here reads it
     for (const x of room) {
-      if (x.named) write(x, x.bin ? (bin ??= frame(whereBinary(p), 2)) : (json ??= frame(JSON.stringify({ t: "where", p }))));
+      if (!x.named) continue;
+      if (x.where === 2) {
+        if (p2.length) write(x, x.bin ? (bin2 ??= frame(where2Binary(p2), 2)) : (json2 ??= frame(JSON.stringify({ t: "where", p: p2 }))));
+      } else if (p.length) {
+        write(x, x.bin ? (bin ??= frame(whereBinary(p), 2)) : (json ??= frame(JSON.stringify({ t: "where", p }))));
+      }
     }
   }
 }
@@ -775,12 +896,22 @@ function impact(peer, m) {
 // A player's new pose (JSON or binary): kept, and passed on to the players that get its car.
 // Its frames are made when first needed (poseFrame), one for every receiver of a kind.
 function posed(peer, pose) {
+  if (pose.m === 1 && blockedPlayerVehicles.has(pose.k)) {
+    disconnect(peer);
+    return;
+  }
   pose.at = Date.now();
   pose.physics = peer.physics;
   peer.pose = pose;
   if (pose.m === 1) {
     peer.at = [pose.s[4], pose.s[5], pose.s[6]];
     peer.vel = speed(pose.s);
+    // Its last free-roam place (Where, version 2): when its physics clock last moved, for paused.
+    if (peer.activity !== "race") {
+      const r = peer.roam;
+      peer.roam = { x: pose.s[4], z: pose.s[6], h: heading(pose.s), at: pose.at, ts: pose.ts,
+                    moved: !r || r.ts !== pose.ts ? pose.at : r.moved };
+    }
   }
   forward(peer, pose.at);
 }
@@ -814,9 +945,16 @@ function copsReach(s, r) {
   return r.follow.has(s.id) || !s.at || !r.at || length3(s.at[0] - r.at[0], s.at[1] - r.at[1], s.at[2] - r.at[2]) <= MID_RANGE;
 }
 
+// Whether every car of a cops frame is near the sender's own car (see the header): its newest
+// pose of any kind (a page in a background tab sends m = 0 poses, at its car's real place).
+function copsNear(peer, list) {
+  const at = peer.pose ? peer.pose.s.slice(4, 7) : peer.at;
+  return !list.length || (at && list.every((x) => distance(at, x.p) <= COPS_NEAR));
+}
+
 function copsFrame(peer, bytes) {
   const list = peer.cops ? readCops(bytes) : null;
-  if (!list || !allow(peer, "cops")) return;
+  if (!list || !copsNear(peer, list) || !allow(peer, "cops")) return;
   peer.chase = { at: Date.now(), list };
   const out = Buffer.from(bytes);
   out.writeUInt32LE(peer.id, 2);
@@ -886,7 +1024,16 @@ function streetMessage(peer, m) {
   send(target, { t: "street", id: peer.id, k: m.k, r: m.r, a: m.a, f: m.f });
 }
 
-function reservedAdmin(name) { return name.normalize("NFKC").toLowerCase().replace(/[4@]/g,"a").replace(/[1!]/g,"i").replace(/[^a-z0-9]/g, "").includes("admin"); }
+// The Latin letter a Cyrillic or Greek letter cannot be told from, case by case (moderation.rs).
+const LATIN_TWIN = new Map(Object.entries({A:"АΑ",B:"ВΒ",C:"СϹ",E:"ЕΕ",H:"НΗ",I:"ІΙӀ",J:"Ј",K:"КΚ",M:"МΜ",N:"Ν",O:"ОΟ",P:"РΡ",S:"Ѕ",T:"ТΤ",Y:"ΥҮ",X:"ХΧ",Z:"Ζ",
+  a:"аα",c:"сϲ",d:"ԁ",e:"е",h:"һ",i:"іιӏ",j:"ј",n:"ոη",o:"оο",p:"рρ",s:"ѕ",v:"ν",x:"хχ",y:"уγ"}).flatMap(([latin, twins]) => [...twins].map((t) => [t, latin])));
+function reservedAdmin(name) {
+  const low = name.toLowerCase();
+  if (low.includes("админ") || low.includes("адмін") || low.includes("αδμιν")) return true;
+  return [...name.normalize("NFKC")].map((c) => LATIN_TWIN.get(c) ?? c).join("").toLowerCase()
+    .replace(/[4@àáâãäåāăą]/g,"a").replace(/[ďđ]/g,"d").replace(/[1!|ìíîïīįı]/g,"i").replace(/[ñńņňп]/g,"n").replace(/м/g,"m")
+    .replace(/[^a-z0-9]/g, "").includes("admin");
+}
 const profanityWords = ["fuck", "fucks", "fucked", "fucker", "fuckers", "fucking", "motherfucker", "motherfuckers", "motherfucking", "shit", "shits", "shitty", "bullshit", "bitch", "bitches", "asshole", "assholes", "bastard", "bastards", "cunt", "cunts", "dick", "dicks", "cock", "cocks", "pussy", "pussies", "nigger", "niggers", "nigga", "niggas", "fag", "fags", "faggot", "faggots"];
 function profane(text) {
   const raw = Array.from(text.replace(/[\u200b-\u200d\ufeff]/g, "")).map(c => c >= "！" && c <= "～" ? String.fromCharCode(c.charCodeAt(0) - 0xfee0).toLowerCase() : c.toLowerCase());
@@ -916,8 +1063,10 @@ function handle(peer, text) {
     peer.cops = !!peer.bin && m.cops === 1;
     // Driving: controls inside compact poses, so only for a page that also got them.
     peer.drive = !!peer.bin && m.drive === 1;
-    send(peer, { t: "welcome", id: peer.id, whispers: 1, ...(m.rivals === 1 ? {rivals: 1} : {}), ...(m.physics === 0 || m.physics === 1 ? { physics: 1 } : {}),
-      ...(peer.bin ? { bin: peer.bin } : {}), ...(peer.cops ? { cops: 1 } : {}), ...(peer.drive ? { drive: 1 } : {}),
+    // Where, version 2: every player in free roam with a state (see the header).
+    peer.where = Number.isInteger(m.where) && m.where >= 2 ? 2 : 1;
+    send(peer, { t: "welcome", id: peer.id, whispers: 1, ...(peer.where === 2 ? { where: 2 } : {}), ...(m.rivals === 1 ? {rivals: 1} : {}), ...(m.physics === 0 || m.physics === 1 ? { physics: 1 } : {}),
+      ...(peer.bin ? { bin: peer.bin } : {}), ...(peer.cops ? { cops: 1, copsMax: COPS_MAX } : {}), ...(peer.drive ? { drive: 1 } : {}),
       peers: [...rooms.get(peer.room)].filter((p) => p !== peer && p.named).map(identity) });
     if (peer.closed) return;
     peer.named = true;
@@ -1016,6 +1165,8 @@ function handle(peer, text) {
              Buffer.byteLength(text) <= RACE_MAX && allow(peer, "race")) {
     // The lobby, start, progress and finish of a race together: to everyone here, the sender too.
     const { t, id, ...rest } = m;
+    // Its presence (Activity), for the map feed: whether it is racing, in free roam or away.
+    if (m.k === "presence" && m.v === 1 && ["roam", "race", "away"].includes(m.a)) peer.activity = m.a;
     const out = { t: "race", id: peer.id, ...rest };
     send(peer, out);
     others(peer, out);
@@ -1260,6 +1411,9 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
   if (!key || (rooms.get(room)?.size ?? 0) >= MAX_ROOM) { socket.destroy(); return; }
+  const client = limitKey(savesClient(req));
+  if (client && CLIENT_MAX > 0 && (clients.get(client) ?? 0) >= CLIENT_MAX) { socket.destroy(); return; }
+  if (client) clients.set(client, (clients.get(client) ?? 0) + 1);
   const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
                `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -1267,10 +1421,10 @@ server.on("upgrade", (req, socket, head) => {
   const now = performance.now();
   // interest: the players whose cars this one gets -> since when; audience: the players
   // that get this one's car -> {sent, owed: ms a held-back pose waits for} (see forward); at, vel: from its newest driving pose.
-  const peer = { id: nextId++, socket, room, name: "Player", crew: "", crewKey: "", named: false, closed: false, buckets: {},
+  const peer = { id: nextId++, socket, room, client, name: "Player", crew: "", crewKey: "", named: false, closed: false, buckets: {},
     pending: new Map(), pendingBytes: 0, blockedAt: null, joinedAt: now, lastPing: now, ping: null,
     physics: false, bin: 0, pose: null, impactSeq: 0, receipts: new Map(), look: null, lights: 0, cops: false, drive: false, chase: null, copHitSeq: 0,
-    at: null, vel: null, interest: new Map(), audience: new Map(), follow: new Set(), hornTo: new Set() };
+    at: null, vel: null, where: 1, activity: "", roam: null, interest: new Map(), audience: new Map(), follow: new Set(), hornTo: new Set() };
   if (!rooms.has(room)) rooms.set(room, new Set());
   rooms.get(room).add(peer);
   let buf = Buffer.alloc(0);

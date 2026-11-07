@@ -166,10 +166,14 @@ typedef struct {
   uint32_t seq, where, garage, garage_max, autosave, count;
   uint32_t performance, visuals, bmw; /* +0x34/+0x38 shops, +0x3c custom BMW boost */
   RwBoss boss[RW_MAX];
+  uint32_t cars, cars_ready; /* +0x1c0 toggle, +0x1c4 capability (CAR1) */
+  uint32_t cash_ready; /* +0x1c8 capability (CSH1); want == RW_MAX sets cash */
+  uint32_t trucks_ready; /* +0x1cc capability (TRK1); want 7/8 = fire/dump truck */
 } RwShared;
 _Static_assert(sizeof(RwBoss) == 0x40 && offsetof(RwShared, seq) == 0x1c &&
                    offsetof(RwShared, count) == 0x30 &&
-                   offsetof(RwShared, boss) == 0x40,
+                   offsetof(RwShared, boss) == 0x40 &&
+                   offsetof(RwShared, cars) == 0x1c0,
                "RwShared layout");
 
 static uint32_t g_rw_block;
@@ -536,8 +540,17 @@ static void rw_service(const PopModApi *api, pop_cpu_v1 *cpu,
     return;
   const uint32_t want = __atomic_load_n(&sh->want, __ATOMIC_ACQUIRE);
   uint32_t result = RW_R_NOT_NOW;
-  if (sh->where == RW_W_SAFE && db)
-    result = (int)want < n ? rw_award(db, career, &bosses[want]) : RW_R_NOT_DUE;
+  if (sh->where == RW_W_SAFE && db) {
+    if (want == RW_MAX) {
+      /* SetCash only: do not count this as earned money or award reward cards.
+       * 004a0960 writes UserProfile + 0x24330; purchases use normal saving. */
+      const uint32_t cash = 999999999u;
+      rw_call(0x004a0960u, 0, &cash, 1);
+      result = get_u32(db - RW_CAR_DB + 0x24330u) == cash ? RW_R_OK : RW_R_FAILED;
+    } else {
+      result = want < (uint32_t)n ? rw_award(db, career, &bosses[want]) : RW_R_NOT_DUE;
+    }
+  }
   if (result == RW_R_OK)
     rw_status(sh, &db, career, bosses);
   sh->result = result;
@@ -577,18 +590,41 @@ static void rw_visuals(const PopModApi *api, pop_cpu_v1 *cpu,
 /* Car Select (008627c0) reads DAL 0x1b5b via 004b3250, which calls
  * 004b1240(handle). The ordinary unlock rule hides the opening BMW even after
  * the pink-slip award. Preserve that rule except for an owned career copy of
- * this exact preset on a local page. No unlock flags are written to the save. */
+ * this exact preset on a local page, or the explicit local car unlock toggle.
+ * This is the car-handle check only: the generic 004b0aa0 check also serves
+ * parts and must not be overridden. No unlock flags are written to the save. */
+static int player_vehicle_record_blocked(uint32_t handle) {
+  if (handle == 0xffffffffu) return 0;
+  const uint32_t profile = rw_profile();
+  if (!profile) return 0;
+  const uint32_t db = profile + RW_CAR_DB;
+  for (uint32_t i = 0; i < RW_CARS; ++i) {
+    const uint32_t car = db + 0x14u * i;
+    if (get_u32(car) == handle)
+      return player_vehicle_blocked(get_u32(car + 8));
+  }
+  return 0;
+}
+
 static void rw_bmw_available(const PopModApi *api, pop_cpu_v1 *cpu,
                              PopHookInvocation *inv, void *user) {
   (void)inv;
   (void)user;
   const uint32_t handle = get_u32(cpu->esp + 4);
+  if (player_vehicle_record_blocked(handle)) {
+    cpu->eax = 0;
+    return;
+  }
   api->call_original(api, cpu->target, cpu);
   RwShared *sh = rw_shared();
   if ((cpu->eax & 0xffu) || !sh ||
       __atomic_load_n(&sh->local, __ATOMIC_ACQUIRE) != RW_LOCAL ||
       handle == 0xffffffffu)
     return;
+  if (__atomic_load_n(&sh->cars, __ATOMIC_ACQUIRE) == 1) {
+    cpu->eax = (cpu->eax & 0xffffff00u) | 1u;
+    return;
+  }
   const uint32_t profile = rw_profile();
   if (!profile)
     return;
@@ -626,6 +662,8 @@ static void rewards_install(void) {
     log_line("core.nfsc: missed boss cars unavailable");
     return;
   }
+  sh->cash_ready = 0x31485343u; /* CSH1: serviced by rw_service above */
+  sh->trucks_ready = 0; /* Truck grants are permanently disabled. */
   if (g_api->hook_install(g_api, 0x004b0d50u, rw_performance, POP_HOOK_AFTER,
                           NULL, &g_rw_hooks[1]) != POP_OK)
     log_line("core.nfsc: performance shop unlock unavailable");
@@ -633,7 +671,9 @@ static void rewards_install(void) {
     sh->version = 2;
   if (g_api->hook_install(g_api, 0x004b1240u, rw_bmw_available,
                           POP_HOOK_REPLACE, NULL, &g_rw_hooks[2]) != POP_OK)
-    log_line("core.nfsc: opening BMW availability unavailable");
+    log_line("core.nfsc: car availability unavailable");
+  else
+    sh->cars_ready = 0x31524143u; /* CAR1; keeps older runtimes' menus hidden */
   const PopModStatus parts = g_api->hook_install(
       g_api, 0x004b0b70u, rw_visuals, POP_HOOK_AFTER, NULL, &g_rw_hooks[3]);
   const PopModStatus paints = g_api->hook_install(

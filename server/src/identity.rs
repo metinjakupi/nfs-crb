@@ -85,7 +85,7 @@ pub struct Claims {
 }
 
 fn canonical(name: &str) -> String {
-    clean_name(name).to_ascii_lowercase()
+    clean_name(&crate::moderation::without_lookalikes(name)).to_ascii_lowercase()
 }
 
 fn valid_token(token: &str) -> bool {
@@ -129,6 +129,17 @@ impl Claims {
     pub fn verified_owner(&self, name: &str, owner: &Owner) -> bool {
         if crate::moderation::reserved(name) { return self.admin_alias(name, Some(owner)); }
         self.names.get(&canonical(name)).is_some_and(|c| &c.owner == owner)
+    }
+
+    /// An owner from CARBON_ADMIN_OWNERS (the public leaderboards' admin API).
+    pub fn is_admin_owner(&self, owner: &Owner) -> bool {
+        self.admins.contains(owner)
+    }
+
+    /// The name is explicitly claimed (the "Admin" alias counts when an admin is configured):
+    /// only such names appear on the public leaderboards.
+    pub fn is_claimed(&self, name: &str) -> bool {
+        self.claimed_owner(name).is_some()
     }
 
     pub fn claimed_owner(&self, name: &str) -> Option<(Owner, String)> {
@@ -484,6 +495,8 @@ mod tests {
         assert_eq!(claims.claim("Admin", &owner, "", 1), Ok("Admin".into()));
         assert!(claims.verified_owner("Admin", &owner));
         assert!(!claims.verified_owner("FakeAdmin", &owner));
+        assert_eq!(canonical("\u{41c}\u{435}tin"), canonical("Metin"), "a lookalike lands on the real claim");
+        assert_ne!(canonical("\u{418}\u{432}\u{430}\u{43d}"), canonical("bah"), "a real Cyrillic name does not");
         assert!(!claims.may_use("Admin", Some(&other), None));
     }
 

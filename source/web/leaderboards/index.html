@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leaderboards · NFS Carbon Browser</title>
+<meta name="description" content="Fastest times, best laps, drift scores, wins and win streaks from players of NFS Carbon in the browser: the game's own online leaderboard and verified online races.">
+<style>
+@font-face { font-family:"Saira"; font-display:swap; src:url("fonts/Saira.woff2") format("woff2"); }
+@font-face { font-family:"Saira Condensed"; font-weight:500; font-display:swap; src:url("fonts/SairaCondensed-500.woff2") format("woff2"); }
+@font-face { font-family:"Saira Condensed"; font-weight:600; font-display:swap; src:url("fonts/SairaCondensed-600.woff2") format("woff2"); }
+@font-face { font-family:"Saira Condensed"; font-weight:700 900; font-display:swap; src:url("fonts/SairaCondensed-700.woff2") format("woff2"); }
+:root {
+  --body:"Saira","Segoe UI",system-ui,sans-serif; --cond:"Saira Condensed","Arial Narrow",system-ui,sans-serif;
+  --cyan:#3fe0e8; --ink:#f2f7fa; --soft:#9fb3bf; --bg:#05080b; --row:#0d1419; --row2:#111a20; --line:rgba(255,255,255,.07);
+  --red:#e8213a; --purple:#b04dff; --green:#2ee88a; --gold:#ffcf3f; --silver:#cfd8de; --bronze:#d8894a;
+  --pad:clamp(16px,4vw,56px);
+}
+* { box-sizing:border-box; }
+[hidden] { display:none !important; }
+html { background:var(--bg); }
+body { margin:0; color:var(--ink); font:15px/1.45 var(--body); min-height:100vh;
+  background:
+    repeating-linear-gradient(45deg, rgba(255,255,255,.018) 0 2px, transparent 2px 6px),
+    radial-gradient(1000px 500px at 85% -10%, rgba(232,33,58,.16), transparent 60%),
+    radial-gradient(900px 500px at 0% 0%, rgba(63,224,232,.10), transparent 60%), var(--bg); }
+a { color:var(--cyan); }
+/* Broadcast header */
+.top { display:flex; align-items:center; gap:14px; padding:14px var(--pad); border-bottom:1px solid var(--line); background:rgba(0,0,0,.35); }
+.top a.home { font:600 13px var(--cond); letter-spacing:.2em; text-transform:uppercase; text-decoration:none; color:var(--soft); }
+.top a.home:hover { color:var(--ink); }
+.top .live { margin-left:auto; display:flex; align-items:center; gap:8px; font:600 12px var(--cond); letter-spacing:.18em; color:var(--soft); text-transform:uppercase; }
+.top .live i { width:8px; height:8px; border-radius:50%; background:var(--red); box-shadow:0 0 10px var(--red); }
+.hero { padding:30px var(--pad) 18px; position:relative; }
+.flag { position:absolute; right:var(--pad); top:26px; width:min(260px,32vw); height:64px; opacity:.16;
+  background:conic-gradient(#fff 25%, #000 0 50%, #fff 0 75%, #000 0) 0 0/16px 16px; transform:skewX(-14deg);
+  -webkit-mask:linear-gradient(90deg, transparent, #000 60%); mask:linear-gradient(90deg, transparent, #000 60%); }
+.hero p.k { margin:0; font:700 13px var(--cond); letter-spacing:.32em; color:var(--red); text-transform:uppercase; }
+.hero h1 { margin:4px 0 6px; font:italic 900 clamp(44px,8vw,96px)/.9 var(--cond); text-transform:uppercase; letter-spacing:.01em; }
+.hero h1 span { color:var(--cyan); }
+.hero .lead { margin:0; color:var(--soft); max-width:62ch; }
+/* Category strip */
+.cats { display:flex; gap:4px; padding:0 var(--pad); overflow-x:auto; border-bottom:1px solid var(--line); }
+.cats button { all:unset; cursor:pointer; white-space:nowrap; font:italic 800 17px var(--cond); text-transform:uppercase; letter-spacing:.04em;
+  padding:12px 18px; color:var(--soft); transform:skewX(-14deg); border-bottom:3px solid transparent; }
+.cats button > span { display:inline-block; transform:skewX(14deg); }
+.cats button[aria-selected="true"] { color:#fff; background:linear-gradient(180deg, transparent, rgba(232,33,58,.25)); border-color:var(--red); }
+.cats button:focus-visible, .ev:focus-visible, .seg button:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+/* Layout */
+.grid { display:grid; grid-template-columns:minmax(220px,290px) minmax(0,1fr); gap:22px; padding:22px var(--pad) 56px; }
+@media (max-width:860px) { .grid { grid-template-columns:1fr; } }
+.side h2 { margin:0 0 10px; font:700 12px var(--cond); letter-spacing:.26em; color:var(--soft); text-transform:uppercase; }
+.side input { width:100%; margin-bottom:10px; background:var(--row); border:1px solid var(--line); color:var(--ink); padding:9px 11px; font:15px var(--body); }
+.evs { display:flex; flex-direction:column; gap:4px; max-height:72vh; overflow:auto; }
+@media (max-width:860px) { .evs { max-height:46vh; } }
+.grp { margin:12px 0 2px; font:700 11px var(--cond); letter-spacing:.24em; text-transform:uppercase; color:var(--red); }
+.grp:first-child { margin-top:0; }
+.ev { all:unset; cursor:pointer; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px; background:var(--row); padding:8px 12px; border-left:3px solid transparent; }
+.ev[aria-pressed="true"] { border-left-color:var(--red); background:linear-gradient(90deg, rgba(232,33,58,.18), var(--row)); }
+.ev .t { display:block; font:italic 800 17px/1.15 var(--cond); text-transform:uppercase; letter-spacing:.02em; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ev .m { display:block; font:600 12px var(--cond); letter-spacing:.06em; color:var(--soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ev .m code { font:500 11px ui-monospace,Menlo,monospace; color:var(--cyan); opacity:.8; }
+.ev .n { font:600 12px var(--cond); color:var(--soft); }
+/* Tower */
+.head { display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom:12px; }
+.title { display:flex; align-items:stretch; }
+.title .tag { background:var(--red); color:#fff; font:italic 900 15px var(--cond); letter-spacing:.12em; text-transform:uppercase; padding:6px 14px; transform:skewX(-14deg); display:flex; align-items:center; }
+.title .tag span { transform:skewX(14deg); }
+.title h3 { margin:0; padding:2px 14px; font:italic 900 clamp(26px,4vw,40px)/1.1 var(--cond); text-transform:uppercase; }
+.sub { color:var(--soft); font-size:13px; margin:6px 0 0; }
+.sub code { font:12px ui-monospace,Menlo,monospace; color:var(--cyan); }
+.seg { display:flex; transform:skewX(-14deg); border:1px solid rgba(255,255,255,.18); }
+.seg button { all:unset; cursor:pointer; padding:7px 16px; font:700 13px var(--cond); letter-spacing:.14em; text-transform:uppercase; color:var(--soft); }
+.seg button span { display:inline-block; transform:skewX(14deg); }
+.seg button[aria-pressed="true"] { background:#fff; color:#000; }
+.seg button[disabled] { opacity:.35; cursor:default; }
+.tower { display:flex; flex-direction:column; gap:3px; }
+.r { display:grid; grid-template-columns:54px 6px minmax(0,1.4fr) minmax(0,1.2fr) 112px 92px; align-items:center; min-height:44px; background:var(--row); }
+.r:nth-child(even) { background:var(--row2); }
+.r.hdr { background:transparent; min-height:28px; font:700 11px var(--cond); letter-spacing:.2em; color:var(--soft); text-transform:uppercase; }
+.r.hdr > * { padding:0 12px; }
+.pos { height:100%; display:flex; align-items:center; justify-content:center; font:italic 900 22px var(--cond); background:#fff; color:#000; clip-path:polygon(0 0,100% 0,82% 100%,0 100%); }
+.r.p1 .pos { background:var(--gold); } .r.p2 .pos { background:var(--silver); } .r.p3 .pos { background:var(--bronze); }
+.r.hdr .pos { background:none; color:var(--soft); clip-path:none; font:700 11px var(--cond); }
+.bar { height:60%; background:var(--c); }
+.nm { padding:0 12px; font:italic 800 19px var(--cond); text-transform:uppercase; letter-spacing:.03em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.car { padding:0 12px; color:var(--soft); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tm { padding:0 12px; font:700 20px var(--cond); letter-spacing:.03em; text-align:right; font-variant-numeric:tabular-nums; }
+.gap { padding:0 12px; font:600 15px var(--cond); color:var(--soft); text-align:right; font-variant-numeric:tabular-nums; }
+.r.p1 .tm { color:var(--purple); }
+.r.p1 .gap { color:var(--purple); font-weight:800; letter-spacing:.1em; }
+.r.me { outline:2px solid var(--cyan); outline-offset:-2px; }
+@media (max-width:640px) { .r { grid-template-columns:44px 5px minmax(0,1fr) 96px; } .r .car, .r .gap { display:none; } .tm { font-size:18px; } }
+.more { all:unset; cursor:pointer; margin-top:10px; font:700 13px var(--cond); letter-spacing:.18em; text-transform:uppercase; color:var(--cyan); }
+.foot { margin-top:16px; color:var(--soft); font-size:12px; display:flex; flex-wrap:wrap; gap:6px 18px; justify-content:space-between; }
+.empty { padding:26px; background:var(--row); color:var(--soft); text-align:center; }
+/* Source switch: the game's own leaderboard or verified online races */
+.src { display:flex; flex-wrap:wrap; align-items:center; gap:10px 18px; margin-top:18px; }
+.src .seg button { padding:9px 20px; font-size:14px; }
+.src .seg button .c { margin-left:8px; font-weight:600; opacity:.6; }
+.srcnote { margin:0; max-width:70ch; color:var(--soft); font-size:13px; border-left:3px solid var(--cyan); padding:2px 0 2px 10px; }
+.srcnote b { color:var(--ink); font-weight:600; }
+.title .tag.ingame { background:var(--cyan); color:#000; }
+.car small { display:block; font:600 12px var(--cond); letter-spacing:.04em; color:var(--soft); opacity:.85; }
+</style>
+</head>
+<body>
+<div class="top">
+  <a class="home" href="/">← NFS Carbon · Browser</a>
+  <span class="live"><i></i><span class="made">Loading…</span></span>
+</div>
+<section class="hero">
+  <div class="flag" aria-hidden="true"></div>
+  <p class="k">Online records</p>
+  <h1>Leader<span>boards</span></h1>
+  <p class="lead">The fastest players on nfscrb.xyz: race times, best laps, drift and speedtrap scores, wins and win streaks. Find your name to see where you stand.</p>
+  <div class="src">
+    <div class="seg" role="group" aria-label="Which leaderboard">
+      <button data-g="ingame"><span>In-game<span class="c"></span></span></button><button data-g="race"><span>Verified<span class="c"></span></span></button>
+    </div>
+    <p class="srcnote"></p>
+  </div>
+</section>
+<nav class="cats" role="tablist"></nav>
+<div class="grid">
+  <aside class="side">
+    <h2 class="side-title">Events</h2>
+    <input class="find" type="search" placeholder="Find a player…" aria-label="Find a player">
+    <div class="evs"></div>
+  </aside>
+  <section>
+    <div class="head">
+      <div><div class="title"><div class="tag"><span class="kind"></span></div><h3 class="evname"></h3></div><p class="sub"></p></div>
+      <div class="seg" role="group" aria-label="Time period">
+        <button data-p="day"><span>Today</span></button><button data-p="week"><span>This week</span></button><button data-p="all"><span>All time</span></button>
+      </div>
+    </div>
+    <div class="tower"></div>
+    <button class="more" hidden>Show top 100</button>
+    <div class="foot"><span class="count"></span><span class="note"></span></div>
+  </section>
+</div>
+<script>
+// Two groups of boards from the game server's GET /leaderboard (server/src/leaderboard.rs):
+// "ingame" (?source=ingame): exactly what the game's own Statistics -> Leaderboard and Online
+// Player Stats show, as the players' games recorded it; "race" (the plain answer): verified online
+// races, counted only when the other racers' games confirm them, for claimed names.
+const GROUPS_OF = {
+  ingame: {
+    label: "In-game",
+    note: "<b>In-game leaderboard</b>: as recorded by the game's online leaderboard (Statistics → Leaderboard in the game), for every name. These are the players' own games' records, career races included; nobody else checked them.",
+    foot: "As recorded by the game's online leaderboard. Names banned from the boards are left out.",
+    empty: "No in-game leaderboard entries from the server yet.",
+    cats: [
+      { id: "race", label: "Race times", test: (b) => b.family === "Evt_Bst" && b.low },
+      { id: "lap", label: "Best laps", test: (b) => b.family === "Evt_Bst_Lap" },
+      { id: "score", label: "Drift & speedtrap", test: (b) => b.family === "Evt_Bst" && !b.low },
+      { id: "wins", label: "Event wins", test: (b) => b.family === "Evt_Wins" },
+      { id: "games", label: "Races per event", test: (b) => b.family === "Total_Rnkd_Evt_Games" },
+      { id: "online", label: "Online records", test: (b) => b.family === "Overall_Solo_On_Wins" || b.family === "Best_Online_Win_Streak" },
+    ],
+  },
+  race: {
+    label: "Verified",
+    note: "<b>Verified</b>: online races only, counted when the other racers' games confirm the result, for claimed names. A record far ahead of the rest waits for review.",
+    foot: "Only online races the other racers' games confirmed, for claimed names. A record far ahead of the rest waits for review.",
+    empty: "Records start today — race online with Race Together or Custom Match to get on the board. Times count when the other racers' games confirm them.",
+    cats: [
+      { id: "race", label: "Race times", test: (b) => b.family === "Evt_Bst" },
+      { id: "lap", label: "Best laps", test: (b) => b.family === "Evt_Bst_Lap" },
+      { id: "canyon", label: "Canyon Duel", test: (b) => b.family === "CD_Best_Score" },
+      { id: "drift", label: "Drift", test: (b) => b.family === "Best_Drift_Combo" || b.family === "Best_Drift_Lap" },
+      { id: "pursuit", label: "Pursuit", test: (b) => b.family === "PK_Best_Cop_Score" || b.family === "PT_Most_Busts" },
+      { id: "online", label: "Online records", test: (b) => b.family === "Overall_Solo_On_Wins" || b.family === "Best_Online_Win_Streak" },
+    ],
+  },
+};
+// Event names, types and groups come from the game data (names.json, tools/carbon-leaderboard-names.py): the
+// name is the track name the game shows for the event; the race id ("mu.1.1") is kept small for reference.
+const GROUPS = ["Career · San Juan", "Career · Kempton", "Career · Downtown", "Career · Fortuna", "Career · Silverton",
+  "Challenge Series", "Collector's Edition", "Quick Race", "Other (story, boss, demo or test)"];
+const PERIODS = ["day", "week", "all"];
+const store = { ingame: null, race: null }, loaded = { ingame: 0, race: 0 };
+let group = null, data = null, cat = "race", board = null, period = "week", me = "", full = false;
+try { me = (localStorage.getItem("nfsc.lbName") || "").toLowerCase(); } catch {}
+const $ = (s) => document.querySelector(s);
+const el = (t, c, x) => { const e = document.createElement(t); if (c) e.className = c; if (x != null) e.textContent = x; return e; };
+const colour = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return `hsl(${h % 360} 80% 55%)`; };
+const clock = (v) => { const m = Math.floor(v / 60), s = v - m * 60; return `${m}:${s.toFixed(3).padStart(6, "0")}`; };
+function fmt(v, unit) {
+  if (unit === "time") return clock(v);
+  if (unit === "speed") return v.toLocaleString("en", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  return Math.round(v).toLocaleString("en");
+}
+function gap(v, lead, unit) {
+  if (unit === "time") return `+${(v - lead).toFixed(3)}`;
+  if (unit === "speed") return `−${(lead - v).toFixed(1)}`;
+  return `−${Math.round(lead - v).toLocaleString("en")}`;
+}
+const mph = (ms) => `${(ms * 2.236936).toFixed(1)} mph`;
+// The two numbers the game's board shows with an in-game best time (server rows elements 4 and 5): a
+// circuit's best lap and top speed, a sprint's top speed (m/s; the game shows MPH). Other race types: none.
+function extra(b, r) {
+  if (r[4] == null || b.family !== "Evt_Bst" || !b.low) return "";
+  if (b.type === "Circuit" || b.type === "Race Wars") return [r[4] > 0 ? `lap ${clock(r[4])}` : "", r[5] > 0 ? mph(r[5]) : ""].filter(Boolean).join(" · ");
+  if (b.type === "Sprint") return r[4] > 0 ? mph(r[4]) : "";
+  return "";
+}
+function label(b) { return b.race ? b.name || b.race : b.title; }
+function meta(b) { return [b.type, b.laps ? `${b.laps} ${b.laps === 1 ? "lap" : "laps"}` : null, b.race && b.name ? null : b.race && "unnamed event"].filter(Boolean).join(" · "); }
+const gi = (b) => (b.group ? (GROUPS.indexOf(b.group) + 1 || GROUPS.length) : 0);
+const cats = () => GROUPS_OF[group].cats;
+// grouped by area, then the busiest boards first; one event's circuits next to each other by lap count
+function boards() {
+  const test = cats().find((c) => c.id === cat).test;
+  const list = data.boards.filter(test), most = {};
+  for (const b of list) most[b.race || b.id] = Math.max(most[b.race || b.id] || 0, b.players);
+  const fam = (b) => ["Overall_Solo_On_Wins", "Best_Online_Win_Streak"].indexOf(b.family);
+  return list.sort((a, b) => gi(a) - gi(b) || most[b.race || b.id] - most[a.race || a.id] || String(a.race).localeCompare(String(b.race)) || (a.laps || 0) - (b.laps || 0) || fam(a) - fam(b));
+}
+function draw() {
+  document.querySelectorAll(".src .seg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.g === group)));
+  $(".srcnote").innerHTML = GROUPS_OF[group].note;
+  $(".note").textContent = GROUPS_OF[group].foot;
+  tabs();
+  if (!data || !data.boards.length) {
+    $(".tower").replaceChildren(el("div", "empty", data ? GROUPS_OF[group].empty : "Loading…"));
+    $(".evs").replaceChildren(); $(".side-title").textContent = "Events"; $(".kind").textContent = ""; $(".evname").textContent = "";
+    $(".sub").replaceChildren(); $(".count").textContent = ""; $(".more").hidden = true; $(".kind").parentElement.hidden = true;
+    $(".head .seg").hidden = true;
+    return;
+  }
+  $(".kind").parentElement.hidden = false; $(".head .seg").hidden = false;
+  if (!cats().some((c) => c.id === cat && data.boards.some(c.test))) cat = cats().find((c) => data.boards.some(c.test)).id;
+  const list = boards();
+  // first the busiest sprint or circuit (the events raced online), else the busiest board
+  const busiest = (l) => l.reduce((m, b) => (!m || b.players > m.players ? b : m), null);
+  if (!board || !list.includes(board)) board = busiest(list.filter((b) => b.type === "Sprint" || b.type === "Circuit")) || list.find((b) => b.players === busiest(list).players);
+  const q = $(".find").value.trim().toLowerCase();
+  document.querySelectorAll(".cats button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.c === cat)));
+  $(".side-title").textContent = `${list.length} ${list.length === 1 ? "board" : "boards"}`;
+  const evs = $(".evs"); evs.replaceChildren();
+  const grouped = list.some((b) => b.group); let last;
+  for (const b of list) {
+    const has = !q || b.all.some((r) => r[0].toLowerCase().includes(q));
+    if (!has) continue;
+    const g = b.group || "Overall";
+    if (grouped && g !== last) { evs.append(el("div", "grp", g)); last = g; }
+    const e = el("button", "ev"); e.setAttribute("aria-pressed", String(b === board));
+    const txt = el("span"), m = el("span", "m", meta(b) ? `${meta(b)} · ` : "");
+    if (b.race) m.append(el("code", null, b.race)); else m.textContent = b.title;
+    txt.append(el("span", "t", label(b)), m);
+    e.append(txt, el("span", "n", `${b.players}`));
+    e.title = `${label(b)}${b.type ? ` · ${b.type}` : ""}${b.group ? ` · ${b.group}` : ""} · ${b.title} · ${b.players} players${b.race ? ` · race id ${b.race}` : ""}`;
+    e.onclick = () => { board = b; full = false; draw(); }; evs.append(e);
+  }
+  // the periods this board has: Today only on in-game boards; an empty period falls back to a longer one
+  const has = (p) => (board[p] || []).length > 0;
+  if (!has(period)) period = PERIODS.slice(PERIODS.indexOf(period) + 1).find(has) || "all";
+  document.querySelectorAll(".head .seg button").forEach((b) => {
+    const p = b.dataset.p; b.hidden = p === "day" && !board.day; b.setAttribute("aria-pressed", String(p === period)); b.disabled = !has(p);
+  });
+  const tag = $(".kind"); tag.textContent = board.title; tag.parentElement.classList.toggle("ingame", board.source === "ingame");
+  $(".evname").textContent = board.race ? label(board) : cats().find((c) => c.id === cat).label;
+  const sub = $(".sub"); sub.replaceChildren();
+  sub.append([board.type, board.group].filter(Boolean).join(" · ") + (board.type || board.group ? " · " : ""));
+  const when = { day: "today (resets 00:00 UTC)", week: "this week (resets Monday 00:00 UTC)", all: "all time" }[period];
+  sub.append(`${when} · ${board.low ? "lowest wins" : board.unit === "count" ? "most first" : "highest wins"}`);
+  if (board.source === "ingame" && board.family === "Evt_Bst" && (board.type === "Circuit" || board.type === "Race Wars")) sub.append(" · one best per event, whatever the lap count (the game keeps no lap count)");
+  if (board.race) { sub.append(" · race id "); sub.append(el("code", null, board.race)); }
+  const rows = board[period], shown = full ? rows : rows.slice(0, 20), tower = $(".tower"); tower.replaceChildren();
+  const hdr = el("div", "r hdr"), what = board.unit === "time" ? "Time" : board.unit === "count" ? (board.family === "Best_Online_Win_Streak" ? "Streak" : board.family === "Total_Rnkd_Evt_Games" ? "Races" : "Wins") : "Score";
+  hdr.append(el("span", "pos", "Pos"), el("span"), el("span", null, "Player"), el("span", "car", "Car"), el("span", "tm", what), el("span", "gap", "Gap"));
+  tower.append(hdr);
+  if (!rows.length) tower.append(el("div", "empty", "No entries in this period yet."));
+  shown.forEach((r, i) => {
+    const row = el("div", `r${i < 3 ? ` p${i + 1}` : ""}${me && r[0].toLowerCase() === me ? " me" : ""}`);
+    const bar = el("span", "bar"); bar.style.setProperty("--c", colour(r[2] || r[0]));
+    const car = el("span", "car", r[2] || "—"), more = extra(board, r);
+    if (more) car.append(el("small", null, more));
+    row.append(el("span", "pos", String(i + 1)), bar, el("span", "nm", r[0]), car, el("span", "tm", fmt(r[1], board.unit)),
+      el("span", "gap", i ? gap(r[1], rows[0][1], board.unit) : (board.unit === "time" ? "FASTEST" : "LEADER")));
+    tower.append(row);
+  });
+  // the plain answer has the top 20 of each period: 20 rows may be more on the server
+  const cut = !board.full && rows.length >= 20;
+  $(".more").hidden = full || (board.full ? rows.length <= 20 : !cut);
+  $(".count").textContent = `${cut ? `top ${rows.length} shown` : `${rows.length} ${rows.length === 1 ? "entry" : "entries"}${rows.length >= 100 ? " (top 100)" : ""}`} · ${board.players} players all time`;
+}
+function tabs() {
+  const n = $(".cats"); n.replaceChildren();
+  if (!data) return;
+  for (const c of cats()) {
+    if (!data.boards.some(c.test)) continue;
+    const b = el("button"); b.setAttribute("role", "tab"); b.dataset.c = c.id; b.append(el("span", null, c.label));
+    b.setAttribute("aria-selected", String(c.id === cat));
+    b.onclick = () => { cat = c.id; board = null; full = false; draw(); }; n.append(b);
+  }
+}
+document.querySelectorAll(".head .seg button").forEach((b) => b.onclick = () => { if (!b.disabled) { period = b.dataset.p; full = false; draw(); } });
+document.querySelectorAll(".src .seg button").forEach((b) => b.onclick = () => choose(b.dataset.g));
+$(".more").onclick = async () => {
+  if (!board) return;
+  // the server sends 20 rows per board; the top 100 of one board on demand
+  if (!board.full) {
+    try {
+      const live = await (await fetch(`${API}?board=${encodeURIComponent(board.id)}&limit=100`)).json();
+      const b = live.boards[0] && convert(live, names).boards[0];
+      if (b) { board.all = b.all; board.week = b.week; if (board.day) board.day = b.day; board.full = true; }
+    } catch {}
+  }
+  full = true; draw();
+};
+$(".find").addEventListener("input", () => { me = $(".find").value.trim().toLowerCase(); try { localStorage.setItem("nfsc.lbName", me); } catch {} draw(); });
+// Live data: the server's GET /leaderboard (server/src/leaderboard.rs) sends race hashes and car
+// keys; names.json (tools/carbon-leaderboard-names.py) names them. API: ?api=<url>, or
+// window.LEADERBOARD_API, else /leaderboard on this site.
+// On nfscrb.xyz the game server answers at server.nfscrb.xyz (it allows this origin).
+const API = new URLSearchParams(location.search).get("api") || window.LEADERBOARD_API ||
+  (/(^|\.)nfscrb\.xyz$/.test(location.hostname) ? "https://server.nfscrb.xyz/leaderboard" : "/leaderboard");
+const URLS = { race: API, ingame: `${API}?source=ingame` };
+const TITLES = {
+  Evt_Bst: ["Best race time", "time"], Evt_Bst_Lap: ["Best lap", "time"], CD_Best_Score: ["Canyon Duel score", "points"],
+  PK_Best_Cop_Score: ["Pursuit Knockout · cop score", "points"], Best_Drift_Combo: ["Best drift combo", "points"],
+  Best_Drift_Lap: ["Best drift lap", "points"], Best_Online_Win_Streak: ["Best win streak", "count"],
+  Overall_Solo_On_Wins: ["Online race wins", "count"], PT_Most_Busts: ["Pursuit Tag · most busts", "count"],
+  Evt_Wins: ["Event wins", "count"], Total_Rnkd_Evt_Games: ["Races", "count"],
+};
+let names = { races: {}, cars: {} };
+function convert(live, names) {
+  const boards = live.boards.map((b) => {
+    const r = (b.race && names.races[b.race]) || {};
+    let [title, unit] = TITLES[b.family] || [b.family, b.unit];
+    const kind = (r.type || "").toLowerCase();
+    // a drift event's best is its score and a speedtrap's its summed speeds: highest wins
+    if (b.family === "Evt_Bst" && !b.low) [title, unit] = kind.includes("speedtrap") ? ["Best speedtrap total", "speed"] : ["Best drift score", "points"];
+    if (b.laps) title += ` · ${b.laps} ${b.laps === 1 ? "lap" : "laps"}`;
+    if (b.source === "game") title += " · unverified";
+    if (b.source === "ingame") title += " · in-game";
+    const rows = (list) => (list || []).map(([n, v, car, when, a, c]) => [n, v, names.cars[car] || "", when, a, c]);
+    return { id: b.id, family: b.family, source: b.source, title, unit, low: b.low, race: b.race ? r.race || b.race : null,
+      laps: b.laps || null, name: r.name || null, track: r.track || null, type: r.type || null, group: r.group || null,
+      players: b.players, all: rows(b.all), week: rows(b.week), day: b.day ? rows(b.day) : null };
+  });
+  return { made: new Date(live.made * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC", week: live.week, boards };
+}
+async function fetchGroup(g) {
+  const live = await (await fetch(URLS[g])).json();
+  // a server from before the in-game group ignores ?source=ingame and sends the plain answer
+  live.boards = live.boards.filter((b) => (b.source === "ingame") === (g === "ingame"));
+  store[g] = convert(live, names); loaded[g] = Date.now();
+}
+function counts() {
+  for (const b of document.querySelectorAll(".src .seg button")) { const d = store[b.dataset.g]; b.querySelector(".c").textContent = d ? String(d.boards.length) : ""; }
+}
+function show() {
+  const keep = board && board.id;
+  data = store[group];
+  board = keep && data ? data.boards.find((b) => b.id === keep) || null : null;
+  $(".made").textContent = data ? `Updated ${data.made}` : "Offline";
+  counts(); draw();
+}
+async function choose(g) {
+  if (g === group) return;
+  group = g; board = null; full = false;
+  try { localStorage.setItem("nfsc.lbGroup", g); } catch {}
+  show();
+  if (!store[g] || Date.now() - loaded[g] > 120000) { try { await fetchGroup(g); } catch {} if (group === g) show(); }
+}
+async function load(first) {
+  if (first) {
+    try { names = await (await fetch("names.json")).json(); } catch {}
+    if (me) $(".find").value = me;
+    // both groups at the start; the in-game one is shown while the verified boards are empty, unless the
+    // visitor chose one before (or ?group=race|ingame)
+    const got = await Promise.allSettled([fetchGroup("ingame"), fetchGroup("race")]);
+    let asked = new URLSearchParams(location.search).get("group");
+    try { asked = asked || localStorage.getItem("nfsc.lbGroup"); } catch {}
+    group = asked in GROUPS_OF ? asked : store.race && store.race.boards.length ? "race" : "ingame";
+    if (!store[group]) group = store.ingame ? "ingame" : store.race ? "race" : group;
+    if (got.every((r) => r.status === "rejected")) {
+      $(".tower").replaceChildren(el("div", "empty", "Leaderboards could not be loaded.")); $(".made").textContent = "Offline"; return;
+    }
+    show(); return;
+  }
+  try { await fetchGroup(group); show(); } catch {}
+}
+load(true);
+setInterval(() => { if (!full && document.visibilityState === "visible") load(false); }, 120000);
+</script>
+</body>
+</html>

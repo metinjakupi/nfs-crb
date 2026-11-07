@@ -6,8 +6,10 @@
 // relay's key, &name= the name others see.
 //
 // The game (mods/core/nfsc/mp.h) shares a block of its memory with the page:
-// this player's car pose and model at the front, then 8 slots for other
-// players' cars. Each new pose the game writes (up to 30 a second) goes to the
+// this player's car pose and model at the front, then slots for other
+// players' cars: 8 in the version-2 block, and with a game from 2026-11-05 on 12
+// more after its end (mp.h MpMore, found by its magic word; 20 in all), and with a game from Step B on (carlimit.h) 44
+// more after that (MpMore2 at +0x2600, labels at +0x5200; MpMore's count says 64). Each new pose the game writes (up to 30 a second) goes to the
 // relay (tools/carbon-net-relay.mjs) stamped with the game's physics time at the
 // moment it describes, so a busy page cannot make the motion stutter. Each pose
 // that arrives goes straight into that player's slot (a ring of the last 4,
@@ -20,12 +22,18 @@
 // A room may hold a few hundred players; the relay sends this one the cars of
 // the (up to 24) players near it, and once a second where everyone is (the
 // "where" feed, for the world map: window.recompOnlineWhere and
-// "recomp-online-where" events). The 8 slots go to the players racing with this
+// "recomp-online-where" events; [id, x, z, heading, state]: this page asks for the relay's
+// version 2 (hi where:2, "Where, version 2" in the relay's header): everyone in free roam, state
+// 1 driving, 2 paused, 3 away; a relay from before sends the drivers only, without a state).
+// The slots go to the players racing with this
 // one (race.js), then crew-mates within CREW_NEAR, then the nearest; a waiting
 // player takes the slot of the one that counts least only when clearly nearer
 // (SWAP) and not within SLOT_HOLD of that slot's last change, so cars do not
 // pop in and out. The racers also go to the relay ({t:"follow"}), which then
-// sends their cars whatever the distance.
+// sends their cars whatever the distance. The game decides which slots' players
+// get a car (nearest first, as many as it has room for) and keeps a car whose
+// player leaves the slots, to take it back when they return; so it is told who
+// left the room (MpMore.gone), and only then lets their kept car go.
 //
 // Poses travel compact once the relay's welcome says it speaks them (bin: 1): a binary
 // frame of 46 bytes instead of about 180 of JSON (format: "Compact poses" in the relay's
@@ -59,14 +67,24 @@
   const name = ((given ? given.name : params.get("name")) || "Player").slice(0, 20);
   const claim = /^[0-9a-f]{64}$/.test((given && given.claim) || "") ? given.claim : "";
   const legacy = /^[A-Za-z0-9_-]{16,64}$/.test((given && given.legacy) || "") ? given.legacy : "";
-  const SLOTS = 8, SLOT0 = 0x60, SLOT = 0x100;
-  const LABELS = SLOT0 + SLOTS * SLOT; // {x, y, depth, spare} floats per slot
+  // Where slot i's label is ({x, y, depth, applied} per slot): after the 8 version-2 slots, or for
+  // slot 8 on in MpMore (mp.h; the worker's slotBase/labelBase say the same).
+  const labelAt = (ptr, i) => (i < 8 ? ptr + 0x860 + i * 16 : i < 20 ? ptr + 0x2540 + (i - 8) * 16 : ptr + 0x5200 + (i - 20) * 16);
 
   // Everything below runs in the worker; it is started from this function's text.
   function link() {
-    const MAGIC = 0x31504d43, SLOTS = 8, SLOT0 = 0x60, SLOT = 0x100, RING = 4, SNAP = 0x38;
+    const MAGIC = 0x31504d43, SLOT0 = 0x60, SLOT = 0x100, RING = 4, SNAP = 0x38;
+    // The slots: 8 in the version-2 block; a game with MpMore (magic MORE_MAGIC at MORE, then its slot
+    // count, the page's gone ring, its slots and labels) has up to MAX_SLOTS (see the top of the file).
+    const V2_SLOTS = 8, V3_SLOTS = 20, MAX_SLOTS = 64, MORE = 0x18f0, MORE_MAGIC = 0x2b504d43;
+    const MORE2_SLOT0 = 0x2600, MORE2_LABELS = MORE2_SLOT0 + (MAX_SLOTS - V3_SLOTS) * 0x100; // mp.h MpMore2
+    const GONE_HEAD = MORE + 8, GONE = MORE + 0x10, GONE_N = 16, MORE_SLOT0 = 0x1940, MORE_LABELS = 0x2540;
+    let SLOTS = V2_SLOTS, more = false;
     const POLL_MS = 8, SEND_MS = 33, STALE = 5000, POSE_RECOVER_MS = 100;
-    const LABELS = SLOT0 + SLOTS * SLOT, CONTACTS = 0x8e0, IMPACTS = 32, IMPACT = 0x40;
+    const KEEP_MS = 1000; // an unchanged pose (paused, or the window in the background) again this often
+    const LABELS = SLOT0 + V2_SLOTS * SLOT, CONTACTS = 0x8e0, IMPACTS = 32, IMPACT = 0x40;
+    const slotBase = (i) => ptr + (i < V2_SLOTS ? SLOT0 + i * SLOT : i < V3_SLOTS ? MORE_SLOT0 + (i - V2_SLOTS) * SLOT : MORE2_SLOT0 + (i - V3_SLOTS) * SLOT);
+    const labelBase = (i) => ptr + (i < V2_SLOTS ? LABELS + i * 16 : i < V3_SLOTS ? MORE_LABELS + (i - V2_SLOTS) * 16 : MORE2_LABELS + (i - V3_SLOTS) * 16);
     const TX = CONTACTS + 0x10, RX = TX + IMPACTS * IMPACT;
     // Who gets a slot (see the top of the file). FRESH: a player heard from this recently may
     // take one; CREW_NEAR: a little past where the game builds a car (300 m).
@@ -78,12 +96,16 @@
     let crewsOk = false, crewId = null, account = null;
     // Compact poses (tools/carbon-net-relay.mjs, "Compact poses"): the format this page reads and
     // writes; bin is what the relay's welcome agreed to (0: JSON).
-    const BIN = 1, BIN_POSE = 1, BIN_WHERE = 2, POSE_BYTES = 46;
+    const BIN = 1, BIN_POSE = 1, BIN_WHERE = 2, BIN_WHERE2 = 4, POSE_BYTES = 46;
     const SCALE = [32767, 32767, 32767, 32767, 1000, 1000, 1000, 100, 100, 100, 500, 500, 500];
     let bin = 0;
     const players = new Map(); // id -> {id, name, crew, key, mode, heard, slot, at, pos, vel, last}
     // Prepare a newly announced model before slot selection and native construction.
     // Bound deduplication; background fetches retain the streamer's two-download limit.
+    // A car that is not ready waits HOLD_NEAR_MS while it is close (a late car is worse than a
+    // slow one), HOLD_FAR_MS while it is further than HOLD_CLOSE metres (it can still arrive
+    // finished). Cars never wait for ever: unknown models and failed downloads go on at the limit.
+    const HOLD_NEAR_MS = 1500, HOLD_FAR_MS = 6000, HOLD_CLOSE = 120;
     const preparedModels = new Map();
     function prepareModel(key) {
       key >>>= 0;
@@ -91,14 +113,25 @@
       if (preparedModels.size >= 64) preparedModels.delete(preparedModels.keys().next().value);
       const record = { at: performance.now(), ready: false };
       preparedModels.set(key, record);
+      const release = () => { for (const p of players.values()) if (p.key === key && p.slot >= 0 && p.last && memory) put(p); };
+      // Both limits, for cars that send no more poses (a paused owner) to move them on.
+      setTimeout(() => { if (preparedModels.get(key) === record && !record.ready) release(); }, HOLD_NEAR_MS);
       setTimeout(() => {
-        if (preparedModels.get(key) !== record) return;
+        if (preparedModels.get(key) !== record || record.ready) return;
         record.ready = true;
-        for (const p of players.values()) if (p.key === key && p.slot >= 0 && p.last && memory) put(p);
-      }, 1500);
+        postMessage({ t: "model-stat", ready: false, ms: HOLD_FAR_MS });
+        release();
+      }, HOLD_FAR_MS);
       postMessage({ t: "prepare-model", key });
     }
-    const owners = new Array(SLOTS).fill(0);
+    // Whether p's car waits for its model now.
+    function modelHeld(p, now) {
+      const record = preparedModels.get(p.key);
+      if (!record || record.ready) return false;
+      const d = self && p.at ? Math.hypot(p.at[0] - self.at[0], p.at[1] - self.at[1], p.at[2] - self.at[2]) : 0;
+      return now - record.at < (d > HOLD_CLOSE ? HOLD_FAR_MS : HOLD_NEAR_MS);
+    }
+    const owners = new Array(SLOTS).fill(0);     // grown to the game's count when its block comes
     const slotAt = new Array(SLOTS).fill(-Infinity); // when each slot last changed hands
     let self = null;          // this car: {at, vel} from its newest pose
     let racers = new Set();   // relay ids racing with this player (race.js, through the page)
@@ -109,18 +142,24 @@
     // the room when it changes, at most one per LOOK_MS (the newest waits), and again on each new
     // connection; each other player's goes into a peer entry of its own, by relay id.
     const LOOK_MAGIC = 0x4b4c4d43, LOOK_REC = 0x20, LOOK_SPACE = 0x440, LOOK_PEER0 = 0x460, LOOK_PEER = 0x460;
-    const LOOK_PEERS = 8, LOOK_MS = 5000;
+    const LOOK_MS = 5000;
+    let lookPeers = 8; // the game's peer entries: 8, or MAX_SLOTS from its look block version 2 on
     let look = null, lookStamp = 0, lookNewest = null, lookDue = false, lookSentAt = -Infinity, lookStamps = 0;
     const looks = new Map(); // id -> {k, bytes}: what each other player last sent
     // Police chases (mods/core/nfsc/cops.h CopShared, a block of its own; the relay header's
-    // "Police chases"). This player's chasing cops go to the relay as binary frames about 15 times a
-    // second while there is a chase, and one empty frame when it ends; other players' cops go into
+    // "Police chases"). This player's chasing cops go to the relay as binary frames about 18 times a
+    // second (the relay allows 20) while there is a chase, and one empty frame when it ends; other players' cops go into
     // the game's COP_SLOTS slots (MpSlot layout: id = owner, mode 1, pad[0] cop number, pad[1]
     // flags). Hits on those cops go back to their owner ({t:"cophit"}), and hits from others on
     // this player's cops go into the game's queue. Only with a relay whose welcome says cops: 1.
-    const COP_MAGIC = 0x31504f43, COP_OUT = 0x20, COP_OUT_SIZE = 0x40, COP_MAX = 8, COP_SLOT0 = 0x220;
-    const COP_SLOTS = 16, COP_Q = 0x1220, COP_TX = 0x1230, COP_RX = 0x1630, COP_HITS = 16, COP_HIT = 0x40;
-    const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COP_SEND_MS = 66, COP_STALE = 1500;
+    const COP_MAGIC = 0x31504f43, COP_OUT = 0x20, COP_OUT_SIZE = 0x40, COP_MAX_V1 = 8, COP_SLOT0 = 0x220;
+    // A game with CopMore (cops.h, Step B; magic at +0x1a30) sends up to 16 and shows 32: out 8.. at +0x1a40, slots 16.. after.
+    const COP_MORE = 0x1a30, COP_MORE_MAGIC = 0x2b504f43, COP_OUT2 = 0x1a40, COP_SLOTS_V1 = 16;
+    let COP_MAX = COP_MAX_V1, copSlotsN = COP_SLOTS_V1, relayCops = 8; // relayCops: what the relay passes in a frame (welcome copsMax)
+    const copOutAt = (i) => cops.ptr + (i < COP_MAX_V1 ? COP_OUT + i * COP_OUT_SIZE : COP_OUT2 + (i - COP_MAX_V1) * COP_OUT_SIZE);
+    const copSlotAt = (i) => cops.ptr + (i < COP_SLOTS_V1 ? COP_SLOT0 + i * SLOT : COP_OUT2 + 8 * COP_OUT_SIZE + (i - COP_SLOTS_V1) * SLOT);
+    const COP_SLOTS = 32, COP_Q = 0x1220, COP_TX = 0x1230, COP_RX = 0x1630, COP_HITS = 16, COP_HIT = 0x40;
+    const BIN_COPS = 3, COPS_HEAD = 10, COP_BYTES = 38, COP_SEND_MS = 55, COP_STALE = 1500;
     let cops = null, copsOk = false, copViews = null, copsSentMs = -1, copsSentCount = 0, copsSentAt = 0;
     const copSlots = new Array(COP_SLOTS).fill(null); // {owner, c} each slot holds
     const copHeard = new Map(); // owner id -> when its last cops frame came
@@ -240,7 +279,7 @@
       const out = { state: u32[b + 4], key: u32[b + 5], frame: u32[b + 6], ms: u32[b + 7],
                     s: Array.from(f32.subarray(b + 8, b + 21)) };
       if (physics) out.acks = owners.flatMap((id, i) => {
-        const serial = u32[(ptr + LABELS + i * 16 + 12) >> 2];
+        const serial = u32[(labelBase(i) + 12) >> 2];
         return id && serial ? [[id, serial]] : [];
       });
       return Atomics.load(i32, b + 3) === before ? out : null;
@@ -249,7 +288,7 @@
     // Slot layout (mp.h MpSlot): id, seq, key, mode, count, 3 spare, then RING
     // poses of {sender ms, 13 floats}.
     function writeSlot(i, id, key, mode, ms, s, contacts = 0, ack = 0, ctl = null) {
-      const { i32, u32, f32 } = mem(), base = ptr + SLOT0 + i * SLOT, b = base >> 2;
+      const { i32, u32, f32 } = mem(), base = slotBase(i), b = base >> 2;
       Atomics.add(i32, b + 1, 1);
       u32[b] = id; u32[b + 2] = key; u32[b + 3] = mode;
       u32[b + 5] = contacts; u32[b + 6] = ack;
@@ -299,10 +338,12 @@
     // p's newest pose into its slot.
     function put(p, now = performance.now()) {
       if (!visible(p)) { park(p); return; }
-      const preparing = preparedModels.get(p.key);
-      if (preparing && !preparing.ready && now - preparing.at < 1500) return;
-      const l = p.last;
-      writeSlot(p.slot, p.id, p.key, p.mode, l.ms, l.s, l.contacts, l.ack, l.drive);
+      // A friend who changed cars keeps driving the old one until the new one is ready.
+      const held = modelHeld(p, now);
+      if (held && !p.shown) return;
+      const l = p.last, key = held ? p.shown : p.key;
+      writeSlot(p.slot, p.id, key, p.mode, l.ms, l.s, l.contacts, l.ack, l.drive);
+      p.shown = key;
       p.applied = now;
     }
 
@@ -323,6 +364,7 @@
     function take(p, i, now) {
       if (p.pending) { clearTimeout(p.pending); p.pending = 0; }
       p.slot = i;
+      p.shown = 0;
       owners[i] = p.id;
       slotAt[i] = now;
       const l = looks.get(p.id);
@@ -378,6 +420,7 @@
       owners[p.slot] = 0;
       if (memory) writeSlot(p.slot, 0, 0, 0, 0, null);
       p.slot = -1;
+      p.shown = 0;
       p.heard = 0;
     }
 
@@ -390,14 +433,18 @@
       if (p.activity !== "race") return localActivity !== "race" || racers.has(p.id);
       return localActivity === "race" && localSession && p.session === localSession && racers.has(p.id);
     }
+    // A feed entry's state: 1 driving (also every entry of a relay from before), 2 paused, 3 away.
+    const driving = (e) => e.length < 5 || e[4] === 1;
     function mapTell() {
       postMessage({t: "where", p: mapPoints.filter(e => {
         const p = players.get(e[0]);
+        // Not driving (version 2): on the map at its last free-roam place unless it, or this player, races.
+        if (!driving(e)) return !!p && p.activity !== "race" && localActivity !== "race";
         return p && visible(p) && p.activity !== "race";
       }).map(e => {
         const p = players.get(e[0]);
-        return p.activity && p.at && p.heard && performance.now() - p.heard <= FRESH
-          ? [e[0], Math.round(p.at[0]), Math.round(p.at[2]), e[3]] : e;
+        return driving(e) && p.activity && p.at && p.heard && performance.now() - p.heard <= FRESH
+          ? [e[0], Math.round(p.at[0]), Math.round(p.at[2]), ...e.slice(3)] : e;
       })});
     }
     function refreshVisibility() {
@@ -436,6 +483,16 @@
       if (!p) return;
       park(p);
       players.delete(id);
+      gone(id);
+    }
+
+    // A player who left the room (or every player, when the link closed): the game lets their kept
+    // car go (mp.h KEPT CARS). A ring of GONE_N; the game treats more than that at once as everyone.
+    function gone(id) {
+      if (!memory || !more) return;
+      const { i32, u32 } = mem(), head = Atomics.load(i32, (ptr + GONE_HEAD) >> 2) >>> 0;
+      u32[(ptr + GONE + (head % GONE_N) * 4) >> 2] = id;
+      Atomics.store(i32, (ptr + GONE_HEAD) >> 2, (head + 1) | 0);
     }
 
     // A player's look into its entry (bytes null: the entry is emptied). Guarded like a slot.
@@ -443,11 +500,11 @@
       if (!look) return;
       const buf = look.memory.buffer, u32 = new Uint32Array(buf), i32 = new Int32Array(buf);
       let at = -1;
-      for (let i = 0; i < LOOK_PEERS && at < 0; i++) if (u32[(look.ptr + LOOK_PEER0 + i * LOOK_PEER) >> 2] === id) at = i;
-      for (let i = 0; i < LOOK_PEERS && at < 0 && bytes; i++) if (!u32[(look.ptr + LOOK_PEER0 + i * LOOK_PEER) >> 2]) at = i;
-      // The game has entries for 8 cars, as many as slots, and more players than that send looks:
-      // a car in a slot takes the entry of a player who has none.
-      for (let i = 0; i < LOOK_PEERS && at < 0 && bytes && owners.includes(id); i++)
+      for (let i = 0; i < lookPeers && at < 0; i++) if (u32[(look.ptr + LOOK_PEER0 + i * LOOK_PEER) >> 2] === id) at = i;
+      for (let i = 0; i < lookPeers && at < 0 && bytes; i++) if (!u32[(look.ptr + LOOK_PEER0 + i * LOOK_PEER) >> 2]) at = i;
+      // The game has entries for as many cars as slots (8 before version 2), and more players than
+      // that send looks: a car in a slot takes the entry of a player who has none.
+      for (let i = 0; i < lookPeers && at < 0 && bytes && owners.includes(id); i++)
         if (!owners.includes(u32[(look.ptr + LOOK_PEER0 + i * LOOK_PEER) >> 2])) at = i;
       if (at < 0) return;
       const base = look.ptr + LOOK_PEER0 + at * LOOK_PEER, b = base >> 2;
@@ -484,7 +541,7 @@
       if (before & 1) return null;
       const list = [];
       for (let i = 0; i < Math.min(u32[b + 5], COP_MAX); i++) {
-        const o = (cops.ptr + COP_OUT + i * COP_OUT_SIZE) >> 2;
+        const o = copOutAt(i) >> 2;
         list.push({ c: u32[o], k: u32[o + 1], f: u32[o + 2] & 255, s: Array.from(f32.subarray(o + 3, o + 16)) });
       }
       const out = { ms: u32[b + 4], list };
@@ -493,7 +550,7 @@
 
     // A cops frame (the relay header's "Police chases"): its 13 numbers per cop as a pose's.
     function packCops(o) {
-      const list = o.list.filter((x) => x.c >= 1 && x.c <= 255 && x.s.every(Number.isFinite));
+      const list = o.list.filter((x) => x.c >= 1 && x.c <= 255 && x.s.every(Number.isFinite)).slice(0, relayCops);
       const b = new ArrayBuffer(COPS_HEAD + COP_BYTES * list.length), v = new DataView(b);
       v.setUint8(0, BIN_COPS);
       v.setUint8(1, list.length);
@@ -516,7 +573,7 @@
 
     // Slot i of the game's friends' cops: owner's cop c at its newest pose (s null: emptied).
     function copWrite(i, owner, k, c, f, ms, s) {
-      const { u32, i32, f32 } = copMem(), base = cops.ptr + COP_SLOT0 + i * SLOT, b = base >> 2;
+      const { u32, i32, f32 } = copMem(), base = copSlotAt(i), b = base >> 2;
       Atomics.add(i32, b + 1, 1);
       u32[b] = owner; u32[b + 2] = k >>> 0; u32[b + 3] = owner ? 1 : 0; u32[b + 5] = c; u32[b + 6] = f;
       if (s) {
@@ -549,15 +606,23 @@
       const keep = new Set(list.map((x) => x.c));
       for (let i = 0; i < COP_SLOTS; i++) if (copSlots[i]?.owner === owner && !keep.has(copSlots[i].c)) copFree(i);
       if (!list.length) copHeard.delete(owner);
+      for (const x of list) prepareModel(x.k);
       if (!cops) return;
       for (const x of list) {
         let i = copSlots.findIndex((h) => h && h.owner === owner && h.c === x.c);
         if (i < 0) {
-          i = copSlots.indexOf(null);
+          i = copSlots.findIndex((h, j) => !h && j < copSlotsN);
+          // All slots taken: a cop (not a traffic car, flag 8) takes one a traffic car holds. With
+          // shared traffic every owner fills 8, so a second chased player's cops found none.
+          if (i < 0 && !(x.f & 8)) {
+            i = copSlots.findIndex((h, j) => h && h.f & 8 && j < copSlotsN);
+            if (i >= 0) copFree(i);
+          }
           if (i < 0) continue;
           copSlots[i] = { owner, c: x.c };
           copWrite(i, 0, 0, 0, 0, 0, null); // a new cop starts from an empty ring
         }
+        copSlots[i].f = x.f;
         copWrite(i, owner, x.k, x.c, x.f, ts, x.s);
       }
     }
@@ -621,6 +686,14 @@
           p.push([v.getUint32(at, true), v.getInt32(at + 4, true), v.getInt32(at + 8, true), v.getUint16(at + 12, true)]);
         return { t: "where", p };
       }
+      if (type === BIN_WHERE2 && (n - 1) % 10 === 0) { // version 2: heading | state << 9
+        const p = [];
+        for (let at = 1; at < n; at += 10) {
+          const hs = v.getUint16(at + 8, true);
+          p.push([v.getUint32(at, true), v.getInt16(at + 4, true), v.getInt16(at + 6, true), hs & 0x1ff, (hs >> 9) & 7]);
+        }
+        return { t: "where", p };
+      }
       if (type === BIN_COPS && n >= COPS_HEAD && n === COPS_HEAD + COP_BYTES * v.getUint8(1)) {
         const list = [];
         for (let j = 0, at = COPS_HEAD; j < v.getUint8(1); j++, at += COP_BYTES) {
@@ -650,6 +723,7 @@
         serverPhysics = m.physics === 1;
         bin = m.bin === 1 ? 1 : 0; // a relay from before compact poses says nothing: JSON
         copsOk = bin === 1 && m.cops === 1; // nor does one from before police chases
+        relayCops = Number.isInteger(m.copsMax) && m.copsMax > 8 ? Math.min(m.copsMax, 16) : 8; // older relays pass 8 a frame
         driveOk = bin === 1 && m.drive === 1; // nor one from before driving
         driveLinked();
         for (const peer of m.peers || []) Object.assign(player(peer.id), { name: peer.name, crew: crewsOk && peer.crewId ? peer.crew || "" : "", crewId: crewsOk ? peer.crewId || null : null, account: crewsOk ? peer.account || null : null, physics: peer.physics === 1 });
@@ -813,10 +887,11 @@
         take(p, owners.indexOf(0), now);
       } else if (m.t === "where" && Array.isArray(m.p)) {
         // Where everyone driving is (whole metres, heading in degrees), for the world map; a
-        // far player's place also stands in for chat until its own poses come.
+        // far player's place also stands in for chat until its own poses come. Version 2 adds
+        // everyone else in free roam, with a state as a fifth number.
         const list = [], now = performance.now();
         for (const e of m.p) {
-          if (!Array.isArray(e) || e.length !== 4 || !e.every(Number.isFinite) || e[0] === me) continue;
+          if (!Array.isArray(e) || (e.length !== 4 && e.length !== 5) || !e.every(Number.isFinite) || e[0] === me) continue;
           list.push(e);
           const p = players.get(e[0]);
           if (p && !(p.heard && now - p.heard <= FRESH)) p.at = [e[1], p.at ? p.at[1] : self ? self.at[1] : 0, e[2]];
@@ -830,7 +905,7 @@
     function connect() {
       ws = new WebSocket(relay);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew: "", crews: 1, chatAck: 1, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1 })); tell(); };
+      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew: "", crews: 1, chatAck: 1, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1, where: 2 })); tell(); };
       ws.onmessage = (e) => {
         try {
           const m = typeof e.data === "string" ? JSON.parse(e.data) : unpack(e.data);
@@ -874,8 +949,9 @@
         tell();
       } else if (m.t === "model-ready") {
         const record = preparedModels.get(m.key);
-        if (record && m.ready) {
+        if (record && m.ready && !record.ready) {
           record.ready = true;
+          postMessage({ t: "model-stat", ready: true, ms: performance.now() - record.at });
           for (const p of players.values()) if (p.key === m.key && p.slot >= 0 && p.last && memory) put(p);
         }
       } else if (m.t === "visibility") {
@@ -897,7 +973,12 @@
         memory = m.memory;
         ptr = m.ptr;
         if (mem().u32[ptr >> 2] !== MAGIC) { console.warn("[online] the game's shared block is not there"); memory = null; return; }
-        console.log("[online] linked to the game");
+        // MpMore: only a game that has it writes its magic there (an older block ends at MORE).
+        const u = mem().u32, count = ptr + MORE + 8 <= u.byteLength && u[(ptr + MORE) >> 2] === MORE_MAGIC ? u[(ptr + MORE + 4) >> 2] : 0;
+        more = count > V2_SLOTS;
+        SLOTS = more ? Math.min(count, MAX_SLOTS) : V2_SLOTS;
+        while (owners.length < SLOTS) { owners.push(0); slotAt.push(-Infinity); }
+        console.log(`[online] linked to the game (${SLOTS} car slots)`);
         physics = mem().u32[(ptr >> 2) + 1] >= 2;
         linked();
         if (me && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "physics", on: physics }));
@@ -907,6 +988,9 @@
       } else if (m.t === "cop-block" && !cops) {
         if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== COP_MAGIC) { console.warn("[online] the game's police block is not there"); return; }
         cops = { memory: m.memory, ptr: m.ptr };
+        { const u = new Uint32Array(m.memory.buffer), more = u[(m.ptr + COP_MORE) >> 2] === COP_MORE_MAGIC;
+          COP_MAX = more ? Math.min(u[(m.ptr + COP_MORE + 4) >> 2], 16) : COP_MAX_V1;
+          copSlotsN = more ? Math.min(u[(m.ptr + COP_MORE + 8) >> 2], COP_SLOTS) : COP_SLOTS_V1; }
       } else if (m.t === "drive-block" && !drive) {
         if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== DRV_MAGIC) { console.warn("[online] the game's drive block is not there"); return; }
         drive = { memory: m.memory, ptr: m.ptr };
@@ -923,6 +1007,7 @@
       } else if (m.t === "look-block" && !look) {
         if (new Uint32Array(m.memory.buffer)[m.ptr >> 2] !== LOOK_MAGIC) { console.warn("[online] the game's look block is not there"); return; }
         look = { memory: m.memory, ptr: m.ptr };
+        { const v = new Uint32Array(m.memory.buffer)[(m.ptr >> 2) + 1]; lookPeers = v >= 3 ? MAX_SLOTS : v >= 2 ? V3_SLOTS : 8; } // look.h: 3 = 64 peers
         for (const [id, l] of looks) lookPut(id, l.k, l.bytes);
       }
     };
@@ -1170,7 +1255,10 @@
       const now = performance.now();
       if (!latest) return;
       const mode = hidden ? 0 : latest.state;
-      if ((latest.ms === sentMs && mode === sentMode) || (mode === sentMode && now - sentAt < SEND_MS)) return;
+      // Paused (Escape, or the window not in front: the game pauses itself) the game's clock stands
+      // still and so does the pose; sent only when it changed, nothing went out, and after STALE the
+      // friends took the car away (user report 2026-11-05). It goes again every KEEP_MS instead.
+      if (mode === sentMode && (now - sentAt < SEND_MS || (latest.ms === sentMs && now - sentAt < KEEP_MS))) return;
       // A connected player in a menu keeps the last car pose, but it must be stationary.
       // Mode 0 tells friends to show PAUSED; a real disconnect still sends `left`.
       const stopped = mode === 0;
@@ -1293,6 +1381,7 @@
     worker.postMessage({t:"send",m:{...fields,t:"moderation",op,q}});
   });
   window.recompOnlinePing = null; // online, round trip not known yet: the performance box shows "PING --"
+  const modelStats = { ready: 0, quick: 0, late: 0, worst: 0 };
   worker.onmessage = (e) => {
     if (e.data.t === "prepare-model") {
       const key = e.data.key, stream = window.recompStream;
@@ -1301,6 +1390,15 @@
         stream?.prepareModels([key]);
         worker.postMessage({ t: "model-ready", key, ready: !stream });
       }
+      return;
+    }
+    if (e.data.t === "model-stat") {
+      // In the reports, like the game's own lines: how often a car's files beat its hold.
+      const s = modelStats, ms = Math.round(e.data.ms);
+      if (e.data.ready) { s.ready++; if (ms > s.worst) s.worst = ms; if (ms <= 1500) s.quick++; } else s.late++;
+      const n = s.ready + s.late;
+      if (n <= 12 || n % 50 === 0 || ms === s.worst)
+        console.log(`[online] car model ${e.data.ready ? `ready in ${ms} ms` : "not ready in time"}: ${s.ready} ready (${s.quick} within 1.5 s, worst ${s.worst} ms), ${s.late} not ready`);
       return;
     }
     if (e.data.t === "moderation-message") {
@@ -1658,9 +1756,9 @@
     const buf = block.memory.buffer;
     if (!views || views.buf !== buf) views = { buf, f32: new Float32Array(buf) };
     const f32 = views.f32, box = canvas.getBoundingClientRect();
-    for (let i = 0; i < SLOTS; i++) {
-      const who = state.slots[i];
-      const b = (block.ptr + LABELS + i * 16) >> 2, depth = f32[b + 2];
+    for (let i = 0; i < tags.length || i < (state.slots?.length || 0); i++) {
+      const who = state.slots?.[i];
+      const b = labelAt(block.ptr, i) >> 2, depth = who ? f32[b + 2] : 0;
       let el = tags[i];
       if (!who || !(depth > 0) || window.recompWorldMapOpen?.()) {
         if (el) el.style.display = "none";
@@ -1687,14 +1785,20 @@
       const mate = !!state.crewId && peer?.crewId === state.crewId;
       if (el.crew !== c || el.paint !== paint || el.mate !== mate) dress(el, c, mate);
       const isPolice = police.has(state.slotIds?.[i]);
+      // Depth is the view's w, metres along the view. Tags draw through walls, and a friend out to the far radius has one
+      // even with no car drawn here: past 200 m only crew mates, police and racers keep theirs (user, 2026-11-07).
+      const far = !mate && !isPolice && !window.recompRaceRacer?.(state.slotIds?.[i]);
+      if (far && depth > 200) { el.style.display = "none"; continue; }
       el.badge.style.display = isPolice ? "inline-block" : "none";
       const paused = state.slotModes?.[i] === 0;
-      const text = paused ? `${who} · PAUSED` : who;
+      // Race start (race.js): a late racer's car passing through the others says so.
+      const note = window.recompRaceTagNote?.(state.slotIds?.[i]) || "";
+      const text = paused ? `${who} · PAUSED` : note ? `${who} · ${note}` : who;
       if (el.text.data !== text) el.text.data = text;
       const size = Math.max(11, Math.min(16, 17 - depth / 25));
       el.style.display = "block";
       el.style.fontSize = `${size}px`;
-      el.style.opacity = depth > 250 && !el.mate && !isPolice ? "0.6" : "1";
+      el.style.opacity = far && depth > 170 ? String((200 - depth) / 30) : depth > 250 && !el.mate && !isPolice ? "0.6" : "1";
       el.style.transform = `translate(${box.left + f32[b] * box.width}px, ${box.top + f32[b + 1] * box.height}px) translate(-50%, -100%)`;
     }
   }

@@ -43,7 +43,7 @@ static void rv_publish(RvShared *sh, uint32_t player) {
     MpPose own;
     if (state) mp_read(state, &own);
     uint32_t node = state ? get_u32(MP_CARS) : 0;
-    for (int guard = 0; node && node != MP_CARS && guard < 64; ++guard, node = get_u32(node)) {
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
         const uint32_t car = node - 0xd0;
         if (get_u32(car + 0x148) != 3u) continue;
         const uint32_t body = mp_state(get_u32(car + 0x70));

@@ -7,7 +7,7 @@
  * THE CHASED PLAYER'S GAME (step 1). Every frame, while the page has the relay link up, the mod
  * lists the cop cars of the player's pursuit (the COP_MAX nearest within COP_RANGE) and writes
  * each one's pose, model, light bar and siren into CopShared, for the page (web/net.js), which
- * sends them to the players near this one about 15 times a second ("cops" frames, the relay
+ * sends them to the players near this one about 18 times a second ("cops" frames, the relay
  * header has the format); nothing without a pursuit, one empty frame when it ends.
  *   - The player's car: mp.h's (g_mp_player_simable, so not in the game's own online races).
  *     A PVehicle's IVehicleAI * is at +0x104 (IVehicle::GetAIVehiclePtr 006d8110 reads IVehicle
@@ -72,8 +72,8 @@
  * inside our car here (it is where our poses said some 150-300 ms earlier, or our car has been
  * pushed since): put there, the two cars overlap and the physics throws ours into the air (seen
  * 2026-10-26: the user's car launched beside two cops; a test tab's car flipped over and over
- * while the other tab's cops boxed it in). The same holds for this game's other cars (its traffic, and
- * its own cops, which step 3's pursuit.h sends after the same friend: two sets of police in one
+ * while the other tab's cops boxed it in). The same holds for this game's own
+ * cops, which step 3's pursuit.h sends after the same friend: two sets of police in one
  * place). So a copy whose place or newest pose is within COP_NEAR_US of our car, or COP_NEAR_CAR of
  * another car here, is never put anywhere: it is switched to mp.h's pull back
  * (MP_RETURNING at full strength), which drives it onto its poses through the physics, so it
@@ -105,7 +105,14 @@
  * the copy closes on us) it is a ram and they stay solid, so it lands as any hit and goes to the
  * cop's owner (step 2); otherwise the copy is coming at us and the two pass through each other
  * (006e95a0, the first step of a contact, the one that pushes the bodies apart, answers "no
- * contact" for that pair, and its caller then skips the solve too) until they are apart again. The copy still collides with everything else.
+ * contact" for that pair, and its caller then skips the solve too) until they are apart again.
+ *
+ * WATCHING A CHASE. A cop copy never touches another replayed car (the chased friend's, other
+ * copies) or this city's traffic: its owner's game already settled those touches, and this
+ * city's traffic was never in that game. Solid, a cop pressing on the car it chases went through
+ * the pull back of NEAR OUR CAR, was pushed off the car and snapped back, again and again
+ * (seen 2026-11-04 as cops shuddering around another player). It stays solid to our car, this
+ * game's own cops and the world.
  *
  * TAKING THEM AWAY. Removing (Kill, as mp.h removes a friend's car) a copy of a cop model ended
  * the game now and then, soon after the Kill (ExitProcess 0xC0000005 or 255, a pure virtual call;
@@ -131,8 +138,11 @@
 #define COP_AI_SIREN 0x1ccu   /* IVehicleAI: AIVehiclePursuit siren state */
 #define COP_GLARE 0x150u      /* PVehicle: light bits */
 #define COP_LIGHTS 0x7000u    /* the light bar */
-#define COP_MAX 8             /* cops sent per player */
-#define COP_SLOTS 16          /* friends' cops shown here */
+#define COP_MAX 16            /* cops (and shared traffic) sent per player: 8 in CopShared.out, 8 more in CopMore (Step B) */
+#define COP_OUT_V1 8
+#define COP_SLOTS 32          /* friends' cops shown here: 16 in CopShared.slots, 16 more in CopMore */
+#define COP_SLOTS_V1 16
+#define COP_MORE_MAGIC 0x2b504f43u /* "COP+" */
 #define COP_HITS 16
 #define COP_RANGE 400.0f      /* metres: a cop farther than this from the player is not sent */
 #define COP_SEEN 600.0        /* ms: see RAMMING THEM */
@@ -144,6 +154,11 @@
 #define COP_DESTROY 0x006edae0u /* IDamageable::Destroy, thiscall on the IDamageable, RET 0 */
 #define COP_SURFACE 0x0075d7d0u /* SimSurface constructor, thiscall (key; 0 = the default surface), RET 4 */
 #define COP_IMPULSE 2050.0f   /* the game's own car-to-car hits on cops: impulse / closing speed */
+#define COP_DRV_SPAN 120.0    /* ms of playback a copy's change in speed is measured over */
+#define COP_DRV_LATERAL 20.0f /* m/s^2 sideways at full steering (a player's car at 27 m/s, measured 2026-11-04) */
+#define COP_DRV_WHEELBASE 2.7f /* metres, for steering at low speed */
+#define COP_DRV_GEAR 18.0f    /* m/s each gear covers (first held to about 20 m/s, measured) */
+#define COP_DRV_SMOOTH 0.3f   /* share of the way to the new controls each frame */
 #define COP_SPARES 8          /* copies out of a chase kept out of sight for the next cops (see TAKING THEM AWAY) */
 #define COP_PARK_DOWN 400.0f  /* metres below where they were that they are kept */
 #define COP_PHYSICS 0x006d6950u /* IVehicle +0x38 SetPhysicsMode, thiscall (IVehicle *, int): 0 parks a car (not simulated, not drawn) */
@@ -162,7 +177,121 @@
 #define COP_BUILD_CLEAR 8.0f  /* metres: a copy is built (or a kept one brought) only this far from our car */
 #define COP_F_LIGHTS 1u       /* flags: the light bar is on */
 #define COP_F_CHASING 2u      /*        the cop is chasing (mInPursuit) */
+#define COP_F_TRAFFIC 8u      /*        a traffic car of the sender's game, not a cop (see SHARED TRAFFIC) */
 /* bits 4-7: the siren state + 1 (0 = not known) */
+
+/* SHARED TRAFFIC (plans/shared-traffic.md). The same frames carry the sender's traffic: with a
+ * friend's car within TRF_FRIEND, the list is topped up to COP_MAX with the traffic cars (driver
+ * class 1) nearest the player within TRF_RANGE, flagged COP_F_TRAFFIC, after the cops of a chase.
+ * A friend's game builds them as it builds cop copies (in a traffic model it has when their own
+ * is not here, never a cop model). Two games near each other share one street: a game that gets
+ * traffic from a player with a lower relay id stops spawning its own (traffic.h, the spawn check
+ * 00444d90) and sends none, so the lower id's traffic is the one both see; with none coming any
+ * more (that player left or drove away) it spawns again. Few cars, as the user wants: COP_MAX.
+ * A truck's trailer is a car of its own (driver class 4, the TRAILER type): it goes with the traffic
+ * (flag COP_F_TRAILER) and is built only in its own model, never in a car's. */
+#define TRF_CLASS 1u          /* driver class: traffic */
+#define TRF_TOWED 4u          /* driver class of a truck's trailer: a car of its own (2026-11-05, both trucks
+                               * of a test game: class 4, PVehicle + 0x11c = the "TRAILER" key at 0x00a9e7bc) */
+#define TRF_TYPE 0x11cu       /* PVehicle: its vehicle type key (cars 336fcacf, trucks 89e87652 seen) */
+#define TRF_TRAILER_KEY 0x00a9e7bcu /* the "TRAILER" type key (filled at 009b6ca0) */
+#define COP_F_TRAILER 0x10u   /* flags, with COP_F_TRAFFIC (no siren bits then): a truck's trailer */
+/* TRUCKS WHOLE (trucks-20261106: "the trucks come without the head sometimes"). A truck's cab (class 1) and its trailer
+ * (class 4) were two cars to this file: chosen one by one (nearest COP_MAX, range, RANGE KEEP, the sent-already bonus
+ * TRF_KEEP), built one by one in a friend's game (one build per MP_BUILD_GAP_MS, in slot order, each in its own model
+ * or a kept copy) and removed one by one (out of the list, far away, lingering). So a friend's game showed a trailer
+ * with no cab: the trailer was built or taken from the kept copies before its cab, the cab's copy went first, or the
+ * owner sent the trailer and not its cab (the cab one place too far for the nearest COP_MAX, or out of range first).
+ * Now:
+ *   - The owner knows which trailer a cab tows: PVehicle + TRF_ARTIC is the cab's IArticulatedVehicle (table
+ *     TRF_ARTIC_TABLE; its slot 1, 00709ce0, returns +0x10: the trailer's IVehicle = trailer PVehicle + 0xb8; 0 on
+ *     every other car; measured on both truck models, 0a92cc67 + dcfbf79e and a9b509c4 + 1caa5b90).
+ *   - A trailer is never chosen alone: the cab is chosen as any traffic car, and its trailer is sent right after it
+ *     in the same frame (COP_F_TOWING on the cab), or neither when only one place is left. A trailer with no cab
+ *     towing it is not sent.
+ *   - The trailer's number is its cab's number + TRF_TRAILER_NO (cabs and all other cars are numbered 1-127), so a
+ *     friend's game knows exactly which cab a trailer belongs to.
+ *   - A friend's game builds (or takes back) a trailer's copy only while its cab's copy is here, and the same frame
+ *     the cab's copy goes (removed, kept, lingered out, gone with the world) the trailer's copy goes too. */
+#define COP_F_TOWING 0x20u    /* flags, with COP_F_TRAFFIC: a truck's cab towing a trailer, sent with it (TRUCKS WHOLE) */
+#define TRF_TRAILER_NO 0x80u  /* a trailer's number: its cab's number (1-127) + this */
+#define TRF_ARTIC 0x108u      /* PVehicle: IArticulatedVehicle * (a truck's hitch), 0 for other cars */
+#define TRF_ARTIC_TABLE 0x009e72d4u
+/* OLDER GAMES' TRAILERS (logs/duel-trucks-20261106: trucks without their cab still seen on the live release 20261106-m5).
+ * A game from before TRUCKS WHOLE (the public 20261106-hud build bfdc5ddf and older; players who have not reloaded)
+ * sends a trailer as a car of its own, numbered below 128, often without its cab. Shown with "that owner's nearest
+ * traffic car within 20 m", it stood behind any car passing near it, and stayed while that cab copy lingered still
+ * (cop_cab_here counted lingering copies) as the trailer drove on. Now an older game's trailer is shown only behind a
+ * copy of its own truck's cab (TRF_CAB_OF; any traffic car only when the trailer model is not one of the two known)
+ * whose newest pose is within TRF_HITCH_NEAR of the trailer's, in a slot (not lingering), and it goes the frame that
+ * cab copy goes or is farther than TRF_HITCH_KEEP from it. */
+#define TRF_HITCH_NEAR 12.0f  /* metres: an older game's trailer is built behind its owner's cab copy this near (7-8 m measured) */
+#define TRF_HITCH_KEEP 16.0f  /* metres: and goes when that cab copy is farther than this */
+#define TRF_RANGE 800.0f      /* metres: traffic cars this near the player are shared (the game spawns them
+                               * out of sight, 160 m and more away: seen 2026-11-04). 300 until no-vanish-20261106: a
+                               * friend's game built each copy as it came within 300 m, in plain view (4 a minute on a
+                               * straight road); now a friend's game has the copy where the owner has the car, out to
+                               * MP_BUILD_FAR (800 m) */
+#define TRF_FRIEND 300.0f     /* metres: and only while a friend's car is this near */
+#define TRF_QUIET_HOLD 120000.0 /* ms: a game showing a friend's traffic stays quiet this long after it was last here (QUIET HOLD) */
+#define TRF_RANGE_KEEP 960.0f /* metres: a car already sent stays sent out to this (RANGE KEEP; only where keep < 1; 360 with TRF_RANGE 300) */
+#define TRF_KEEP 0.5f         /* a traffic car sent already counts as this times as far, squared (cop_nearest) */
+static int g_trf_owner;       /* this game sends its traffic now */
+static int g_trf_quiet;       /* this game spawns no traffic: it shows a lower id's */
+static uint32_t g_trf_from;   /* that player's relay id */
+
+/* SHARED PATROLS (plans/shared-traffic.md, "Police"). The game that owns the traffic owns the
+ * police near it too: after the cops of its own chase it sends its other cop cars within
+ * TRF_RANGE (patrols, and cops chasing a friend), before its traffic. A game that shows a lower
+ * id's traffic runs no police of its own (pursuit.h sets the cop manager's maximum to 0) while
+ * nobody here is chased and none of that player's cops is chasing; a chase brings this game's
+ * police back, so a chase is shared exactly as before (cops.h, pursuit.h). NFSCO lets one game
+ * spawn all police (its gate at 00413386); here it is one game per area, as for traffic.
+ *
+ * FRIENDS COUNT AS NEAR (as NFSCO does). While this game shares its traffic, three places that ask
+ * how far a car is from the player (00761550: 00412d70 lets traffic go, 004248b0 a vehicle's AI
+ * check against 80 m, 00624c40) get a distance of about 0 for a car within TRF_NEAR of a friend's
+ * car: the call's position argument is pointed at our own car (BEFORE hooks at those three call
+ * sites; a float result changed after the call does not reach the caller, see traffic.h), so the
+ * owner's traffic and police are not let go near a friend who drives a little away.
+ *
+ * WRECKED COPS (as NFSCO's destroyed flag, ee894489). A cop wrecked in its owner's game (damage 1.0:
+ * IDamageable at PVehicle + 0xfc, damage at +0x34) goes with COP_F_WRECKED, and stays sent for
+ * COP_WRECK_KEEP while it is near, though the game drops a wrecked cop from its pursuit (UpdatePursuits
+ * 00445c70): before, its copy went to the kept ones the moment it was taken out, so friends saw the
+ * cop vanish. Only a cop sent already before the wreck is sent wrecked. A friend's game gives its copy
+ * the game's own take-out, IDamageable::Destroy 006edae0 (every damage zone full, damage 1.0, the
+ * EVehicleDestroyed event), let through cop_no_destroy for that call alone; the copy is still in no
+ * pursuit (AIVehicleEmpty), so this game's chase does not count it. A copy that is wrecked while its
+ * cop is not (a kept one taken by another cop) is made as new (ResetDamage 006edef0, as police.h).
+ * The game gives a car's memory to a new car with its damage cleared (006edc00 from 0041862b and
+ * 00419785, seen for cops and traffic 2026-11-05), and a wrecked cop once came back undamaged under its
+ * number 3 frames after its wreck: a sent car wrecked and then not is taken as a new car with a new
+ * number, so friends drop the wreck and build the new car. */
+#define COP_F_WRECKED 4u      /* flags: the cop is wrecked in the sender's game */
+#define COP_RESET 0x006edef0u /* IDamageable::ResetDamage, thiscall on the IDamageable, RET 0 */
+#define COP_WRECK_KEEP 20000.0 /* ms: a wrecked cop stays sent this long after its wreck */
+static int g_cop_wrecking;    /* cop_no_destroy lets this Destroy through: a copy's wreck */
+
+#define TRF_SPAWN_COP 0x00435300u /* ICopMgr::SpawnCop (table 009c3b30 +0x20), thiscall, RET 0x14: queues a
+                               * cop request (ICopMgr + 0x14 list, made into cars by 00435630 -> 004353b0).
+                               * The cop manager's maximum (+0x94) = 0 did not stop patrols (a patrol cop came
+                               * with it, 2026-11-05), so while patrol-quiet no request is queued (REPLACE). */
+#define TRF_MAKE_COP 0x00422ef0u /* the cop manager's cop factory, thiscall (1 argument), RET 4: the car or 0.
+                               * SpawnCop alone did not stop patrols either (2026-11-05: a patrol came with it):
+                               * they are made here from other paths (00423610 and 00423980 from 00445b20,
+                               * roadblocks 0042d2a0, 0043a9a0). Every caller handles 0 (checked in the code),
+                               * so while patrol-quiet it makes none (REPLACE). */
+#define COP_SHARED_PATROLS 0  /* 0 (2026-11-07): every game runs its own police again. With SHARED PATROLS on, a game
+                               * near a lower-numbered player made no cops at all, and the patrol copies it showed
+                               * cannot notice anyone, so players near others were never chased (player reports). */
+#define TRF_NEAR 150.0f       /* metres: NFSCO's distance, the game's own 150 (009c17a8) */
+static uint32_t g_trf_spawn_hook, g_trf_make_hook;
+#define TRF_DISTANCE 0x00761550u /* cdecl (const float pos[3]) -> distance to the player, ST0 */
+static const uint32_t g_trf_near_ret[3] = {0x00412e2fu, 0x004248d4u, 0x00624ce4u}; /* after its three calls */
+static uint32_t g_trf_near_hooks[3];
+static uint32_t g_trf_near_buf; /* our car's position, 12 guest bytes */
+static int g_cop_quiet;       /* this game runs no police of its own now (pursuit.h) */
 
 typedef struct CopOut { /* 0x40 bytes: one cop chasing this player */
     uint32_t id;    /* its number, 1-255 */
@@ -187,16 +316,29 @@ typedef struct CopShared {
     uint32_t ms;             /* the physics clock (mp_ms) of these poses */
     uint32_t count;          /* cops in out[]: 0 = no pursuit */
     uint32_t frame, spare;
-    CopOut out[COP_MAX];
-    MpSlot slots[COP_SLOTS]; /* the page's: friends' cops (see A FRIEND'S GAME) */
+    CopOut out[COP_OUT_V1];
+    MpSlot slots[COP_SLOTS_V1]; /* the page's: friends' cops (see A FRIEND'S GAME) */
     uint32_t tx_head, tx_tail, rx_head, rx_tail;
     CopHit tx[COP_HITS], rx[COP_HITS]; /* single-producer/single-consumer queues */
+    /* CopMore (+0x1a30, Step B): with its magic, `count` may go to COP_MAX (out 8.. here) and the page may
+     * fill COP_SLOTS slots (16.. here). A page that does not know it uses the first 8 and 16. */
+    uint32_t more_magic, more_out, more_slots, more_spare;
+    CopOut out2[COP_MAX - COP_OUT_V1];
+    MpSlot slots2[COP_SLOTS - COP_SLOTS_V1];
 } CopShared;
 /* The page reads these by offset (web/net.js). */
 _Static_assert(sizeof(CopOut) == 0x40 && sizeof(CopHit) == 0x40 && offsetof(CopShared, out) == 0x20 &&
                    offsetof(CopShared, slots) == 0x220 && offsetof(CopShared, tx_head) == 0x1220 &&
-                   sizeof(CopShared) == 0x1a30,
+                   offsetof(CopShared, more_magic) == 0x1a30 && offsetof(CopShared, out2) == 0x1a40 &&
+                   offsetof(CopShared, slots2) == 0x1a40 + 0x40 * (COP_MAX - COP_OUT_V1),
                "CopShared layout");
+
+static CopOut *cop_out(CopShared *sh, uint32_t i) {
+    return i < COP_OUT_V1 ? &sh->out[i] : &sh->out2[i - COP_OUT_V1];
+}
+static MpSlot *cop_slot(CopShared *sh, int i) {
+    return i < COP_SLOTS_V1 ? &sh->slots[i] : &sh->slots2[i - COP_SLOTS_V1];
+}
 
 typedef struct CopTrack { /* a cop chasing this player, as sent */
     uint32_t car;         /* PVehicle, 0 = free */
@@ -206,6 +348,7 @@ typedef struct CopTrack { /* a cop chasing this player, as sent */
     CopHit held;          /* a received hit waiting for our own touch */
     int holding, from;
     double held_at;
+    double wrecked_at;    /* our ms: when it was first sent wrecked, 0 = not yet (see WRECKED COPS) */
 } CopTrack;
 
 typedef struct CopCar { /* a friend's cop shown here */
@@ -217,7 +360,11 @@ typedef struct CopCar { /* a friend's cop shown here */
     CopHit hit;           /* touches with our car not sent yet, for its owner */
     int pending;
     double sent_at;       /* our ms: the last hit sent */
+    float steer, gas, brake; /* the controls cop_drive worked out last frame */
+    int gear;             /* and its gear, 0 = none yet */
     int met;              /* with our car: 0 apart, 1 solid (we ran into it), 2 passing through (see PASSING THROUGH) */
+    int wreck_tried;      /* this cop's wreck has been given to the copy (see WRECKED COPS) */
+    uint32_t cab, cab_no; /* a trailer's copy: the copy of its cab it was built behind, and that cab's number (TRUCKS WHOLE) */
 } CopCar;
 
 static uint32_t g_cop_block;
@@ -242,52 +389,107 @@ static CopShared *cop_shared(void) {
     return g_cop_block && g_api->guest_ptr(g_api, g_cop_block, sizeof(CopShared), &p) == POP_OK ? p : NULL;
 }
 
+/* Whether car is a truck's trailer of this game (driver class 4 and the TRAILER type). */
+static int cop_trailer(uint32_t car) {
+    return get_u32(car + 0x148) == TRF_TOWED && get_u32(car + TRF_TYPE) == get_u32(TRF_TRAILER_KEY);
+}
+
+/* The trailer cab tows (TRUCKS WHOLE), or 0: cab is a traffic car of this game whose IArticulatedVehicle names a
+ * listed trailer. */
+static uint32_t cop_towed(uint32_t cab) {
+    if (get_u32(cab + 0x148) != TRF_CLASS)
+        return 0;
+    const uint32_t artic = get_u32(cab + TRF_ARTIC), iv = artic && get_u32(artic) == TRF_ARTIC_TABLE ? get_u32(artic + 0x10) : 0;
+    return iv > 0xb8u && cop_trailer(iv - 0xb8u) && mp_listed(iv - 0xb8u) ? iv - 0xb8u : 0;
+}
+
+/* Whether car's damage is full: wrecked (see WRECKED COPS). */
+static int cop_wrecked(uint32_t car) {
+    const uint32_t damageable = get_u32(car + 0xfc);
+    return damageable && bits_float(get_u32(damageable + 0x34)) >= 1.0f;
+}
+
+/* Whether a cop car may be sent as far as its wreck goes: not wrecked, or wrecked after it was sent
+ * and less than COP_WRECK_KEEP ago (see WRECKED COPS). */
+static int cop_wreck_ok(uint32_t car) {
+    if (!cop_wrecked(car))
+        return 1;
+    for (int t = 0; t < COP_MAX; ++t)
+        if (g_cop_track[t].car == car)
+            return !g_cop_track[t].wrecked_at || mp_now() - g_cop_track[t].wrecked_at < COP_WRECK_KEEP;
+    return 0;
+}
+
 /* Whether car is one of the cop cars (not a helicopter) of pursuit. */
 static int cop_of(uint32_t car, uint32_t pursuit) {
     if (get_u32(car + 0x148) != COP_CLASS)
         return 0;
     const uint32_t ai = get_u32(car + COP_AI);
-    return ai && get_u32(ai) == COP_AI_TABLE && get_u32(ai + COP_AI_PURSUIT) == pursuit;
+    return ai && get_u32(ai) == COP_AI_TABLE && get_u32(ai + COP_AI_PURSUIT) == pursuit && cop_wreck_ok(car);
 }
 
 static uint32_t cop_flags(uint32_t car) {
+    if (get_u32(car + 0x148) == TRF_CLASS)
+        return COP_F_TRAFFIC | (cop_towed(car) ? COP_F_TOWING : 0u);
+    if (cop_trailer(car))
+        return COP_F_TRAFFIC | COP_F_TRAILER;
     const uint32_t ai = get_u32(car + COP_AI);
     const uint32_t siren = (get_u32(ai + COP_AI_SIREN) + 1u) & 15u;
     return (get_u32(car + COP_GLARE) & COP_LIGHTS ? COP_F_LIGHTS : 0) |
-           (get_u32(ai + COP_AI_CHASING) & 0xffu ? COP_F_CHASING : 0) | siren << 4;
+           (get_u32(ai + COP_AI_CHASING) & 0xffu ? COP_F_CHASING : 0) |
+           (cop_wrecked(car) ? COP_F_WRECKED : 0) | siren << 4;
 }
 
 /* ---- the chased player's game ---- */
 
-/* The cops of the player's pursuit, nearest first, into found[]; returns how many. */
-static int cop_find(uint32_t player, uint32_t found[COP_MAX]) {
-    const uint32_t ai = player ? get_u32(player + COP_AI) : 0;
-    const uint32_t pursuit = ai ? get_u32(ai + COP_AI_PURSUIT) : 0;
-    const uint32_t own = player ? mp_state(get_u32(player + 0x70)) : 0;
-    if (!pursuit || !own)
-        return 0;
-    float here[3], dist[COP_MAX];
-    for (int k = 0; k < 3; ++k)
-        here[k] = bits_float(get_u32(own + 0x10 + 4u * k));
-    int n = 0;
+/* The cars of this game for which want(car, pursuit) says yes within range of here, nearest first,
+ * into found[from..COP_MAX); returns the new count. A car sent already counts as keep times as far
+ * (squared): without that, traffic cars at much the same distance traded places in the list every
+ * few seconds and each change rebuilt a copy in the friends' games (16 in a minute, 2026-11-04). */
+static float g_cop_pts[MP_SLOTS][3]; /* friends' cars (their newest poses) within TRF_FRIEND, for shared traffic */
+static int g_cop_npts;
+static int cop_traffic_of(uint32_t car, uint32_t unused);
+static int cop_nearest(uint32_t player, const float here[3], uint32_t pursuit, int (*want)(uint32_t, uint32_t),
+                       float range, float keep, uint32_t found[COP_MAX], int from) {
+    float dist[COP_MAX];
+    if (from >= COP_MAX)
+        return from; /* full already: dist[] holds nothing of the earlier calls */
+    int n = from;
     uint32_t node = get_u32(MP_CARS);
-    for (int guard = 0; node && node != MP_CARS && guard < 64; ++guard, node = get_u32(node)) {
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
         const uint32_t car = node - 0xd0, state = car != player ? mp_state(get_u32(car + 0x70)) : 0;
-        if (!state || !cop_of(car, pursuit))
+        if (!state || !want(car, pursuit))
             continue;
         float d = 0;
         for (int k = 0; k < 3; ++k) {
             const float x = bits_float(get_u32(state + 0x10 + 4u * k)) - here[k];
             d += x * x;
         }
-        if (!(d <= COP_RANGE * COP_RANGE))
+        /* Shared traffic (Step B): the distance to whoever is nearest of us and the friends near us, so a
+         * friend driving ahead keeps the cars around it (g_cop_pts, filled by cop_find). */
+        for (int p = 0; want == cop_traffic_of && p < g_cop_npts; ++p) {
+            float e = 0;
+            for (int k = 0; k < 3; ++k) {
+                const float x = bits_float(get_u32(state + 0x10 + 4u * k)) - g_cop_pts[p][k];
+                e += x * x;
+            }
+            if (e < d)
+                d = e;
+        }
+        int sent = 0;
+        for (int t = 0; keep < 1.0f && t < COP_MAX && !sent; ++t)
+            sent = g_cop_track[t].car == car;
+        const float reach = sent ? range * (TRF_RANGE_KEEP / TRF_RANGE) : range; /* RANGE KEEP (traffic-stable-20261105) */
+        if (!(d <= reach * reach))
             continue;
+        if (sent)
+            d *= keep;
         int at = n < COP_MAX ? n++ : COP_MAX;
         if (at == COP_MAX && d >= dist[COP_MAX - 1])
             continue;
         if (at == COP_MAX)
             at = COP_MAX - 1;
-        for (; at > 0 && dist[at - 1] > d; --at) {
+        for (; at > from && dist[at - 1] > d; --at) {
             found[at] = found[at - 1];
             dist[at] = dist[at - 1];
         }
@@ -297,7 +499,460 @@ static int cop_find(uint32_t player, uint32_t found[COP_MAX]) {
     return n;
 }
 
-/* Keeps each cop's number while it stays in the chase; a new one takes a number not in use. */
+/* A traffic car of this game (not a copy of ours: those are class 7 or 8). A truck's trailer (a car of its own,
+ * without which friends saw trucks without their load, 2026-11-05) is not one: it goes with its cab (TRUCKS WHOLE). */
+static int cop_traffic_of(uint32_t car, uint32_t unused) {
+    (void)unused;
+    return get_u32(car + 0x148) == TRF_CLASS;
+}
+
+/* TRUCKS WHOLE: the traffic cars cand[0..m) (nearest first) into found[n..COP_MAX), each cab followed by the trailer
+ * it tows; a cab whose trailer does not fit is left out (the next car may). Returns the new count. */
+static int cop_with_trailers(uint32_t found[COP_MAX], int n, const uint32_t cand[COP_MAX], int m) {
+    for (int i = 0; i < m && n < COP_MAX; ++i) {
+        const uint32_t trailer = cop_towed(cand[i]);
+        int dup = 0;
+        for (int j = 0; trailer && j < n && !dup; ++j)
+            dup = found[j] == trailer;
+        if (trailer && !dup && n + 2 > COP_MAX)
+            continue;
+        found[n++] = cand[i];
+        if (trailer && !dup)
+            found[n++] = trailer;
+    }
+    return n;
+}
+
+/* A cop car of this game (not a helicopter) that is not in our pursuit (SHARED PATROLS). */
+static int cop_other_of(uint32_t car, uint32_t pursuit) {
+    if (get_u32(car + 0x148) != COP_CLASS)
+        return 0;
+    const uint32_t ai = get_u32(car + COP_AI);
+    return ai && get_u32(ai) == COP_AI_TABLE && (!pursuit || get_u32(ai + COP_AI_PURSUIT) != pursuit) &&
+           !cop_wrecked(car);
+}
+
+/* A wrecked cop car of this game out of our pursuit (the game drops a wrecked cop from it), still sent
+ * within COP_RANGE as in the chase it was in (see WRECKED COPS). */
+static int cop_wreck_of(uint32_t car, uint32_t pursuit) {
+    if (get_u32(car + 0x148) != COP_CLASS || !cop_wrecked(car))
+        return 0;
+    const uint32_t ai = get_u32(car + COP_AI);
+    return ai && get_u32(ai) == COP_AI_TABLE && (!pursuit || get_u32(ai + COP_AI_PURSUIT) != pursuit) &&
+           cop_wreck_ok(car);
+}
+
+/* The cops of the player's pursuit, nearest first, then (while this game shares its traffic) the
+ * nearest other cops and the nearest traffic cars, into found[]; returns how many. */
+static int cop_find(uint32_t player, uint32_t found[COP_MAX]) {
+    const uint32_t ai = player ? get_u32(player + COP_AI) : 0;
+    const uint32_t pursuit = ai ? get_u32(ai + COP_AI_PURSUIT) : 0;
+    const uint32_t own = player ? mp_state(get_u32(player + 0x70)) : 0;
+    if (!own)
+        return 0;
+    float here[3];
+    for (int k = 0; k < 3; ++k)
+        here[k] = bits_float(get_u32(own + 0x10 + 4u * k));
+    int n = pursuit ? cop_nearest(player, here, pursuit, cop_of, COP_RANGE, 1.0f, found, 0) : 0;
+    n = cop_nearest(player, here, pursuit, cop_wreck_of, COP_RANGE, 1.0f, found, n); /* sent ones only */
+    g_cop_npts = 0;
+    for (int i = 0; i < MP_SLOTS; ++i) {
+        const MpCar *c = &g_mp_remote[i];
+        if (!c->id || !c->kept)
+            continue;
+        float d = 0;
+        for (int k = 0; k < 3; ++k)
+            d += (c->pose[c->kept - 1].p[k] - here[k]) * (c->pose[c->kept - 1].p[k] - here[k]);
+        if (d <= TRF_FRIEND * TRF_FRIEND)
+            memcpy(g_cop_pts[g_cop_npts++], c->pose[c->kept - 1].p, sizeof g_cop_pts[0]);
+    }
+    if (g_trf_owner) {
+        n = cop_nearest(player, here, pursuit, cop_other_of, TRF_RANGE, TRF_KEEP, found, n);
+        uint32_t cand[COP_MAX];
+        const int m = cop_nearest(player, here, 0, cop_traffic_of, TRF_RANGE, TRF_KEEP, cand, 0);
+        n = cop_with_trailers(found, n, cand, m); /* TRUCKS WHOLE */
+    }
+    return n;
+}
+
+/* Who shows whose traffic (see SHARED TRAFFIC), once a frame before this game's list is made. */
+static void cop_traffic_owner(uint32_t player) {
+    const MpShared *mp = mp_shared();
+    const uint32_t me = mp ? mp->me : 0;
+    uint32_t from = 0;
+    for (int i = 0; me && player && i < COP_SLOTS; ++i) {
+        const MpSlot *s = &g_cop_seen[i];
+        if (s->id && s->mode == 1 && (s->pad[1] & COP_F_TRAFFIC) && s->id < me && (!from || s->id < from))
+            from = s->id;
+    }
+    const uint32_t own = player ? mp_state(get_u32(player + 0x70)) : 0;
+    /* QUIET HOLD (traffic-stable-20261105): still that player's street for a while after its traffic was last here. */
+    {
+        static double from_at;
+        const double now = mp_now();
+        if (from) {
+            from_at = now;
+        } else if (g_trf_from && own && now - from_at < TRF_QUIET_HOLD) {
+            for (int i = 0; i < MP_SLOTS; ++i) {
+                const MpCar *c = &g_mp_remote[i];
+                if (c->id != g_trf_from || !c->kept)
+                    continue;
+                float d = 0;
+                for (int k = 0; k < 3; ++k) {
+                    const float x = c->pose[c->kept - 1].p[k] - bits_float(get_u32(own + 0x10 + 4u * k));
+                    d += x * x;
+                }
+                if (d <= TRF_FRIEND * TRF_FRIEND)
+                    from = g_trf_from;
+            }
+        }
+    }
+    int near = 0;
+    for (int i = 0; own && !from && i < MP_SLOTS && !near; ++i) {
+        const MpCar *c = &g_mp_remote[i];
+        if (!c->id || !c->kept)
+            continue;
+        float d = 0;
+        for (int k = 0; k < 3; ++k) {
+            const float x = c->pose[c->kept - 1].p[k] - bits_float(get_u32(own + 0x10 + 4u * k));
+            d += x * x;
+        }
+        near = d <= TRF_FRIEND * TRF_FRIEND;
+    }
+    const int owner = !from && near, quiet = from != 0;
+    if (quiet != g_trf_quiet || owner != g_trf_owner || (quiet && from != g_trf_from)) {
+        char line[128];
+        if (quiet)
+            snprintf(line, sizeof line, "core.nfsc: traffic: showing player %u's traffic, ours spawns no more", from);
+        else
+            snprintf(line, sizeof line, owner ? "core.nfsc: traffic: sharing ours with the friends near us"
+                                              : "core.nfsc: traffic: our own, not shared (no friend near)");
+        log_line(line);
+    }
+    g_trf_owner = owner;
+    g_trf_quiet = quiet;
+    g_trf_from = from;
+    /* SHARED PATROLS: no police of our own while that player's are the ones here and no chase. */
+    const uint32_t ai = player ? get_u32(player + COP_AI) : 0;
+    int chase = ai && get_u32(ai + COP_AI_PURSUIT) != 0;
+    for (int i = 0; quiet && !chase && i < COP_SLOTS; ++i) {
+        const MpSlot *s = &g_cop_seen[i];
+        chase = s->id == from && s->mode == 1 && (s->pad[1] & COP_F_CHASING) != 0;
+    }
+    const int cop_quiet = COP_SHARED_PATROLS && quiet && !chase;
+    if (cop_quiet != g_cop_quiet) {
+        char line[128];
+        if (cop_quiet)
+            snprintf(line, sizeof line, "core.nfsc: police: player %u's police patrol here, ours spawn none", from);
+        else
+            snprintf(line, sizeof line, "core.nfsc: police: our own again (%s)", chase ? "a chase" : "no friend's police here");
+        log_line(line);
+    }
+    g_cop_quiet = cop_quiet;
+}
+
+/* Whether this game's traffic spawning is off now (traffic.h). */
+static int cop_traffic_quiet(void) {
+    return g_trf_quiet;
+}
+
+/* Whether this game's police are off now (pursuit.h sets the cop manager's maximum to 0). */
+static int cop_patrol_quiet(void) {
+    return g_cop_quiet;
+}
+
+/* SHARED PATROLS: no new cop asked for while a friend's police patrol here (REPLACE SpawnCop). */
+static void cop_no_spawn(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)inv;
+    (void)user;
+    if (g_cop_quiet)
+        api->hook_return(api, cpu, cpu->eax, 0x14);
+    else
+        api->call_original(api, cpu->target, cpu);
+}
+
+/* SHARED PATROLS: no cop car made while a friend's police patrol here (REPLACE the cop factory). */
+static void cop_no_make(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)inv;
+    (void)user;
+    if (g_cop_quiet)
+        api->hook_return(api, cpu, 0, 4);
+    else
+        api->call_original(api, cpu->target, cpu);
+}
+
+/* FRIENDS COUNT AS NEAR: BEFORE 00761550 at its three call sites. */
+static void cop_near_friends(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
+    (void)api;
+    (void)inv;
+    (void)user;
+    const uint32_t pos = get_u32(cpu->esp + 4);
+    const uint32_t me = g_mp_player_simable ? mp_state(get_u32(g_mp_player_simable - 0x24u + 0x70)) : 0;
+    if (!g_trf_owner || !g_trf_near_buf || !pos || !me)
+        return;
+    float p[3];
+    for (int k = 0; k < 3; ++k)
+        p[k] = bits_float(get_u32(pos + 4u * k));
+    for (int i = 0; i < MP_SLOTS; ++i) {
+        const MpCar *c = &g_mp_remote[i];
+        if (!c->id || !c->kept)
+            continue;
+        float d = 0;
+        for (int k = 0; k < 3; ++k)
+            d += (c->pose[c->kept - 1].p[k] - p[k]) * (c->pose[c->kept - 1].p[k] - p[k]);
+        if (d <= TRF_NEAR * TRF_NEAR) {
+            mp_copy(g_trf_near_buf, me + 0x10, 12);
+            mp_put(cpu->esp + 4, g_trf_near_buf);
+            return;
+        }
+    }
+}
+
+/* TRAFFIC NUMBER DIAGNOSIS (traffic-stable-20261105, test only: RECOMP_TRF_DIAG=1 in the URL). In the
+ * owner's game, each frame: every track (sent car) that lost its number and every new number, with the car's
+ * address, class, model, distance, whether it is still in the car list, and whether the same address had
+ * a number before (memory given to a new car, or the same car back). */
+typedef struct CopDiagOld { uint32_t car, number, key, cls; float p[3]; double at; } CopDiagOld;
+static CopDiagOld g_cdg_hist[64];
+static int g_cdg_next;
+static int cop_diag_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_TRF_DIAG");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+static int cop_diag_pos(uint32_t car, float p[3]) {
+    const uint32_t st = car ? mp_state(get_u32(car + 0x70)) : 0;
+    for (int k = 0; st && k < 3; ++k)
+        p[k] = bits_float(get_u32(st + 0x10 + 4u * k));
+    return st != 0;
+}
+static void cop_diag(uint32_t player, const uint32_t old_car[COP_MAX], const uint32_t old_num[COP_MAX], int n,
+                     const uint32_t found[COP_MAX]) {
+    static int last_n = -1;
+    static uint32_t frames;
+    ++frames;
+    float here[3] = {0, 0, 0};
+    cop_diag_pos(player, here);
+    const double now = mp_now();
+    if ((n == 0) != (last_n == 0) || last_n < 0) {
+        char line[200];
+        snprintf(line, sizeof line, "core.nfsc: trfdiag: n %d -> %d (page %d, owner %d, quiet %d, player %x)", last_n, n,
+                 cop_shared() ? (int)__atomic_load_n(&cop_shared()->page, __ATOMIC_ACQUIRE) : -1, g_trf_owner, g_trf_quiet,
+                 player);
+        log_line(line);
+    }
+    last_n = n;
+    /* Freed numbers. */
+    for (int t = 0; t < COP_MAX; ++t) {
+        if (!old_car[t])
+            continue;
+        int still = 0;
+        for (int u = 0; u < COP_MAX && !still; ++u)
+            still = g_cop_track[u].car == old_car[t] && g_cop_track[u].number == old_num[t];
+        if (still)
+            continue;
+        const uint32_t car = old_car[t];
+        float p[3] = {0, 0, 0};
+        const int listed = mp_listed(car), st = listed && cop_diag_pos(car, p);
+        float d = 0;
+        for (int k = 0; k < 3; ++k)
+            d += (p[k] - here[k]) * (p[k] - here[k]);
+        int rank = -1;
+        for (int i = 0; i < n; ++i)
+            if (found[i] == car)
+                rank = i;
+        char line[240];
+        snprintf(line, sizeof line,
+                 "core.nfsc: trfdiag: f%u free %u car %x listed %d state %d cls %u key %08x dist %.0f found-rank %d n %d", frames,
+                 old_num[t], car, listed, st, listed ? get_u32(car + 0x148) : 0u, listed ? mp_model_key(car) : 0u,
+                 st ? sqrtf(d) : -1.0f, rank, n);
+        log_line(line);
+        CopDiagOld *h = &g_cdg_hist[g_cdg_next++ % 64];
+        h->car = car;
+        h->number = old_num[t];
+        h->key = listed ? mp_model_key(car) : 0;
+        h->cls = listed ? get_u32(car + 0x148) : 0;
+        memcpy(h->p, p, sizeof h->p);
+        h->at = now;
+    }
+    /* New numbers. */
+    for (int u = 0; u < COP_MAX; ++u) {
+        const CopTrack *tr = &g_cop_track[u];
+        if (!tr->car)
+            continue;
+        int had = 0;
+        for (int t = 0; t < COP_MAX && !had; ++t)
+            had = old_car[t] == tr->car && old_num[t] == tr->number;
+        if (had)
+            continue;
+        float p[3] = {0, 0, 0};
+        cop_diag_pos(tr->car, p);
+        float d = 0;
+        for (int k = 0; k < 3; ++k)
+            d += (p[k] - here[k]) * (p[k] - here[k]);
+        const CopDiagOld *prev = NULL;
+        for (int i = 0; i < 64; ++i) {
+            const CopDiagOld *h = &g_cdg_hist[(g_cdg_next - 1 - i + 128) % 64];
+            if (h->car == tr->car) {
+                prev = h;
+                break;
+            }
+        }
+        float moved = 0;
+        for (int k = 0; prev && k < 3; ++k)
+            moved += (p[k] - prev->p[k]) * (p[k] - prev->p[k]);
+        char line[260];
+        snprintf(line, sizeof line,
+                 "core.nfsc: trfdiag: f%u new %u car %x cls %u key %08x dist %.0f n %d; same address before: %s %u key %s moved %.0f m %.0f ms ago",
+                 frames, tr->number, tr->car, get_u32(tr->car + 0x148), mp_model_key(tr->car), sqrtf(d), n, prev ? "number" : "none",
+                 prev ? prev->number : 0u, prev ? (prev->key == mp_model_key(tr->car) ? "same" : "other") : "-",
+                 prev ? sqrtf(moved) : 0.0f, prev ? now - prev->at : 0.0);
+        log_line(line);
+    }
+}
+
+/* STABLE NUMBERS (traffic-stable-20261105). A car's number used to live in its track (CopTrack), and a track
+ * lived only while the car was in this frame's list: a traffic car that left the list for one frame (the
+ * nearest COP_MAX traded places, it passed out of range and back, the list was empty for a frame) came back
+ * under a new number, and every friend's game removed its copy and built a new one. Now each car of this game
+ * that can be sent (police class 2, traffic class 1, trucks' trailers) gets its number when it first appears
+ * in the game's car list and keeps it for its whole life, sent or not. A car's memory given to a new car
+ * (the game frees a car and builds the next in the same place: the same address) is a new car: a new model or
+ * class, a jump no car can drive (COP_ID_JUMP + COP_ID_SPEED x the time since we last saw it), or a wrecked
+ * cop no longer wrecked (see WRECKED COPS). Measured (d15-fixA-1): the game moves a patrol cop's car 100-300 m
+ * about every 10 s (the same address: its patrol given a new place), which is a new car here, so a friend's
+ * game takes its copy away (out of view, or lingering in view) and builds the new one where it now is. A car
+ * gone from the list frees its number. */
+#define COP_IDS 128
+#define COP_ID_JUMP 40.0f   /* metres, plus */
+#define COP_ID_SPEED 120.0f /* metres a second since it was last seen */
+typedef struct CopId {
+    uint32_t car, number, key, cls;
+    uint32_t towed;       /* the trailer this cab tows, this frame (TRUCKS WHOLE), 0 = none */
+    float p[3];
+    int has_p, wrecked;
+    uint32_t frame;
+    double at;
+} CopId;
+static CopId g_cop_ids[COP_IDS];
+static uint32_t g_cop_id_frame, g_cop_id_next, g_cop_ids_born, g_cop_ids_reborn, g_cop_ids_full;
+
+static int cop_id_wanted(uint32_t car) {
+    const uint32_t cls = get_u32(car + 0x148);
+    return cls == TRF_CLASS || cls == COP_CLASS; /* a trailer's number is its cab's (TRUCKS WHOLE) */
+}
+
+static uint32_t cop_id_number_free(void) {
+    for (int guard = 0; guard < 128; ++guard) {
+        g_cop_id_next = g_cop_id_next % (TRF_TRAILER_NO - 1u) + 1u; /* 1-127: + TRF_TRAILER_NO is its trailer's */
+        int used = 0;
+        for (int i = 0; i < COP_IDS && !used; ++i)
+            used = g_cop_ids[i].car && g_cop_ids[i].number == g_cop_id_next;
+        if (!used)
+            return g_cop_id_next;
+    }
+    return 0;
+}
+
+/* Once a frame, before the list is made: every car's number, kept or new. */
+static void cop_ids_frame(void) {
+    const uint32_t frame = ++g_cop_id_frame;
+    const double now = mp_now();
+    uint32_t node = get_u32(MP_CARS);
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
+        const uint32_t car = node - 0xd0;
+        if (!cop_id_wanted(car))
+            continue;
+        const uint32_t key = mp_model_key(car), cls = get_u32(car + 0x148), state = mp_state(get_u32(car + 0x70));
+        float p[3] = {0, 0, 0};
+        for (int k = 0; state && k < 3; ++k)
+            p[k] = bits_float(get_u32(state + 0x10 + 4u * k));
+        const int wrecked = cls == COP_CLASS && cop_wrecked(car);
+        CopId *id = NULL, *free_id = NULL;
+        for (int i = 0; i < COP_IDS && !id; ++i) {
+            if (g_cop_ids[i].car == car)
+                id = &g_cop_ids[i];
+            else if (!g_cop_ids[i].car && !free_id)
+                free_id = &g_cop_ids[i];
+        }
+        int born = 0;
+        if (id) {
+            float jump = 0;
+            for (int k = 0; state && id->has_p && k < 3; ++k)
+                jump += (p[k] - id->p[k]) * (p[k] - id->p[k]);
+            const float may = COP_ID_JUMP + COP_ID_SPEED * (float)((now - id->at) / 1000.0);
+            /* A new car is in the list at the world's origin for a frame or two before the game puts it on
+             * the road (every traffic car, 3280-3370 m jumps in d15-fixA-1): that first move is not a new car. */
+            const int placed = fabsf(id->p[0]) + fabsf(id->p[1]) + fabsf(id->p[2]) > 5.0f;
+            if (id->key != key || id->cls != cls || (id->wrecked && !wrecked) || (placed && jump > may * may)) {
+                if (cop_diag_on()) {
+                    char line[200];
+                    snprintf(line, sizeof line,
+                             "core.nfsc: trfdiag: number %u's car %x is a new car (key %08x -> %08x, class %u -> %u, wrecked %d -> %d, "
+                             "jump %.0f m in %.0f ms)",
+                             id->number, car, id->key, key, id->cls, cls, id->wrecked, wrecked, sqrtf(jump), now - id->at);
+                    log_line(line);
+                }
+                ++g_cop_ids_reborn;
+                id->number = 0;
+                born = 1;
+            }
+        } else if (free_id) {
+            id = free_id;
+            memset(id, 0, sizeof *id);
+            id->car = car;
+            born = 1;
+        } else {
+            ++g_cop_ids_full;
+            continue;
+        }
+        if (born) {
+            id->number = cop_id_number_free();
+            ++g_cop_ids_born;
+        }
+        id->key = key;
+        id->cls = cls;
+        id->towed = cop_towed(car);
+        id->wrecked = wrecked;
+        id->frame = frame;
+        if (state) {
+            memcpy(id->p, p, sizeof id->p);
+            id->has_p = 1;
+            id->at = now;
+        }
+    }
+    for (int i = 0; i < COP_IDS; ++i)
+        if (g_cop_ids[i].car && g_cop_ids[i].frame != frame)
+            g_cop_ids[i].car = 0; /* gone from the car list */
+    static double said_at;
+    if (now - said_at >= 30000.0) {
+        said_at = now;
+        int live = 0;
+        for (int i = 0; i < COP_IDS; ++i)
+            live += g_cop_ids[i].car != 0;
+        char line[160];
+        snprintf(line, sizeof line, "core.nfsc: cops: car numbers: %d cars now, %u numbered so far, %u of them memory given to a new car%s",
+                 live, g_cop_ids_born, g_cop_ids_reborn, g_cop_ids_full ? " (table full at times)" : "");
+        log_line(line);
+    }
+}
+
+/* car's number for its life (cop_ids_frame), 0 = none. A trailer's is its cab's + TRF_TRAILER_NO while that cab
+ * tows it (TRUCKS WHOLE). */
+static uint32_t cop_id_number(uint32_t car) {
+    for (int i = 0; car && i < COP_IDS; ++i)
+        if (g_cop_ids[i].car == car)
+            return g_cop_ids[i].number;
+    for (int i = 0; car && i < COP_IDS; ++i)
+        if (g_cop_ids[i].car && g_cop_ids[i].towed == car && g_cop_ids[i].number && g_cop_ids[i].number < TRF_TRAILER_NO)
+            return g_cop_ids[i].number + TRF_TRAILER_NO;
+    return 0;
+}
+
+/* A track for car (a car sent this frame), with the car's own number (STABLE NUMBERS). */
 static CopTrack *cop_track(uint32_t car) {
     CopTrack *free_track = NULL;
     for (int i = 0; i < COP_MAX; ++i) {
@@ -306,30 +961,77 @@ static CopTrack *cop_track(uint32_t car) {
         if (!g_cop_track[i].car && !free_track)
             free_track = &g_cop_track[i];
     }
-    if (!free_track)
+    const uint32_t number = cop_id_number(car);
+    if (!free_track || !number)
         return NULL;
-    for (int guard = 0; guard < 256; ++guard) {
-        g_cop_next = g_cop_next % 255u + 1u;
-        int used = 0;
-        for (int i = 0; i < COP_MAX; ++i)
-            used |= g_cop_track[i].car && g_cop_track[i].number == g_cop_next;
-        if (!used)
-            break;
-    }
     memset(free_track, 0, sizeof *free_track);
     free_track->car = car;
-    free_track->number = g_cop_next;
+    free_track->number = number;
     return free_track;
+}
+
+/* TEST (RECOMP_COP_WRECK=1 in the URL): the first cop sent to friends for 15 s is taken out with the
+ * game's own Destroy, as a ram that wrecks it would (WRECKED COPS). With no cop sent 20 s after the
+ * first frame sent, a chase of our car is started (ICopMgr +0x3c PursueAtHeatLevel 004358d0, heat 1). */
+static void cop_wreck_test(int n, const uint32_t found[COP_MAX]) {
+    static int test = -1, done, chased;
+    static double since, first;
+    if (test < 0) {
+        const char *e = getenv("RECOMP_COP_WRECK");
+        test = e && e[0] == '1';
+    }
+    if (!test || done || !n)
+        return;
+    if (!first)
+        first = mp_now();
+    const uint32_t mgr = get_u32(0x00a9e874u);
+    if (!chased && !since && mp_now() - first > 20000.0 && mgr) {
+        const uint32_t heat = 1;
+        mp_call(get_u32(get_u32(mgr) + 0x3c), mgr, &heat, 1);
+        chased = 1;
+        log_line("core.nfsc: cops: test: a chase of our car started");
+    }
+    for (int i = 0; i < n; ++i) {
+        const uint32_t damageable = get_u32(found[i] + 0xfc);
+        if (get_u32(found[i] + 0x148) != COP_CLASS || !damageable)
+            continue;
+        if (!since)
+            since = mp_now();
+        if (mp_now() - since < 15000.0)
+            return;
+        mp_call(COP_DESTROY, damageable, NULL, 0);
+        done = 1;
+        log_line(cop_wrecked(found[i]) ? "core.nfsc: cops: test: a cop sent to friends taken out"
+                                       : "core.nfsc: cops: test: Destroy left the cop as it was");
+        return;
+    }
 }
 
 /* This player's chase, for the page to send. */
 static void cop_publish(CopShared *sh, uint32_t player) {
     static uint32_t last_count;
     uint32_t found[COP_MAX];
+    uint32_t dg_car[COP_MAX], dg_num[COP_MAX];
+    for (int i = 0; i < COP_MAX; ++i) {
+        dg_car[i] = g_cop_track[i].car;
+        dg_num[i] = g_cop_track[i].number;
+    }
+    cop_ids_frame();
     const int n = __atomic_load_n(&sh->page, __ATOMIC_ACQUIRE) ? cop_find(player, found) : 0;
-    for (int i = 0; i < COP_MAX; ++i)
+    for (int i = 0; i < COP_MAX; ++i) {
         g_cop_track[i].seen = 0;
+        if (g_cop_track[i].car && g_cop_track[i].wrecked_at && !cop_wrecked(g_cop_track[i].car))
+            g_cop_track[i].car = 0; /* its car given to a new one (see WRECKED COPS): a new number */
+    }
     CopTrack *tracks[COP_MAX];
+    /* Cars no longer listed give up their track first, so a new one gets it this frame. */
+    for (int t = 0; t < COP_MAX; ++t) {
+        int listed = 0;
+        for (int i = 0; i < n && !listed; ++i)
+            listed = g_cop_track[t].car == found[i];
+        if (!listed || (g_cop_track[t].car && g_cop_track[t].number != cop_id_number(g_cop_track[t].car)))
+            g_cop_track[t].car = 0; /* not sent now, or its memory is a new car's (STABLE NUMBERS) */
+    }
     for (int i = 0; i < n; ++i) {
         tracks[i] = cop_track(found[i]);
         if (tracks[i])
@@ -344,29 +1046,44 @@ static void cop_publish(CopShared *sh, uint32_t player) {
     __atomic_fetch_add(&sh->seq, 1u, __ATOMIC_SEQ_CST);
     sh->ms = mp_ms();
     sh->frame = g_mp_frame;
-    uint32_t count = 0;
+    uint32_t count = 0, sent_cab = 0; /* sent_cab: the trailer the car sent just before tows (TRUCKS WHOLE) */
     for (int i = 0; i < n; ++i) {
-        CopOut *o = &sh->out[count];
+        CopOut *o = cop_out(sh, count);
         const uint32_t state = mp_state(get_u32(found[i] + 0x70));
-        if (!tracks[i] || !state)
-            continue;
+        const uint32_t tows = sent_cab;
+        sent_cab = 0;
+        if (!tracks[i] || !state || (cop_trailer(found[i]) && tows != found[i]))
+            continue; /* a trailer goes only right after its cab, in the same frame */
         mp_read(state, &o->pose);
         if (!mp_pose_ok(&o->pose))
             continue;
+        sent_cab = get_u32(found[i] + 0x148) == TRF_CLASS ? cop_towed(found[i]) : 0;
         o->id = tracks[i]->number;
         o->key = mp_model_key(found[i]);
         o->flags = cop_flags(found[i]);
+        if ((o->flags & COP_F_WRECKED) && !tracks[i]->wrecked_at) {
+            tracks[i]->wrecked_at = mp_now();
+            char line[96];
+            snprintf(line, sizeof line, "core.nfsc: cops: cop %u wrecked, shown wrecked to friends", o->id);
+            log_line(line);
+        }
         ++count;
     }
+    if (cop_diag_on())
+        cop_diag(player, dg_car, dg_num, n, found);
+    cop_wreck_test(n, found);
     sh->count = count;
     __atomic_fetch_add(&sh->seq, 1u, __ATOMIC_SEQ_CST);
-    if (!count != !last_count) {
+    uint32_t cops = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        cops += !(cop_out(sh, i)->flags & COP_F_TRAFFIC);
+    if (!cops != !last_count) {
         char line[96];
-        snprintf(line, sizeof line, count ? "core.nfsc: cops: in a chase, %u cops sent to friends"
-                                          : "core.nfsc: cops: chase over (was %u cops)", count ? count : last_count);
+        snprintf(line, sizeof line, cops ? "core.nfsc: cops: in a chase, %u cops sent to friends"
+                                         : "core.nfsc: cops: chase over (was %u cops)", cops ? cops : last_count);
         log_line(line);
     }
-    last_count = count;
+    last_count = cops;
 }
 
 static int cop_vector_ok(const float v[3], float limit) {
@@ -591,6 +1308,14 @@ static MpCar *cop_car_of(uint32_t owner) {
     return NULL;
 }
 
+/* Whether simable is a copy of a friend's cop, not of their traffic (race.h's minimap). */
+static int cop_chase_copy(uint32_t simable) {
+    for (int i = 0; simable && i < COP_SLOTS; ++i)
+        if (g_cop_cars[i].car.simable == simable && !(g_cop_cars[i].flags & COP_F_TRAFFIC))
+            return 1;
+    return 0;
+}
+
 /* Whether owner is a kept copy. */
 static int cop_spare_of(uint32_t owner) {
     for (int i = 0; owner && i < COP_SPARES; ++i)
@@ -612,7 +1337,9 @@ static void cop_drop(CopCar *cc, const char *why) {
     MpCar *c = &cc->car;
     if (c->simable && why) {
         char line[128];
-        snprintf(line, sizeof line, "core.nfsc: cops: cop %u of player %u removed (%s)", cc->number, c->id, why);
+        snprintf(line, sizeof line, "core.nfsc: cops: %s %u of player %u removed (%s)",
+                 cc->flags & COP_F_TRAILER && cc->flags & COP_F_TRAFFIC ? "trailer" : cc->flags & COP_F_TRAFFIC ? "traffic car" : "cop",
+                 cc->number, c->id, why);
         log_line(line);
     }
     for (int i = 0; c->simable && i < COP_SPARES; ++i) {
@@ -621,6 +1348,9 @@ static void cop_drop(CopCar *cc, const char *why) {
             continue;
         const uint32_t car = c->simable - 0x24, state = mp_state(get_u32(car + 0x70));
         mp_put(car + COP_GLARE, get_u32(car + COP_GLARE) & ~COP_LIGHTS);
+        const uint32_t in = get_u32(car + DRV_INPUT); /* IInput::ClearInput: no gas left on */
+        if (in && get_u32(in))
+            mp_call(drv_method(in, 1), in, NULL, 0);
         if (state) { /* out of the way, then parked as police.h parks the player's own car */
             MpPose park;
             mp_read(state, &park);
@@ -646,6 +1376,15 @@ static void cop_drop(CopCar *cc, const char *why) {
 
 /* Whether a kept copy is still ours: in the car list, its class, and not (its memory given to)
  * another car of ours or of mp.h's. */
+static int cop_spare_ok(const CopSpare *sp);
+/* Whether a kept copy of this model is free: taking one is cheap, a build is not. */
+static int cop_spare_free(uint32_t key, uint32_t kind) {
+    for (int i = 0; i < COP_SPARES; ++i)
+        if (g_cop_spares[i].simable && g_cop_spares[i].key == key && g_cop_spares[i].kind == kind && cop_spare_ok(&g_cop_spares[i]))
+            return 1;
+    return 0;
+}
+
 static int cop_spare_ok(const CopSpare *sp) {
     const uint32_t simable = sp->simable;
     if (!simable || !mp_listed(simable - 0x24) || !mp_kind_kept(simable - 0x24, sp->kind) ||
@@ -699,10 +1438,23 @@ static void cop_spares(uint32_t player) {
 /* A cop model this game has now (one of its own cop cars), other than not, or 0. */
 static uint32_t cop_model_here(uint32_t not) {
     uint32_t node = get_u32(MP_CARS);
-    for (int guard = 0; node && node != MP_CARS && guard < 64; ++guard, node = get_u32(node)) {
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
         const uint32_t car = node - 0xd0, ai = get_u32(car + COP_AI);
         const uint32_t key = get_u32(car + 0x148) == COP_CLASS && ai && get_u32(ai) == COP_AI_TABLE ? mp_model_key(car) : 0;
         if (key && key != not)
+            return key;
+    }
+    return 0;
+}
+
+/* A traffic model this game has now (one of its own traffic cars), other than not, or 0. Never a truck cab
+ * that tows: as a stand-in it would show a friend's ordinary car as a cab without its trailer. */
+static uint32_t traffic_model_here(uint32_t not) {
+    uint32_t node = get_u32(MP_CARS);
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
+        const uint32_t car = node - 0xd0;
+        const uint32_t key = get_u32(car + 0x148) == TRF_CLASS ? mp_model_key(car) : 0;
+        if (key && key != not && !cop_towed(car))
             return key;
     }
     return 0;
@@ -757,15 +1509,238 @@ static void cop_send_hits(CopShared *sh) {
     }
 }
 
+
+/* LINGERING COPIES (Step B, 2026-11-05: "the traffic disappears in 10 seconds and then another"). A traffic
+ * copy whose car its owner no longer sends (it left the owner's list) is not taken away in front of this
+ * player: while it is in view (cop_in_view: on screen, within MP_VIEW_FAR) it stays where it is, its controls cleared (it
+ * rolls to a stop), its slot free for the next car; it goes (cop_drop) once it is farther or out of view,
+ * (COP_LINGER_MS no longer applies in view: logs/no-vanish-20261106). When its owner sends the same car again it
+ * takes the lingering copy back.
+ * Patrol cops (not chasing) linger too (traffic-stable-20261105): the game moves a patrol's car 100-300 m about
+ * every 10 s, which is a new car (STABLE NUMBERS), and its old copy should not vanish in front of this player. */
+#define COP_LINGER 16
+#define COP_LINGER_NEAR 150.0f
+#define COP_LINGER_MS 30000.0
+#define COP_VIEW_COS 0.34f /* about 70 degrees each side of our car's heading */
+typedef struct CopLinger {
+    uint32_t simable, kind, key, built, number, owner, flags;
+    double since;
+    uint32_t cab, cab_no; /* a trailer's: as CopCar's (TRUCKS WHOLE) */
+} CopLinger;
+static CopLinger g_cop_linger[COP_LINGER];
+static uint32_t g_cop_lingered, g_cop_linger_back, g_cop_linger_gone;
+
+static int cop_car_pos(uint32_t simable, float out[3]) {
+    const uint32_t st = mp_state(get_u32(simable - 0x24 + 0x70));
+    for (int k = 0; st && k < 3; ++k)
+        out[k] = bits_float(get_u32(st + 0x10 + 4u * k));
+    return st != 0;
+}
+
+/* Whether p is in view: on this player's screen (mp.h mp_seen_at: the main view's projection, or within
+ * MP_VIEW_NEAR) and within MP_VIEW_FAR (logs/no-vanish-20261106). It was "within COP_LINGER_NEAR (150 m) and within
+ * 70 degrees of our car's heading": a copy leaves its owner's list at TRF_RANGE_KEEP (360 m) from the owner, so in
+ * a friend's game it was nearly always farther than 150 m then, and no copy ever lingered (trucks-20261106). fwd is
+ * no longer used. */
+static int cop_in_view(const float here[3], const float fwd[3], const float p[3]) {
+    (void)fwd;
+    float len = 0;
+    for (int k = 0; k < 3; ++k)
+        len += (p[k] - here[k]) * (p[k] - here[k]);
+    return len <= MP_VIEW_FAR * MP_VIEW_FAR && mp_seen_at(p, here);
+}
+
+static void cop_drop(CopCar *cc, const char *why);
+/* A traffic copy leaving its slot: kept lingering (1) or not (0). */
+static int cop_linger(CopCar *cc, const float here[3], const float fwd[3]) {
+    MpCar *c = &cc->car;
+    float p[3];
+    if ((!(cc->flags & COP_F_TRAFFIC) && (cc->flags & COP_F_CHASING)) || !c->simable || !mp_listed(c->simable - 0x24) ||
+        !cop_car_pos(c->simable, p) ||
+        !cop_in_view(here, fwd, p))
+        return 0;
+    for (int i = 0; i < COP_LINGER; ++i) {
+        CopLinger *l = &g_cop_linger[i];
+        if (l->simable)
+            continue;
+        const uint32_t car = c->simable - 0x24, in = get_u32(car + DRV_INPUT);
+        if (in && get_u32(in))
+            mp_call(drv_method(in, 1), in, NULL, 0); /* IInput::ClearInput: it rolls to a stop */
+        *l = (CopLinger){c->simable, c->kind, c->key, cc->built, cc->number, c->id, cc->flags, mp_now(), cc->cab, cc->cab_no};
+        c->simable = 0;
+        c->pending = c->holding = 0;
+        ++g_cop_lingered;
+        return 1;
+    }
+    return 0;
+}
+
+/* The lingering copy of owner's car number (model key), taken back, or 0. */
+static uint32_t cop_linger_take(uint32_t owner, uint32_t number, uint32_t key, uint32_t kind) {
+    for (int i = 0; i < COP_LINGER; ++i) {
+        CopLinger *l = &g_cop_linger[i];
+        if (l->simable && l->owner == owner && l->number == number && l->key == key && l->kind == kind &&
+            mp_listed(l->simable - 0x24)) {
+            const uint32_t simable = l->simable;
+            l->simable = 0;
+            ++g_cop_linger_back;
+            return simable;
+        }
+    }
+    return 0;
+}
+
+/* A lingering copy goes (cop_drop). */
+static void cop_linger_drop(CopLinger *l, const char *why) {
+    CopCar tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.car.simable = l->simable;
+    tmp.car.kind = l->kind;
+    tmp.car.id = l->owner;
+    tmp.car.key = l->key;
+    tmp.built = l->built;
+    tmp.number = l->number;
+    tmp.flags = l->flags;
+    l->simable = 0;
+    ++g_cop_linger_gone;
+    cop_drop(&tmp, why);
+}
+
+/* OLDER GAMES' TRAILERS: the cab model of a trailer model (both truck models of the game, trucks-20261106), 0 = unknown. */
+static uint32_t cop_cab_of(uint32_t trailer_key) {
+    return trailer_key == 0xdcfbf79eu ? 0x0a92cc67u : trailer_key == 0x1caa5b90u ? 0xa9b509c4u : 0;
+}
+/* The squared distance between two copies' newest poses, or -1. */
+static float cop_pose_d2(const MpCar *a, const MpCar *b) {
+    if (!a->kept || !b->kept)
+        return -1.0f;
+    float d = 0;
+    for (int k = 0; k < 3; ++k)
+        d += (a->pose[a->kept - 1].p[k] - b->pose[b->kept - 1].p[k]) * (a->pose[a->kept - 1].p[k] - b->pose[b->kept - 1].p[k]);
+    return d;
+}
+
+/* TRUCKS WHOLE: the slot of trailer slot i's cab (the same owner, the trailer's number - TRF_TRAILER_NO, flagged
+ * COP_F_TOWING), or -1. A trailer numbered below TRF_TRAILER_NO comes from an older game: it goes with that owner's
+ * copy of its truck's cab model (OLDER GAMES' TRAILERS) nearest to it within TRF_HITCH_NEAR. */
+static int cop_cab_slot(int i) {
+    const MpSlot *s = &g_cop_seen[i];
+    const MpCar *a = &g_cop_cars[i].car;
+    int best = -1;
+    float best_d = TRF_HITCH_NEAR * TRF_HITCH_NEAR;
+    for (int j = 0; j < COP_SLOTS; ++j) {
+        const MpSlot *t = &g_cop_seen[j];
+        if (j == i || t->id != s->id || t->mode != 1 || !t->pad[0] || !(t->pad[1] & COP_F_TRAFFIC) || (t->pad[1] & COP_F_TRAILER))
+            continue;
+        if (s->pad[0] & TRF_TRAILER_NO) {
+            if ((t->pad[1] & COP_F_TOWING) && t->pad[0] == s->pad[0] - TRF_TRAILER_NO)
+                return j;
+            continue;
+        }
+        const MpCar *b = &g_cop_cars[j].car;
+        const uint32_t cab_key = cop_cab_of(s->key);
+        if (cab_key && t->key != cab_key)
+            continue; /* OLDER GAMES' TRAILERS: only its own truck's cab, never a car passing by */
+        const float d = cop_pose_d2(a, b);
+        if (d >= 0 && d < best_d) {
+            best_d = d;
+            best = j;
+        }
+    }
+    return best;
+}
+
+/* TRUCKS WHOLE: whether the cab copy cab (owner's car number no) is still here: in a slot of that car, or lingering. */
+static int cop_cab_here(uint32_t owner, uint32_t cab, uint32_t no) {
+    for (int j = 0; cab && j < COP_SLOTS; ++j)
+        if (g_cop_cars[j].car.simable == cab && g_cop_cars[j].car.id == owner && g_cop_cars[j].number == no)
+            return 1;
+    for (int j = 0; cab && j < COP_LINGER; ++j)
+        if (g_cop_linger[j].simable == cab && g_cop_linger[j].owner == owner && g_cop_linger[j].number == no)
+            return 1;
+    return 0;
+}
+
+/* TRUCKS WHOLE, at the end of every cop_cars: a trailer's copy (in a slot or lingering) whose cab's copy is no longer
+ * here goes, in the same frame as its cab's. */
+static uint32_t g_cop_trailers_dropped;
+static void cop_trailers_follow(void) {
+    for (int i = 0; i < COP_SLOTS; ++i) {
+        CopCar *cc = &g_cop_cars[i];
+        if (!cc->car.simable || !(cc->flags & COP_F_TRAFFIC) || !(cc->flags & COP_F_TRAILER))
+            continue;
+        const char *why = !cop_cab_here(cc->car.id, cc->cab, cc->cab_no) ? "its truck's copy is gone" : NULL;
+        if (!why && cc->number < TRF_TRAILER_NO) {
+            /* OLDER GAMES' TRAILERS: its cab copy in a slot (a lingering one stands still), and still hitched. */
+            int j = 0;
+            while (j < COP_SLOTS && !(g_cop_cars[j].car.simable == cc->cab && g_cop_cars[j].car.id == cc->car.id &&
+                                      g_cop_cars[j].number == cc->cab_no))
+                ++j;
+            const float d = j < COP_SLOTS ? cop_pose_d2(&cc->car, &g_cop_cars[j].car) : -1.0f;
+            if (j == COP_SLOTS)
+                why = "an older game's trailer, its truck's copy is not following it";
+            else if (d < 0 || d > TRF_HITCH_KEEP * TRF_HITCH_KEEP)
+                why = "an older game's trailer, its truck's copy is not hitched to it";
+        }
+        if (why) {
+            ++g_cop_trailers_dropped;
+            cop_drop(cc, why);
+            cc->car.wait = 0;
+        }
+    }
+    for (int i = 0; i < COP_LINGER; ++i) {
+        CopLinger *l = &g_cop_linger[i];
+        if (l->simable && (l->flags & COP_F_TRAFFIC) && (l->flags & COP_F_TRAILER) && !cop_cab_here(l->owner, l->cab, l->cab_no)) {
+            ++g_cop_trailers_dropped;
+            cop_linger_drop(l, "lingering, its truck's copy is gone");
+        }
+    }
+}
+
+/* Every frame: lingering copies out of view, farther than COP_LINGER_NEAR, or too old go. */
+static void cop_linger_frame(const float here[3], const float fwd[3], int have_player) {
+    const double now = mp_now();
+    static double said_at;
+    static uint32_t said;
+    if (now - said_at >= 10000.0 && g_cop_lingered + g_cop_linger_back + g_cop_linger_gone != said) {
+        said_at = now;
+        said = g_cop_lingered + g_cop_linger_back + g_cop_linger_gone;
+        int n = 0;
+        for (int i = 0; i < COP_LINGER; ++i)
+            n += g_cop_linger[i].simable != 0;
+        char line[160];
+        snprintf(line, sizeof line, "core.nfsc: cops: traffic copies lingering %d now; %u lingered, %u taken back, %u gone so far", n,
+                 g_cop_lingered, g_cop_linger_back, g_cop_linger_gone);
+        log_line(line);
+    }
+    for (int i = 0; i < COP_LINGER; ++i) {
+        CopLinger *l = &g_cop_linger[i];
+        float p[3];
+        if (!l->simable)
+            continue;
+        if (!mp_listed(l->simable - 0x24) || get_u32(l->simable - 0x24 + 0x148) != l->kind) {
+            l->simable = 0; /* gone with the world */
+            continue;
+        }
+        if (have_player && cop_car_pos(l->simable, p) && cop_in_view(here, fwd, p))
+            continue; /* no time limit in view (logs/no-vanish-20261106: COP_LINGER_MS took copies away in plain view) */
+        cop_linger_drop(l, now - l->since >= COP_LINGER_MS ? "lingered 30 s" : "lingered until out of view or 150 m away");
+    }
+}
+
 /* Friends' cops from the page's slots: built near us, moved in mp_place_all (cop_place). */
 static void cop_cars(CopShared *sh, uint32_t player) {
     const double now = mp_now();
     const uint32_t state = player ? mp_state(get_u32(player + 0x70)) : 0;
     float here[3] = {0, 0, 0};
-    for (int k = 0; k < 3 && state; ++k)
+    float fwd[3] = {0, 0, 1};
+    for (int k = 0; k < 3 && state; ++k) {
         here[k] = bits_float(get_u32(state + 0x10 + 4u * k));
+        fwd[k] = bits_float(get_u32(state + 0x90 + 4u * k));
+    }
+    cop_linger_frame(here, fwd, state != 0);
     for (int i = 0; i < COP_SLOTS; ++i) {
-        MpSlot *src = &sh->slots[i], copy;
+        MpSlot *src = cop_slot(sh, i), copy;
         const uint32_t before = __atomic_load_n(&src->seq, __ATOMIC_ACQUIRE);
         if (!(before & 1)) {
             memcpy(&copy, src, sizeof copy);
@@ -781,7 +1756,8 @@ static void cop_cars(CopShared *sh, uint32_t player) {
             c->simable = 0;
         const int active = s->id && s->mode == 1 && s->pad[0] && state;
         const int same = c->id == s->id && cc->number == s->pad[0] && c->key == s->key;
-        if (c->simable && (!active || !same || c->kind != cop_kind()))
+        if (c->simable && (!active || !same || c->kind != cop_kind()) &&
+            !(c->kind == cop_kind() && state && !g_mp_local_paused && cop_linger(cc, here, fwd)))
             cop_drop(cc, active ? "another cop in its slot" : "out of the chase or out of reach");
         if (!active) {
             c->id = 0;
@@ -795,11 +1771,14 @@ static void cop_cars(CopShared *sh, uint32_t player) {
             c->wait = 0;
             c->tries = 0;
             cc->round = 0;
+            cc->steer = cc->gas = cc->brake = 0;
+            cc->gear = 0;
             c->taken = s->count + 1; /* start over in mp_take */
             c->follow = MP_FOLLOWING;
             c->contact_at = 0;
             cc->pending = 0;
             cc->met = 0;
+            cc->wreck_tried = 0;
         }
         cc->flags = s->pad[1];
         c->contacts = 0; /* mp.h's shared impacts are for players' own cars */
@@ -813,20 +1792,36 @@ static void cop_cars(CopShared *sh, uint32_t player) {
         float near = (MP_NEAR_FROM - sqrtf(d2)) / (MP_NEAR_FROM - MP_NEAR_TO); /* as mp_remotes */
         near = c->kind == MP_GHOST || near < 0 ? 0 : near > 1 ? 1 : near;
         c->lag = MP_DELAY + (MP_NEAR_DELAY - MP_DELAY) * near;
-        if (c->simable) {
-            if (d2 > MP_FAR * MP_FAR)
+        if (g_mp_local_paused)
+            continue; /* as mp_remotes: no new or removed cars behind the frozen menu */
+        /* TRUCKS WHOLE: a trailer's copy is built and removed with its cab's, not by its own distance from us (7 m
+         * from its cab's: at MP_NEAR and MP_FAR one of the two was built or removed alone, measured 2026-11-06). */
+        const int towed = (s->pad[1] & COP_F_TRAFFIC) && (s->pad[1] & COP_F_TRAILER);
+        if (c->simable) { /* RADII (logs/no-vanish-20261106): as a friend's car, built within MP_BUILD_FAR, gone past MP_VIEW_FAR */
+            if (d2 > MP_VIEW_FAR * MP_VIEW_FAR && !towed)
                 cop_drop(cc, "far away");
             continue;
         }
-        if (d2 > MP_NEAR * MP_NEAR || (c->wait && --c->wait))
+        if ((d2 > MP_BUILD_FAR * MP_BUILD_FAR && !towed) || (c->wait && --c->wait))
             continue;
         if (d2 < COP_BUILD_CLEAR * COP_BUILD_CLEAR) { /* not on our car (see NEAR OUR CAR) */
             c->wait = 6;
             continue;
         }
-        /* Its own model, then spooled, then a cop model this game has (see the header). */
-        const int step = c->tries % 3;
-        const uint32_t key = step < 2 ? s->key : cop_model_here(s->key); /* 0 = model 0 is the player's own */
+        /* Its own model, then spooled, then a cop (or, for a traffic car, a traffic) model this game
+         * has (see the header). */
+        const int step = c->tries % 3, traffic = (s->pad[1] & COP_F_TRAFFIC) != 0;
+        const int trailer = traffic && (s->pad[1] & COP_F_TRAILER) != 0; /* only its own model: never a car */
+        /* TRUCKS WHOLE: a trailer's copy only behind its cab's, built in the cab's own model (never behind a car
+         * standing in for a truck this game does not have), and then at once: not after the build gap. */
+        const int cab_slot = trailer ? cop_cab_slot(i) : -1;
+        if (trailer && (cab_slot < 0 || !g_cop_cars[cab_slot].car.simable || g_cop_cars[cab_slot].built != g_cop_seen[cab_slot].key))
+            continue;
+        const uint32_t key = step < 2 ? s->key : trailer ? 0 : traffic ? traffic_model_here(s->key) : cop_model_here(s->key);
+        /* 0 = model 0 is the player's own */
+        /* One build per MP_BUILD_GAP_MS, shared with friends' cars: a chase can bring eight at once. */
+        if (key && now < g_mp_build_after && !cop_spare_free(key, cop_kind()) && !trailer)
+            continue;
         ++c->tries;
         if (!key) { /* no cop car here to borrow a model from: the next round */
             c->wait = step == 2 ? COP_RETRY : 2;
@@ -838,25 +1833,35 @@ static void cop_cars(CopShared *sh, uint32_t player) {
         c->follow = MP_FOLLOWING;
         memcpy(c->drawn, last->p, sizeof c->drawn);
         cc->met = 0;
+        cc->cab = trailer ? g_cop_cars[cab_slot].car.simable : 0; /* TRUCKS WHOLE: the cab copy it goes with */
+        cc->cab_no = trailer ? g_cop_cars[cab_slot].number : 0;
+        c->simable = cop_linger_take(c->id, cc->number, s->key, c->kind);
+        if (c->simable) {
+            cc->built = key;
+            continue; /* still where it lingered: the playback moves it on */
+        }
         c->simable = cop_spare_take(key, c->kind);
         if (c->simable) {
             mp_place(c->simable, last);
             cc->built = key;
             if (++g_cop_reused <= 40u || g_cop_reused % 100u == 0) {
                 char line[128];
-                snprintf(line, sizeof line, "core.nfsc: cops: cop %u of player %u (model %08x) took a kept copy (%u so far)",
-                         cc->number, c->id, key, g_cop_reused);
+                snprintf(line, sizeof line, "core.nfsc: cops: %s %u of player %u (model %08x) took a kept copy (%u so far)",
+                         trailer ? "trailer" : traffic ? "traffic car" : "cop", cc->number, c->id, key, g_cop_reused);
                 log_line(line);
             }
             continue;
         }
+        g_mp_build_after = now + MP_BUILD_GAP_MS;
         c->simable = mp_build(player, c->kind, key, last->p, flags, 0);
         cc->built = key;
         if (cc->round < 1 || c->simable) {
             char line[160];
-            snprintf(line, sizeof line, "core.nfsc: cops: cop %u of player %u (model %08x) %s%s%s", cc->number, c->id,
-                     s->key, c->simable ? "built" : "refused", flags & 1 ? " (spooled)" : "",
-                     key != s->key ? " in a cop model this game has (its own is not here)" : "");
+            snprintf(line, sizeof line, "core.nfsc: cops: %s %u of player %u (model %08x) %s%s%s",
+                     trailer ? "trailer" : traffic ? "traffic car" : "cop", cc->number, c->id, s->key, c->simable ? "built" : "refused",
+                     flags & 1 ? " (spooled)" : "",
+                     key == s->key ? "" : traffic ? " in a traffic model this game has (its own is not here)"
+                                                  : " in a cop model this game has (its own is not here)");
             log_line(line);
         }
         if (!c->simable) {
@@ -865,6 +1870,55 @@ static void cop_cars(CopShared *sh, uint32_t player) {
                 ++cc->round;
         }
     }
+    cop_trailers_follow(); /* TRUCKS WHOLE */
+}
+
+/* mp_drive.h's g_drv_cop: what a driver must be doing to make a copy move as it does at playback
+ * time play. A positive turn rate about the up axis goes with positive (right) steering when
+ * driving forward: 53 of 54 samples of a player's car turning at speed, 2026-11-04. */
+static int cop_forward(const float q[4], float out[2]);
+static int cop_drive(MpCar *c, double play, DrvCtl *out) {
+    CopCar *cc = cop_car(c);
+    float f[2];
+    MpPose a, b;
+    if (!cc || c->kept < 2)
+        return 0;
+    mp_sample(c, play, &a);
+    mp_sample(c, play - COP_DRV_SPAN, &b);
+    if (!cop_forward(a.q, f))
+        return 0;
+    const float along = a.v[0] * f[0] + a.v[2] * f[1], before = b.v[0] * f[0] + b.v[2] * f[1];
+    const float speed = sqrtf(a.v[0] * a.v[0] + a.v[2] * a.v[2]);
+    const float accel = (fabsf(along) - fabsf(before)) / (float)(COP_DRV_SPAN / 1000.0);
+    const float dir = along < 0 ? -1.0f : 1.0f, yaw = a.w[1];
+    /* Sideways force at speed; the wheels' geometry when slow. */
+    float steer = dir * yaw * speed / COP_DRV_LATERAL;
+    if (speed < 10.0f) {
+        const float low = dir * yaw * COP_DRV_WHEELBASE / (speed > 2.0f ? speed : 2.0f) / 0.6f;
+        if (fabsf(low) > fabsf(steer))
+            steer = low;
+    }
+    const int moving = speed > 0.5f;
+    float gas = moving ? 0.35f + accel / 6.0f : 0.0f, brake = accel < -4.0f ? -accel / 14.0f : 0.0f;
+    gas = brake > 0.0f ? 0.0f : gas;
+    steer = !isfinite(steer) ? 0.0f : steer < -1.0f ? -1.0f : steer > 1.0f ? 1.0f : steer;
+    cc->steer += (steer - cc->steer) * COP_DRV_SMOOTH;
+    cc->gas += (drv_unit(gas) - cc->gas) * COP_DRV_SMOOTH;
+    cc->brake += (drv_unit(brake) - cc->brake) * COP_DRV_SMOOTH;
+    /* A gear for the speed, up at the top of its range and down well below it. */
+    int gear = cc->gear < 2 ? 2 : cc->gear;
+    const float top = (float)(gear - 1) * COP_DRV_GEAR;
+    if (speed > top)
+        ++gear;
+    else if (gear > 2 && speed < top - COP_DRV_GEAR - 4.0f)
+        --gear;
+    cc->gear = gear;
+    memset(out, 0, sizeof *out);
+    out->steer = cc->steer;
+    out->gas = cc->gas;
+    out->brake = cc->brake;
+    out->gear = along < -1.0f ? 0 : gear;
+    return 1; /* rpm 0: its own engine works its revs out from the gas and gear */
 }
 
 /* Our car for cop_keep_off, read each cop_place: place, speed, forward on the ground. */
@@ -1039,15 +2093,17 @@ static void cop_contact(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation
         api->hook_return(api, cpu, cpu->eax & 0xffffff00u, 0);
         return;
     }
-    /* Traffic and native racers belong to this city alone. A remote player cannot
-     * have hit them in the owner's game. Reject before contact separation, not
-     * just in the later impulse solver. Shared pursuit cops remain interactive. */
+    /* Two replayed cars (a friend's, a copy of a friend's cop) follow their owners' poses, and the
+     * owners' games have already settled how they touch; solved again here, a cop pressing on the
+     * car it chases was thrown off it and put back, over and over (see WATCHING A CHASE). Traffic
+     * and native racers belong to this city alone, so a replayed car cannot have hit them in its
+     * owner's game. Reject before contact separation, not just in the later impulse solver. This
+     * game's own cops stay interactive. */
     MpCar *ra = oa ? mp_remote_owner(oa) : NULL;
     MpCar *rb = ob ? mp_remote_owner(ob) : NULL;
-    const int pa = ra && !cop_car_of(oa), pb = rb && !cop_car_of(ob);
-    const uint32_t local = pa && !rb ? ob : pb && !ra ? oa : 0;
+    const uint32_t local = ra && !rb ? ob : rb && !ra ? oa : 0;
     const uint32_t cls = local && mp_listed(local - 0x24) ? get_u32(local - 0x24 + 0x148) : 0;
-    if ((pa && pb) || ((pa || pb) && (cls == 1u || cls == 3u))) {
+    if ((ra && rb) || (cls == 1u || cls == 3u)) {
         api->hook_return(api, cpu, cpu->eax & 0xffffff00u, 0);
         return;
     }
@@ -1145,10 +2201,13 @@ static void cop_place(double now, int late) {
         any |= g_cop_cars[i].car.simable && g_cop_cars[i].car.kept;
     /* Every other car of this game (not the copies, kept or not, and not ours: see above). */
     uint32_t node = any ? get_u32(MP_CARS) : 0;
-    for (int guard = 0; node && node != MP_CARS && guard < 64; ++guard, node = get_u32(node)) {
+    for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
         const uint32_t car = node - 0xd0, simable = car + 0x24, state = mp_state(get_u32(car + 0x70));
         if (!state || simable == g_mp_player_simable || cop_car_of(simable) || cop_spare_of(simable))
             continue;
+        const uint32_t cls = get_u32(car + 0x148);
+        if (mp_remote_owner(simable) || cls == 1u || cls == 3u)
+            continue; /* passes through the copies (cop_contact): not near anything */
         for (int k = 0; k < 3; ++k)
             cars[n][k] = bits_float(get_u32(state + 0x10 + 4u * k));
         n += isfinite(cars[n][0]) && isfinite(cars[n][1]) && isfinite(cars[n][2]);
@@ -1198,10 +2257,36 @@ static void cop_no_destroy(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocat
     (void)inv;
     (void)user;
     const uint32_t owner = get_u32(cpu->ecx - 0x44 + 0x2c);
-    if (owner && (cop_car_of(owner) || cop_spare_of(owner)))
+    if (owner && !g_cop_wrecking && (cop_car_of(owner) || cop_spare_of(owner)))
         api->hook_return(api, cpu, cpu->eax, 0);
     else
         api->call_original(api, cpu->target, cpu);
+}
+
+/* WRECKED COPS: each copy wrecked while its cop is wrecked in its owner's game, as new when not. */
+static void cop_wrecks(void) {
+    for (int i = 0; i < COP_SLOTS; ++i) {
+        CopCar *cc = &g_cop_cars[i];
+        const uint32_t simable = cc->car.simable, car = simable ? simable - 0x24 : 0;
+        const uint32_t damageable = car ? get_u32(car + 0xfc) : 0;
+        if (!damageable || !cc->car.id)
+            continue;
+        const int want = (cc->flags & COP_F_WRECKED) != 0, is = cop_wrecked(car);
+        if (want ? is || cc->wreck_tried : !is)
+            continue;
+        cc->wreck_tried = want;
+        if (want) {
+            g_cop_wrecking = 1;
+            mp_call(COP_DESTROY, damageable, NULL, 0);
+            g_cop_wrecking = 0;
+        } else {
+            mp_call(COP_RESET, damageable, NULL, 0);
+        }
+        char line[128];
+        snprintf(line, sizeof line, "core.nfsc: cops: copy of cop %u of player %u %s", cc->number, cc->car.id,
+                 !want ? "made as new" : cop_wrecked(car) ? "wrecked, as in its owner's game" : "not wrecked (Destroy refused)");
+        log_line(line);
+    }
 }
 
 static void cops_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
@@ -1213,9 +2298,11 @@ static void cops_service(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocatio
     if (!sh)
         return;
     const uint32_t player = g_mp_player_simable ? g_mp_player_simable - 0x24u : 0;
+    cop_traffic_owner(__atomic_load_n(&sh->page, __ATOMIC_ACQUIRE) ? player : 0);
     cop_publish(sh, player);
     cop_received(sh, player);
     cop_cars(sh, player);
+    cop_wrecks();
     cop_spares(player);
     cop_send_hits(sh);
 }
@@ -1234,6 +2321,9 @@ static void cops_install(void) {
     memset(sh, 0, sizeof *sh);
     sh->magic = COP_MAGIC;
     sh->version = 1;
+    sh->more_magic = COP_MORE_MAGIC;
+    sh->more_out = COP_MAX;
+    sh->more_slots = COP_SLOTS;
     if (g_api->hook_install(g_api, MP_FE_SERVICE, cops_service, POP_HOOK_BEFORE, NULL, &g_cop_hooks[0]) != POP_OK) {
         log_line("core.nfsc: friends' police chases unavailable");
         return;
@@ -1250,10 +2340,33 @@ static void cops_install(void) {
         log_line(line);
     }
     g_mp_cop_car = cop_car_of;
+    g_drv_cop = cop_drive;
     g_mp_cop_place = cop_place;
     g_mp_cop_touch = cop_touch;
     g_mp_cop_pair = cop_pair;
     g_mp_follow_target = cop_keep_off;
+    /* FRIENDS COUNT AS NEAR: three call-site hooks (see SHARED PATROLS). */
+    int near_hooks = 0;
+    if (g_api->hook_install_at_callsite && g_api->guest_alloc(g_api, 12, &g_trf_near_buf) == POP_OK) {
+        for (int i = 0; i < 3; ++i)
+            near_hooks += g_api->hook_install_at_callsite(g_api, TRF_DISTANCE, g_trf_near_ret[i], cop_near_friends,
+                                                          POP_HOOK_BEFORE, NULL, &g_trf_near_hooks[i]) == POP_OK;
+    } else {
+        g_trf_near_buf = 0;
+    }
+    if (near_hooks != 3) {
+        char line[96];
+        snprintf(line, sizeof line, "core.nfsc: traffic: friends count as near at %d of 3 places", near_hooks);
+        log_line(line);
+    }
+    if (g_api->hook_install(g_api, TRF_SPAWN_COP, cop_no_spawn, POP_HOOK_REPLACE, NULL, &g_trf_spawn_hook) != POP_OK) {
+        g_trf_spawn_hook = 0;
+        log_line("core.nfsc: police: shared patrols unavailable (could not hook SpawnCop)");
+    }
+    if (g_api->hook_install(g_api, TRF_MAKE_COP, cop_no_make, POP_HOOK_REPLACE, NULL, &g_trf_make_hook) != POP_OK) {
+        g_trf_make_hook = 0;
+        log_line("core.nfsc: police: shared patrols unavailable (could not hook the cop factory)");
+    }
 #ifdef __EMSCRIPTEN__
     MAIN_THREAD_ASYNC_EM_ASM({
         var block = {};

@@ -18,13 +18,16 @@ guest_root = 'C:\Program Files\EA GAMES\Need for Speed Carbon'
 developer_exe = "original/NFSC.exe"
 # Carbon requires Windows XP or later.
 windows_version = "5.1.2600"
-# Nearly 2 GB arena (the game's own address space on Windows; the MW port uses 1 GB): the two runtime DLLs
-# sit just above the fixed stack/TEB/shim region (0x10000000), the extra heap above them. 1 GB was not enough
-# with the HD UI: loading the HD GlobalB.lzc (21 MB packed, 138 MB unpacked) crashed at 006add0f when the
-# unpack buffer's allocation failed. Only memory the game touches is used.
-guest_size = 0x7ffff000
+# 1 GiB arena (logs/guest-memory-20261106, logs/guest-1g-20261106, logs/release-1g-20261106): the two runtime
+# DLLs sit just above the fixed stack/TEB/shim region (0x10000000), the extra heap above them up to the arena's
+# end. The game's highest guest address is 0x1e5640b0 (485 MB) on desktop with the 160000 KB Cars pool, 328 MB
+# on phones. The extra heap must hold the Cars pool + 72.1 MB in ONE block: size it from CL_POOL_DESKTOP
+# (carlimit.h). With the old 2 GB arena (0x7ffff000) the browser reserved 1 GiB more wasm memory per tab for
+# nothing. The HD UI's 138 MB GlobalB unpack buffer (the reason for 2 GB on 2026-10-10, crash at 006add0f)
+# would land above the pool block, at about 623 MB: inside 1 GiB (inferred, not re-run: no HD UI files here).
+guest_size = 0x40000000
 heap_extra_base = 0x10100000
-heap_extra_size = 0x6feff000
+heap_extra_size = 0x2ff00000
 
 [translate]
 # Keep original routines available when a native audio/geometry fast path cannot apply.

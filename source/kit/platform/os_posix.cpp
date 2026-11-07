@@ -24,6 +24,7 @@
 #include <unistd.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
+#include <emscripten/heap.h>
 #endif
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
@@ -793,6 +794,21 @@ OsThreadId os_thread_id_of(const OsThread *t) {
     return (OsThreadId)(uintptr_t)t->handle;
 }
 
+#ifdef __EMSCRIPTEN__
+// Emscripten's mmap writes zeros over the whole mapping, which makes every page of a reservation
+// resident at once: 2 GiB for Carbon's arena, which is an iPhone tab's entire limit. Memory the
+// heap has just grown into is already zero, so only the part below the old end is cleared.
+void *os_vm_reserve(size_t bytes) {
+    char *fresh = (char *)sbrk(0);
+    char *p = (char *)emscripten_builtin_memalign(65536, bytes);
+    if (p && p < fresh)
+        memset(p, 0, p + bytes < fresh ? bytes : size_t(fresh - p));
+    return p;
+}
+void os_vm_release(void *p, size_t) {
+    emscripten_builtin_free(p);
+}
+#else
 void *os_vm_reserve(size_t bytes) {
     void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     return p == MAP_FAILED ? nullptr : p;
@@ -800,6 +816,7 @@ void *os_vm_reserve(size_t bytes) {
 void os_vm_release(void *p, size_t bytes) {
     munmap(p, bytes);
 }
+#endif
 
 void *os_dlopen(const char *path) {
     return dlopen(path, RTLD_NOW | RTLD_LOCAL);

@@ -24,6 +24,8 @@ void profile_note_guest_ms(double milliseconds);
 // The thread map (RECOMP_PROFILE=1; profile.cpp recomp_profile_threads_dump).
 void profile_note_lock(uint32_t critical_section);
 void profile_note_import(uint32_t index);
+// Whether profile_note_import records anything (the thread map is on); fixed at start.
+bool profile_import_notes_on();
 extern "C" {
 extern const int recomp_profile_enabled;
 void recomp_profile_push(uint32_t index);

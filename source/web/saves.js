@@ -95,6 +95,10 @@
     "not-zip": "This file isn't a save backup (it isn't a .zip file).",
     "not-backup": "This .zip doesn't hold a Carbon save. Use a file made with Download backup.",
     "damaged": "This backup is damaged: some of its files don't read back correctly.",
+    "packed": "This is a .rar or .7z archive. Unpack it first, then choose the folder or the career file inside. A .zip works as it is.",
+    "no-career": "No Need for Speed Carbon career was found there. Choose the NFS Carbon folder from Documents, or a career file inside it.",
+    "not-14": "This save doesn't match the PC game version 1.4, so it can't be used here. Update the game to 1.4, load the career, save it, and import it again.",
+    "corrupt": "This save is damaged: it fails the checks the game makes when loading a career. Your current save is unchanged.",
     "empty": "There is no save in this browser yet. Play first, then back it up.",
     "in-use": "Part of the save is in use. Is the game open in another window?",
     "quota": "This browser is out of storage space.",
@@ -205,6 +209,107 @@
     return concat([...parts, ...central, new Uint8Array(end.buffer), note]);
   }
 
+  // ---- PC game saves ----
+  // A career is <name>/<name>, one file of a fixed size. The layout and the checks below are what
+  // version 1.4 reads and writes: the header is built at 00894320 and checked at 008955c4 and
+  // 008957e9, and the checksum is 0089747b. A save carries no version number, so "1.4" means
+  // "exactly this layout": anything else is refused before it can reach the game.
+  // SAVE-CHECK-START
+  const CAREER = { size: 0x4602c, head: 0x1c, info: 0x10, data: 0x46000, magic: 0x4d433032, layout: 6, game: 0x656d6147 };
+  const CAREER_TABLE = Array.from({ length: 256 }, (_, i) => {
+    let c = i << 24;
+    for (let k = 0; k < 8; k++) c = (c & 0x80000000) ? (c << 1) ^ 0x04c11db7 : c << 1;
+    return c >>> 0;
+  });
+  function careerCrc(u8, start, end) {
+    let a = ~((u8[start] << 24) | (u8[start + 1] << 16) | (u8[start + 2] << 8) | u8[start + 3]);
+    for (let i = start + 4; i < end; i++) a = ((a << 8) | u8[i]) ^ CAREER_TABLE[a >>> 24];
+    return ~a >>> 0;
+  }
+  // The game signs each save (0057ff60, 006b7120): the data after the first 0x10 bytes goes through
+  // MD5, that digest through MD5 three more times, and the four digests are one 512-bit
+  // little-endian number raised to e mod n. The low 16 bytes open the data section.
+  const CAREER_KEY = {
+    n: 0xef620ebb3403d099478fe08aaa365e57fc98e72983fe82cf691328bc47c81de807f34ea0a0a20e969b8ddf94c6dec0b987284be4d4406b7e4a50abe5860b960dn,
+    e: 0x2829285589e575f2b149d71f0c6d70a88c4d4ec2ed4d1ebf135ece7fbfff37dce999a2ae905ce2a0aa219daa065152b845208a6e676f4f8bd129d25360bdd0e1n,
+  };
+  const MD5_K = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 2 ** 32) >>> 0);
+  const MD5_S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  function md5(bytes) {
+    const blocks = Math.floor((bytes.length + 8) / 64) + 1, m = new Uint8Array(blocks * 64);
+    m.set(bytes);
+    m[bytes.length] = 0x80;
+    const v = new DataView(m.buffer), h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    v.setUint32(m.length - 8, bytes.length * 8, true);
+    for (let at = 0; at < m.length; at += 64) {
+      let [a, b, c, d] = h;
+      for (let i = 0; i < 64; i++) {
+        const round = i >> 4;
+        const f = round === 0 ? (b & c) | (~b & d) : round === 1 ? (d & b) | (~d & c) : round === 2 ? b ^ c ^ d : c ^ (b | ~d);
+        const g = round === 0 ? i : round === 1 ? 5 * i + 1 : round === 2 ? 3 * i + 5 : 7 * i;
+        const sum = (a + f + MD5_K[i] + v.getUint32(at + (g & 15) * 4, true)) | 0, s = MD5_S[round * 4 + (i & 3)];
+        [a, d, c, b] = [d, c, b, (b + ((sum << s) | (sum >>> (32 - s)))) | 0];
+      }
+      h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0;
+    }
+    const out = new Uint8Array(16), o = new DataView(out.buffer);
+    h.forEach((x, i) => o.setUint32(i * 4, x, true));
+    return out;
+  }
+  function careerSignature(u8) {
+    const body = CAREER.head + CAREER.info;
+    let digest = md5(u8.subarray(body + 0x10, body + CAREER.data)), value = 0n;
+    const chain = new Uint8Array(64);
+    for (let i = 0; i < 4; i++) { chain.set(digest, i * 16); digest = md5(digest); }
+    for (let i = 63; i >= 0; i--) value = (value << 8n) | BigInt(chain[i]);
+    let power = 1n, base = value % CAREER_KEY.n;
+    for (let e = CAREER_KEY.e; e; e >>= 1n) {
+      if (e & 1n) power = (power * base) % CAREER_KEY.n;
+      base = (base * base) % CAREER_KEY.n;
+    }
+    return Uint8Array.from({ length: 16 }, (_, i) => Number((power >> BigInt(i * 8)) & 0xffn));
+  }
+  // null when the file is a sound 1.4 career, else "not-14" or "corrupt".
+  function checkCareer(u8) {
+    if (u8.length !== CAREER.size) return "not-14";
+    const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), at = (o) => v.getUint32(o, true);
+    if (at(0) !== CAREER.magic || at(4) !== CAREER.size || at(8) !== CAREER.info || at(12) !== CAREER.data) return "not-14";
+    const body = CAREER.head + CAREER.info;
+    if (careerCrc(u8, 0, 0x18) !== at(0x18)) return "corrupt";
+    if (careerCrc(u8, CAREER.head, body) !== at(0x10) || careerCrc(u8, body, CAREER.size) !== at(0x14)) return "corrupt";
+    if (at(CAREER.head + 8) !== CAREER.layout || at(body + 0x50) !== CAREER.game) return "not-14";
+    if (at(CAREER.head) + at(CAREER.head + 4) > CAREER.data) return "not-14";
+    if (careerSignature(u8).some((b, i) => b !== u8[body + i])) return "corrupt";
+    return null;
+  }
+  // A save also holds the serial number of the copy that wrote it, and the game refuses one that
+  // differs from its own (007167b0). Here it has none, so an imported career's is cleared, then
+  // the signature and the checksums that cover it are made again.
+  function careerForThisGame(u8) {
+    const body = CAREER.head + CAREER.info, serial = [body + 0x10, body + 0x30];
+    if (u8.subarray(...serial).every((b) => !b)) return u8;
+    const out = u8.slice(), v = new DataView(out.buffer);
+    out.fill(0, ...serial);
+    out.set(careerSignature(out), body);
+    v.setUint32(0x14, careerCrc(out, body, CAREER.size), true);
+    v.setUint32(0x18, careerCrc(out, 0, 0x18), true);
+    return out;
+  }
+  // Careers among {path, data}: the file <name>/<name>, wherever that folder sits. A file on its
+  // own is named by itself.
+  function findCareers(files) {
+    const found = new Map();
+    for (const f of files) {
+      if (f.dir) continue;
+      const parts = f.path.replaceAll("\\", "/").split("/").filter(Boolean), name = parts.at(-1);
+      if (parts.length > 1 && parts.at(-2).toLowerCase() !== name.toLowerCase()) continue;
+      if (!name || name.length > 32 || !/^[\p{L}\p{N} _.-]+$/u.test(name) || /^[. ]|[. ]$/.test(name)) continue;
+      found.set(name.toLowerCase(), { name, data: f.data, problem: checkCareer(f.data) });
+    }
+    return [...found.values()];
+  }
+  // SAVE-CHECK-END
+
   async function inflate(data) {
     const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
     return new Uint8Array(await new Response(stream).arrayBuffer());
@@ -212,7 +317,7 @@
 
   // A ZIP's bytes -> {files, comment, info}. Unsafe paths make the whole file
   // fail; junk and caches (SKIP) are left out.
-  async function zipRead(u8) {
+  async function zipRead(u8, { anyFiles = false } = {}) {
     const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), dec = new TextDecoder();
     let eocd = -1;
     for (let i = u8.length - 22; i >= Math.max(0, u8.length - 22 - 65535); i--)
@@ -254,6 +359,7 @@
     let info = {};
     try { info = JSON.parse(comment) || {}; } catch {}
     const result = { files: tidy(files), info };
+    if (anyFiles) return result;
     if (info.backup !== "nfsc-save" && !result.files.some((f) =>
         /^(registry\.json|mod-settings\.json)$/i.test(f.path) || /^documents\//i.test(f.path)))
       throw new SaveError("not-backup");
@@ -390,18 +496,19 @@
               background: rgba(95, 228, 242, .6); transform-origin: left center; transform: rotate(45deg); }
         .sv .sv-phrase::before { left: calc(100% - 13px); top: -1px; }
         .sv .sv-phrase::after { left: -1px; top: calc(100% - 13px); }
-        .sv .sv-pre { font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--dim); margin-bottom: 10px; }
-        .sv .sv-full { margin-top: 12px; font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color: var(--dim);
+        .sv .sv-pre { font-size: 14px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--cyan); margin-bottom: 4px; }
+        .sv .sv-why { margin: 0 0 14px; font-size: 14px; line-height: 1.4; color: #e8eef2; }
+        .sv .sv-full { margin-top: 14px; font: 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color: #cfd8de;
               overflow-wrap: anywhere; user-select: all; }
-        .sv .sv-words { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 14px; margin: 0; padding: 0;
+        .sv .sv-words { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px 14px; margin: 0; padding: 0;
               list-style: none; counter-reset: sv-word; }
-        .sv .sv-words li { font: italic 700 18px/1.15 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif;
-              letter-spacing: .03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sv .sv-words li { font: italic 700 22px/1.15 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif;
+              letter-spacing: .03em; white-space: nowrap; color: #fff; }
         .sv .sv-words li::before { counter-increment: sv-word; content: counter(sv-word); margin-right: 6px; vertical-align: 2px;
               font: 600 10px/1 system-ui, sans-serif; color: var(--cyan); }
-        .sv .sv-warn { margin: 12px 0 0; font-size: 13px; color: #ffd27a; }
+        .sv .sv-phrase.sv-unsaved { border-color: #ffd27a; box-shadow: inset 0 0 26px rgba(255, 210, 122, .1); }
+        .sv .sv-unsaved .sv-pre, .sv .sv-unsaved .sv-why { color: #ffd27a; }
         .sv .sv-phrase .cs-actions { margin-top: 14px; }
-        .sv details.sv-keep { margin-top: 14px; }
         .sv .sv-enter { display: grid; gap: 10px; margin-top: 12px; }
         .sv .sv-enter input { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
         .sv .sv-btn-sm { font-size: 13px; padding: 9px 14px; }
@@ -419,6 +526,14 @@
         <button class="cs-btn sv-up" type="button"><span>Restore from file</span></button>
       </div>
       <div class="cs-note sv-gap">Back up your progress and game settings.</div>
+      <div class="sv-sub">From the PC game</div>
+      <div class="cs-note">Keep playing your career from the PC version 1.4. On Windows, it's in Documents, in the NFS Carbon folder.</div>
+      <div class="cs-actions">
+        <button class="cs-btn sv-import-dir" type="button"><span>Choose the NFS Carbon folder</span></button>
+        <button class="cs-btn sv-import-file" type="button"><span>Choose a career file or zip</span></button>
+      </div>
+      <input type="file" class="sv-pick-dir" webkitdirectory multiple hidden>
+      <input type="file" class="sv-pick-file" hidden>
       <button class="sv-link sv-undo" type="button" hidden></button>
       <div class="sv-sub">Cloud</div>
       <div class="sv-cloud"></div>
@@ -615,13 +730,13 @@
     function showLocal() {
       const line = $(".sv-local"), own = slot > 1 ? "This window's save" : "Save in this browser";
       line.replaceChildren();
-      if (!state.files.length) {
+      if (!state.files.length || describe(state.files).what === "settings only, no career yet") {
         line.textContent = slot > 1 && !state.exists
           ? "This window has no save of its own yet: it gets a copy of the main one when you press Play."
           : "No career saved yet. Start one in the game.";
       } else {
         const d = describe(state.files), b = document.createElement("b");
-        b.textContent = d.what === "settings only, no career yet" ? "No career saved yet" : d.what;
+        b.textContent = d.what;
         const newest = Math.max(...state.files.filter((f) => !f.dir).map((f) => f.mtime));
         line.append(b, ` · saved ${when(newest)}`);
       }
@@ -631,8 +746,7 @@
     }
     const button = (cls, text, extra = "") => `<button class="cs-btn ${extra} ${cls}" type="button"><span>${text}</span></button>`;
     function wordsHtml(phrase) {
-      return `<div class="sv-pre">Your keyphrase</div>
-        <ol class="sv-words">${phrase.slice(PREFIX.length).split("-").map((w) => `<li>${w}</li>`).join("")}</ol>
+      return `<ol class="sv-words">${phrase.slice(PREFIX.length).split("-").map((w) => `<li>${w}</li>`).join("")}</ol>
         <div class="sv-full">${phrase}</div>`;
     }
     function showCloud() {
@@ -640,7 +754,7 @@
       const s = server();
       if (!cloud) {
         box.innerHTML = `
-          <div class="cs-note" style="margin:0 0 12px">Keep a backup online to continue on another device. Your recovery phrase unlocks it.</div>
+          <div class="cs-note" style="margin:0 0 12px">Keep a backup online to continue on another device. Your keyphrase unlocks it.</div>
           <div class="cs-actions">${button("sv-on", "Turn on cloud saves")}${button("sv-have", "I have a keyphrase")}</div>
           <form class="sv-enter" ${state.entering ? "" : "hidden"}>
             <label class="cs-row" style="margin:0"><span class="cs-label">Your keyphrase</span>
@@ -672,19 +786,19 @@
           <div class="cs-actions">${button("sv-mine", "Keep this browser's", "sv-btn-sm")}${button("sv-take", "Use the cloud's", "sv-btn-sm")}</div></div>`;
       const reveal = !cloud.ack;
       box.innerHTML = `${notice}
-        ${reveal ? `<div class="sv-phrase">${wordsHtml(cloud.phrase)}
-          <p class="sv-warn">Write it down now and keep it private. It is the only way back to your saves on another computer:
-            there is no account and no reset. This browser remembers it, to keep the cloud copy up to date.</p>
-          <div class="cs-actions">${button("sv-copy", "Copy", "sv-btn-sm")}${button("sv-text", "Save as text file", "sv-btn-sm")}${button("sv-ack", "I wrote it down", "sv-btn-sm")}</div></div>` : ""}
+        <div class="sv-phrase${reveal ? " sv-unsaved" : ""}">
+          <div class="sv-pre">Your keyphrase</div>
+          <p class="sv-why">${reveal ? "Write it down now." : "Keep it safe and private."} It is the only way to open your cloud save on another device.
+            There is no account and no reset.</p>
+          ${wordsHtml(cloud.phrase)}
+          <div class="cs-actions">${button("sv-copy", "Copy", "sv-btn-sm")}${button("sv-text", "Save as text file", "sv-btn-sm")}${reveal ? button("sv-ack", "I wrote it down", "sv-btn-sm") : ""}</div>
+          <div class="cs-note sv-gap">On another device: open Saves, then Cloud save, then I have a keyphrase.</div>
+        </div>
         <div class="sv-line sv-cloud-state"></div>
         <div class="cs-actions">${button("sv-push", "Save to cloud")}${button("sv-pull", "Load from cloud")}</div>
         <div class="cs-note sv-gap">${s ? `Kept on ${esc(s.label ? `“${s.label}”` : s.base)}, the server chosen under Online.` : ""}</div>
         ${s && !(rec?.removed && !state.notice) ? `<button class="sv-link sv-remove" type="button">Remove from cloud</button>` : ""}
-        ${reveal ? "" : `<details class="sv-keep"><summary>Keyphrase</summary>
-          <div class="sv-phrase">${wordsHtml(cloud.phrase)}
-            <div class="cs-actions">${button("sv-copy", "Copy", "sv-btn-sm")}${button("sv-text", "Save as text file", "sv-btn-sm")}</div></div>
-          <div class="cs-note">On another computer: Saves, Cloud, I have a keyphrase.</div>
-          <button class="sv-link sv-off" type="button">Stop cloud saves on this computer</button></details>`}`;
+        ${reveal ? "" : `<button class="sv-link sv-off" type="button">Stop cloud saves on this computer</button>`}`;
       $(".sv-cloud-state").textContent = status;
       $(".sv-push").onclick = () => run("Sealing your save and sending it to the cloud…", () => upload(rec?.etag ? "match" : "new"));
       $(".sv-pull").onclick = () => run("Fetching the cloud save…", () => download(cloud.phrase, cloud.id), { blocksPlay: true });
@@ -828,6 +942,45 @@
       say("Restoring…", "busy");
       await restore(backup.files);
       return `Restored: ${describe(backup.files).text}.`;
+    }
+    // Only careers change: settings and any other career stay, and the restore keeps the old save
+    // for Undo. Nothing is written unless every career chosen passes.
+    async function importCareers(files, from) {
+      const careers = findCareers(files);
+      if (!careers.length) throw new SaveError("no-career");
+      const bad = careers.find((c) => c.problem);
+      if (bad) throw new SaveError(bad.problem);
+      const now = (await readFolder()).files;
+      const taken = (name) => now.some((f) => f.path.toLowerCase() === `documents/nfs carbon/${name.toLowerCase()}/${name.toLowerCase()}`);
+      const names = careers.map((c) => `“${c.name}”`).join(", "), same = careers.filter((c) => taken(c.name)).map((c) => `“${c.name}”`);
+      say("");
+      const lines = [`${from} holds ${careers.length === 1 ? "the career" : "the careers"} ${names}, and ${careers.length === 1 ? "it passes" : "they pass"} the game's checks.`];
+      lines.push(same.length ? `This replaces your ${same.join(", ")} here. The old save is kept, so you can put it back (Undo the last restore).` : "Your settings and any other career here stay. You can undo this afterwards (Undo the last restore).");
+      if ((await ask("Import from the PC game?", lines, [{ label: "Import", value: true, primary: true }, { label: "Cancel", value: false }])) !== true) return "Nothing was changed.";
+      say("Importing…", "busy");
+      const incoming = new Set(careers.map((c) => `documents/nfs carbon/${c.name.toLowerCase()}/`));
+      const keep = now.filter((f) => ![...incoming].some((p) => `${f.path.toLowerCase()}/`.startsWith(p)));
+      const mtime = Date.now();
+      await restore(tidy([...keep, ...careers.flatMap((c) => [{ path: `Documents/NFS Carbon/${c.name}/${c.name}`, data: careerForThisGame(c.data), mtime }])]));
+      return `Imported ${names}. Press Play, then choose Resume Career in the game. If you have more than one career, pick it with Load.`;
+    }
+    async function importFolder(list) {
+      const picked = [...list].filter((f) => f.size === CAREER.size);
+      if (!picked.length) throw new SaveError("no-career");
+      const files = [];
+      for (const f of picked.slice(0, 32)) files.push({ path: f.webkitRelativePath || f.name, data: new Uint8Array(await f.arrayBuffer()) });
+      return importCareers(files, "This folder");
+    }
+    async function importFile(file) {
+      if (file.size > 64 * 1024 * 1024) throw new SaveError("no-career");
+      const data = new Uint8Array(await file.arrayBuffer());
+      if ((data[0] === 0x52 && data[1] === 0x61 && data[2] === 0x72 && data[3] === 0x21) || (data[0] === 0x37 && data[1] === 0x7a && data[2] === 0xbc)) throw new SaveError("packed");
+      if (data[0] === 0x50 && data[1] === 0x4b) {
+        const zip = await zipRead(data, { anyFiles: true });
+        if (zip.info.backup === "nfsc-save") return restoreFile(file); // a copy made here: career and settings
+        return importCareers(zip.files, `“${file.name}”`);
+      }
+      return importCareers([{ path: file.name, data }], `“${file.name}”`);
     }
     async function undoRestore() {
       const undo = await readUndo();
@@ -1010,6 +1163,19 @@
       if (file) run("Reading the backup…", () => restoreFile(file), { blocksPlay: true });
     };
     $(".sv-undo").onclick = () => run("Putting the save back…", undoRestore, { blocksPlay: true });
+    if (matchMedia("(pointer: coarse)").matches) $(".sv-import-dir").hidden = true; // phones have no folder picker
+    $(".sv-import-dir").onclick = () => $(".sv-pick-dir").click();
+    $(".sv-import-file").onclick = () => $(".sv-pick-file").click();
+    $(".sv-pick-dir").onchange = () => {
+      const list = [...$(".sv-pick-dir").files];
+      $(".sv-pick-dir").value = "";
+      if (list.length) run("Checking your save…", () => importFolder(list), { blocksPlay: true });
+    };
+    $(".sv-pick-file").onchange = () => {
+      const file = $(".sv-pick-file").files[0];
+      $(".sv-pick-file").value = "";
+      if (file) run("Checking your save…", () => importFile(file), { blocksPlay: true });
+    };
     // The server is chosen in the Online panel: show and sync for the new one.
     root.querySelector(".cs-server")?.addEventListener("change", () => {
       state.notice = null;

@@ -204,6 +204,36 @@
     .cs-panel { order: 3; } .cs-panel.cs-play { order: 1; } .cs-panel.cs-online { order: 2; } .cs-panel.cs-about { order: 4; }
   }
   @media (max-width: 520px) { .cs-claim-safe { grid-template-columns: 1fr; } .cs-claim-dialog .cs-actions { display: grid; } .cs-claim-dialog .cs-btn { width: 100%; min-height: 44px; } }
+  /* Phones and tablets: Play first and always in reach, no keyboard-only items, tighter forms.
+     Text boxes stay 16px: below that, iOS zooms the page on focus. */
+  @media (pointer: coarse) {
+    .cs-wrap { padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 18px max(12px, env(safe-area-inset-left)); }
+    .cs-head { flex-wrap: nowrap; align-items: center; margin-bottom: 8px; gap: 8px; }
+    .cs-logo { width: min(190px, 46vw); }
+    .cs-tag, .cs-local, .cs-key, .cs-keys { display: none !important; }
+    .cs-head-actions { width: auto; flex-direction: row; align-items: center; gap: 8px; }
+    .cs-head-actions .cs-support { flex-grow: 0; padding: 6px 10px; font-size: 11px; }
+    .cs-grid, .cs-col { gap: 8px; }
+    .cs-panel { padding: 10px 12px; }
+    .cs-panel h2 { margin: 0 0 7px; font-size: 12px; }
+    .cs-play { position: sticky; top: max(6px, env(safe-area-inset-top)); z-index: 2; background: #070e18f5; }
+    .cs-state { margin-bottom: 6px; font-size: 12px; }
+    .cs-btn.big, .cs-go { width: 100%; min-height: 50px; padding: 8px 16px; font-size: 22px; justify-content: center; }
+    .cs-mode, .cs-slot { margin-top: 5px; font-size: 11px; }
+    .cs-note { font-size: 11px; line-height: 1.35; }
+    .cs-row { gap: 2px; margin-bottom: 7px; }
+    .cs-label { font-size: 10px; }
+    .cs-row input, .cs-row select { min-height: 38px; padding: 4px 10px; font-size: 16px; }
+    .cs-switch { min-height: 34px; margin-bottom: 6px; }
+    .cs-actions .cs-btn:not(.big) { min-height: 38px; padding: 6px 12px; font-size: 12px; }
+  }
+  @media (pointer: coarse) and (orientation: landscape) {
+    .cs-grid { grid-template-columns: minmax(230px, .62fr) minmax(0, 1.38fr); align-items: start; }
+  }
+  @media (pointer: coarse) and (orientation: portrait) {
+    .cs-grid { grid-template-columns: minmax(0, 1fr); }
+    .cs-head { justify-content: center; }
+  }
   @media (prefers-reduced-motion: reduce) { .cs::before, .cs-btn, .cs-switch input, .cs-switch input::after, .cs-claim-dialog .cs-panel { transition: none; } }
   `;
 
@@ -333,6 +363,12 @@
     left.append(root.querySelector(".cs-about"));
     right.append(root.querySelector(".cs-files").closest("section"));
   }
+  // The new design moves these same controls into tabs (play-home.js). Without it, this page shows.
+  root.style.visibility = "hidden";
+  const design = document.createElement("script");
+  design.src = "play-home.js";
+  design.onload = design.onerror = () => { root.style.visibility = ""; };
+  document.head.append(design);
   const $ = (sel) => root.querySelector(sel);
 
   // Which save slot this window uses: the first free one. Slot 1 is the
@@ -409,6 +445,90 @@
     serversReady.then(count);
   });
 
+  // A game that ends without a clean exit (the browser killed the tab: out of memory, a renderer
+  // crash) leaves its "running" mark in localStorage; the next start page in the same save slot
+  // offers once to send report.js's saved tail of that session's log. A tab that was hidden when
+  // it went (a phone that closed it in the background) is not asked about. A reload that resumes
+  // the game at once (resume.js; Chrome's "Aw, Snap!" Reload) shows the same line as a small note
+  // in a corner for half a minute, since the start page is gone by then.
+  const sessionKey = () => `${game.id}.session.v1.${slot}`;
+  let session = null;
+  // report.js keeps the tail (key + ".tail"); a page that has not loaded it yet loads it here.
+  const reporter = () => (window.recompReport ? Promise.resolve(window.recompReport) : new Promise((resolve) => {
+    const script = document.createElement("script");
+    script.src = "report.js";
+    script.onload = () => resolve(window.recompReport || null);
+    script.onerror = () => { script.remove(); resolve(null); };
+    document.body.append(script);
+  }));
+  function markRunning() {
+    const key = sessionKey();
+    const save = () => { try { localStorage.setItem(key, JSON.stringify(session)); } catch {} };
+    const visible = () => (document.visibilityState === "hidden" ? "hidden" : "running");
+    session = { version: 1, state: visible(), started: new Date().toISOString(), at: Date.now(), online: on.checked };
+    save();
+    reporter().then((r) => { if (session) r?.watchSession?.(key); });
+    let quit = false;
+    const end = () => {
+      if (!session) return;
+      session = null;
+      try { localStorage.removeItem(key); } catch {}
+      window.recompReport?.endSession?.();
+    };
+    addEventListener("pagehide", end); // closing, reloading or leaving the page is a clean exit
+    addEventListener("recomp-quit", () => { quit = true; end(); });
+    addEventListener("pageshow", (e) => { // back from the back/forward cache: running again
+      if (!e.persisted || session || quit) return;
+      session = { version: 1, state: visible(), started: new Date().toISOString(), at: Date.now(), online: on.checked };
+      save();
+      reporter().then((r) => { if (session) r?.watchSession?.(key); });
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!session) return;
+      session.state = visible();
+      session.at = Date.now();
+      save();
+    });
+  }
+  async function offerLastSession(restoring) {
+    const key = sessionKey();
+    let mark = null;
+    try { mark = JSON.parse(localStorage.getItem(key)); localStorage.removeItem(key); } catch {}
+    if (mark?.version !== 1 || mark.state !== "running" || !(Date.now() - mark.at < 7 * 24 * 3600 * 1000)) {
+      try { localStorage.removeItem(key + ".tail"); } catch {}
+      return;
+    }
+    const report = await reporter();
+    const tail = report?.takeSession?.(key) || null;
+    if (!report?.openDialog || session) return; // no reporter, or Play was pressed meanwhile
+    const line = document.createElement("div");
+    line.className = "cs-crashed";
+    line.setAttribute("role", "status");
+    line.style.marginTop = "8px";
+    const button = (text) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = text;
+      b.style.cssText = "background:none;border:0;padding:0 0 0 10px;color:inherit;font:inherit;text-decoration:underline;cursor:pointer";
+      return b;
+    };
+    const send = button("Send a report"), dismiss = button("No thanks");
+    line.append("The game closed unexpectedly last time. ", send, dismiss);
+    send.onclick = () => {
+      line.remove();
+      report.openDialog(tail || { version: 1, log: [], pageLines: [], crashes: [],
+        note: "the closed tab saved no log lines", started: mark.started, online: mark.online });
+    };
+    dismiss.onclick = () => line.remove();
+    // Inside the slot line: play-home.js moves that element (with this) into its own layout.
+    if (!restoring) { $(".cs-slot").append(line); return; }
+    line.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:30;max-width:calc(100% - 24px);margin:0;padding:8px 12px;" +
+      "background:rgba(6,12,22,.92);color:#e9f6ff;border:1px solid rgba(95,228,242,.3);font:13px/1.4 system-ui,sans-serif";
+    document.body.append(line);
+    setTimeout(() => line.remove(), 30000);
+  }
+  Promise.all([slotReady, recoveryReady]).then(() => { if (slot) offerLastSession(!!recovery?.pending); });
+
   on.addEventListener("change", () => { store.set("online", on.checked); reflect(); count(); scheduleIdentity(); });
   nameEl.addEventListener("input", () => { identityState = ""; showIdentity(); reflect(); scheduleIdentity(); });
   roomEl.addEventListener("input", reflect);
@@ -460,11 +580,9 @@
       language.onerror = () => { clearTimeout(timeout); language.remove(); resolve(); };
       document.body.append(language);
     });
-    if (game.streamAssets) {
-      const preferences = document.createElement("script");
-      preferences.src = "home-settings.js";
-      document.body.append(preferences);
-    }
+    const preferences = document.createElement("script");
+    preferences.src = "home-settings.js";
+    document.body.append(preferences);
     return languageLoaded;
   });
 
@@ -661,7 +779,6 @@
   let counting = 0;
   async function count() {
     const el = $(".cs-count"), mine = ++counting;
-    if (!on.checked) { el.textContent = ""; return; }
     const server = SERVERS[serverEl.value];
     const http = server.url.replace(/^ws/, "http");
     try {
@@ -919,6 +1036,11 @@
   // game's own schedule, 007218a0). Lowered once per slot from 3 to 2, never raised, and a player
   // who sets it again in the game's options keeps that.
   const REFLECTION_DEFAULT_MARK = "car-reflections-default-v1";
+  // The performance overlay off by default (2026-11-04): the browser host starts a fresh profile with
+  // the graph on (kit host/sdl/platform_ui_desktop.cpp platform_ui_default_overlay), which most
+  // players never asked for. Set to off once per slot in the slot's mod-settings.json, which the
+  // game reads at start; F9 → Display & graphics, or F11, turns it on again and that is kept.
+  const OVERLAY_DEFAULT_MARK = "performance-overlay-default-v1";
   // One of the slot's own settings (registry.json) changed once, before the game reads them;
   // `change` gives the new value, or undefined to keep it. The marker file keeps a player's own
   // later choice. A slot whose game has not written its settings yet is tried again at the next
@@ -942,6 +1064,43 @@
       await marker.write("1\n");
       await marker.close();
     } catch {} // no settings yet, or storage unavailable: the game keeps its own default
+  }
+  // One of the slot's mod and display settings (mod-settings.json, a flat object of "owner/key" ->
+  // value) set once to `value`; the file is made if the game has not written one yet (the game
+  // fills in every other setting with its default). Same marker rule as settingOnce. A slot whose
+  // folder does not exist yet is tried again at the next Play.
+  async function modSettingOnce(folder, mark, name, value) {
+    try {
+      const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle(game.id)).getDirectoryHandle(folder);
+      try { await dir.getFileHandle(mark); return; } catch {}
+      const file = await dir.getFileHandle("mod-settings.json", { create: true });
+      // Edited as text: every other value keeps its bytes (some are integers past 2^53).
+      const text = await (await file.getFile()).text();
+      const settings = text.trim() ? JSON.parse(text) : {};
+      if (!settings || typeof settings !== "object" || Array.isArray(settings)) return;
+      const quoted = JSON.stringify(name), entry = `${quoted}: ${JSON.stringify(value)}`;
+      const at = new RegExp(`${quoted.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}\\s*:\\s*[^,}\\s]+`);
+      const next = name in settings ? text.replace(at, entry)
+        : Object.keys(settings).length ? text.replace(/\{/, `{\n ${entry},`) : `{\n ${entry}\n}\n`;
+      const out = await file.createWritable();
+      await out.write(next);
+      await out.close();
+      const marker = await (await dir.getFileHandle(mark, { create: true })).createWritable();
+      await marker.write("1\n");
+      await marker.close();
+    } catch {} // no slot yet, unreadable settings, or storage unavailable: the game keeps its own default
+  }
+  const overlayOffOnce = (folder) => modSettingOnce(folder, OVERLAY_DEFAULT_MARK, "host.display/performance_overlay", 0);
+  // Phones: the game's window follows devicePixelRatio, and at a phone's ratio of 3 that is 2442x1290
+  // on hardware that has to keep the whole browser tab in memory. Read
+  // before the runtime starts, so the game only ever sees the capped value. iPhone and iPad take 1,
+  // the one ratio with a recorded Quick Race on a real iPhone (logs/iphone-lan-20261104).
+  function isTouchDevice() { return navigator.maxTouchPoints > 0 && matchMedia("(pointer: coarse)").matches; }
+  function capPhoneResolution() {
+    if (!isTouchDevice()) return;
+    const apple = /iPhone|iPad|iPod/.test(navigator.userAgent) || navigator.platform === "MacIntel";
+    const ratio = apple ? 1 : Math.max(1, 1280 / Math.max(screen.width, screen.height));
+    if (ratio < devicePixelRatio) Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => ratio });
   }
   const motionBlurOffOnce = (folder) => settingOnce(folder, BLUR_DEFAULT_MARK, "g_MotionBlurEnable", () => 0);
   const reflectionsHalfOnce = (folder) =>
@@ -970,6 +1129,10 @@
       catch { problem = "The game language could not be saved. Reload the page to try again."; return; }
       name = nameEl.value.trim();
       if (on.checked && !name) { ask(); return; }
+      // Ask the browser to keep this site's storage (the imported game and the saves) under storage
+      // pressure: without it Chrome deletes the whole of it when the disk runs low (three test profiles,
+      // 2026-11-05). Not awaited: Firefox asks the player, and a refusal changes nothing else.
+      try { navigator.storage?.persist?.().catch(() => {}); } catch {}
       identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
     } finally {
       if (!identity?.ok) setStarting(false, problem);
@@ -985,6 +1148,9 @@
       crew: crewEl.value.trim(), server: serverEl.value }, restoring);
     await motionBlurOffOnce(slot > 1 ? `profile-${slot}` : "profile");
     await reflectionsHalfOnce(slot > 1 ? `profile-${slot}` : "profile");
+    await overlayOffOnce(slot > 1 ? `profile-${slot}` : "profile");
+    capPhoneResolution();
+    markRunning();
     root.remove();
     // Online gives both: free roam with others (net.js, the relay room) and the game's own
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).

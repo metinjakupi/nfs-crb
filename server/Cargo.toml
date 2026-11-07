@@ -22,6 +22,12 @@ serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 sha2 = "0.10"
 
+# On Linux, the Rust project's pure-Rust dlmalloc instead of the C library's allocator: the
+# static musl build's own (mallocng) took a fifth of the relay's core at ~575 players, much of
+# it handing pages back to the kernel and taking them again. No C compiler needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+dlmalloc = { version = "0.2", features = ["global"] }
+
 [profile.release]
 lto = "thin"
 strip = true

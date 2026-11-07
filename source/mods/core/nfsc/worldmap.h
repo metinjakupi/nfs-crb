@@ -69,6 +69,43 @@
  * version 1 had 8 without (places only from mp.h's slots). The magic differs so
  * a page script of the other version leaves the block alone.
  *
+ * EVERYONE ELSE (version 3, 2026-11-06). The map has only those ten arrows, a
+ * room a few hundred players, so the page draws the rest itself, over the game's
+ * picture (web/worldmap.js). For that the game publishes, after the first 0x200
+ * bytes (which keep the WMP2 layout and magic, so a WMP2 page still works; the
+ * version word says 3), the map's view as it was last drawn (WmView, its own
+ * magic "WMV3" and sequence number, odd while the game writes):
+ * - physics x, z -> the FE's screen units (0..fe_w across, 0..480 down; the game's
+ *   picture is fe_w x 480 of them): the track calibration (0056e770 at three
+ *   points: it is affine) followed by 005c9500's pan and zoom, which places every
+ *   item at s * (unzoomed - centre) + the map's middle: s = 1 / the zoom value
+ *   (the map state WorldMap + 0x70, a 2-D animated value at +0x28: x at +0, y at
+ *   +0x2c; 1 when 0), centre = TRACK_MAP's top-left (WorldMap + 0x44) + the state's
+ *   centre value (+0x80) x its size (+0x4c), the middle = (*0x00a604ac, the world
+ *   map's X centre the widescreen code sets, 240). Read BEFORE 005c9500 runs, all
+ *   of these are what the frame on screen was drawn with (005c9500 itself steps
+ *   the animation, 005825a0). Checked against every visible item's drawn place
+ *   (its image's render object, FEObject + 0x58, holds the last drawn matrix at
+ *   +0x30, translation at +0x60/+0x64): 0 difference at three zooms and pans; the
+ *   game re-checks it each frame against the player's arrow (check[]).
+ * - which players have one of the ten arrows (shown[]), so the page leaves them out;
+ * - where the map's cursor is (FE units: GetCenter of the cursor and of the
+ *   player's arrow, a sibling in the icons group, plus the arrow's drawn place),
+ *   so the page names the marker the cursor is on, as the label does for arrows;
+ * - covers[]: what of the map's own screen is drawn over the icons (the button
+ *   bar, the heat box, the legend...): every shown image (FEObject type 1, 9, 12,
+ *   its groups shown too, outside the icons group) nearer than the player's arrow
+ *   (render z, matrix +0x68: smaller is in front) and not see-through: its colour
+ *   (data + 0xc alpha) times its groups' at least 1/4 (the two heat boxes, left
+ *   and right, take turns by their groups' alpha), and every corner of its last
+ *   drawn quad (render object +0x18 -> quad +0x90..+0x9c) at least 0x40 (a fade,
+ *   as at the map's edges, is not a cover); except the map's edge vignette
+ *   (texture be6ef52e); as rectangles in FE units, merged to WM_COVERS;
+ *   and flag WMV_MENU when another menu package than the map's (and the pause's
+ *   FeBlackScreen.fng) is up: the page then draws nothing.
+ * flags WMV_PLAYER: the player's arrow is on the map (as for the arrows: not the
+ * quick list, not the front end's maps).
+ *
  * TEST (RECOMP_WORLDMAP_TEST=1 in the address): the M key opens the world map
  * while driving (FEManager::HandlePauseRequest 005b02b0, reason 5), as the
  * career pause menu would; a Quick Race has no map of its own otherwise, and a
@@ -110,6 +147,31 @@ typedef struct WmFriend { /* written by the page */
     float fx, fz;   /* the way their nose points (unit vector, physics x and z) */
 } WmFriend;
 
+#define WM_COVERS 48
+typedef struct WmView { /* written by the game, read by the page (version 3) */
+    uint32_t magic;        /* WMV_MAGIC */
+    uint32_t seq;          /* odd while the game writes */
+    uint32_t frame;        /* WmShared.updates when written */
+    uint32_t flags;        /* WMV_PLAYER, WMV_MENU */
+    float m[6];            /* FE x = m0 x + m1 z + m2, FE y = m3 x + m4 z + m5 (physics x, z in metres) */
+    float fe_w, fe_h;      /* the game's picture in FE units */
+    float fe_scale;        /* the menus' size setting (ui_scale, ui_autofit); 1 = as drawn above */
+    float zoom;            /* s: FE units per unzoomed map unit */
+    float arrow;           /* the player's arrow as drawn, FE units across */
+    float cursor[2];       /* the map cursor's place, FE units; NaN = no cursor */
+    uint32_t cursor_shown; /* the game shows the cursor (it hides it while the keys move the map) */
+    float check[2];        /* the player's arrow: drawn place - the transform's place (FE units) */
+    uint32_t us;           /* microseconds this took, last frame */
+    uint32_t shown_n;      /* players with one of the arrows */
+    uint32_t shown[WM_ARROWS];
+    uint32_t covers_n;
+    uint32_t spare[3];
+    float covers[WM_COVERS][4]; /* x0, y0, x1, y1, FE units */
+} WmView;
+#define WMV_PLAYER 1u
+#define WMV_MENU 2u
+#define WMV_MAGIC 0x33564d57u /* "WMV3" */
+
 typedef struct WmShared {
     uint32_t magic, version;
     uint32_t seq;     /* the page's part (friends), odd while it writes */
@@ -118,12 +180,20 @@ typedef struct WmShared {
     uint32_t shown;   /* the game: friends on the map at its last frame */
     uint32_t hover;   /* the game: whose name the label shows, 0 none */
     uint32_t spare[2];
+    WmView view;      /* version 3 */
+    uint8_t pad[0x600 - 0x200 - sizeof(WmView)];
 } WmShared;
-#define WM_MAGIC 0x32504d57u /* "WMP2" */
+#define WM_MAGIC 0x32504d57u /* "WMP2": kept for version 3, which only adds the view after it */
 /* The page reads these by offset (web/worldmap.js). */
 _Static_assert(offsetof(WmShared, friends) == 0x10 && sizeof(WmFriend) == 0x30 && offsetof(WmFriend, x) == 0x20 &&
-                   offsetof(WmShared, shown) == 0x1f0 && sizeof(WmShared) == 0x200,
+                   offsetof(WmShared, shown) == 0x1f0 && offsetof(WmShared, view) == 0x200 && sizeof(WmShared) == 0x600,
                "WmShared layout");
+_Static_assert(offsetof(WmView, m) == 0x10 && offsetof(WmView, fe_w) == 0x28 && offsetof(WmView, arrow) == 0x38 &&
+                   offsetof(WmView, cursor) == 0x3c && offsetof(WmView, cursor_shown) == 0x44 &&
+                   offsetof(WmView, check) == 0x48 && offsetof(WmView, us) == 0x50 && offsetof(WmView, shown_n) == 0x54 &&
+                   offsetof(WmView, shown) == 0x58 && offsetof(WmView, covers_n) == 0x80 &&
+                   offsetof(WmView, covers) == 0x90 && sizeof(WmView) == 0x390,
+               "WmView layout");
 
 static uint32_t g_wm_block, g_wm_buf, g_wm_methods, g_wm_fmt;
 static uint32_t g_wm_hooks[4];
@@ -171,7 +241,7 @@ static const WmFriend *wm_person(uint32_t id) {
 /* Slot i's player and newest pose, if they are driving. A slot the page is
  * writing just now keeps the pose read last time. */
 static uint32_t wm_slot(MpShared *mp, int i, MpPose *out) {
-    MpSlot *s = &mp->slots[i];
+    MpSlot *s = mp_slot(mp, i);
     uint32_t seq = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     if (!(seq & 1)) {
         uint32_t id = s->id, mode = s->mode, count = s->count;
@@ -220,6 +290,271 @@ static int wm_place(uint32_t map, const WmWhere *p, float *x, float *y, float *d
     uint32_t angle[2] = {float_bits(-p->fx), float_bits(p->fz)};
     *degrees = (float)(wm_call(WM_ANGLE, 0, angle, 2) & 0xffffu) * (360.0f / 65536.0f);
     return isfinite(*x) && isfinite(*y);
+}
+
+/* ---- The view for the page (version 3) ---- */
+#define WM_MAP_X_CENTRE 0x00a604acu /* the world map's X centre (nfsc.c apply_hud: HUD_WORLD_MAP_X) */
+#define WM_FE_X_CENTRE 0x009c778cu  /* the FE's X centre (nfsc.c apply_hud: HUD_FE_X) */
+#define WM_ONE 0x009c2478u          /* 1.0f, 005c9500's numerator for the zoom */
+#define WM_VIGNETTE 0xbe6ef52eu     /* the map's edge shading, drawn over the icons but see-through */
+#define WM_BLACK_SCREEN "FeBlackScreen.fng"
+
+static float wm_f(uint32_t addr) { return bits_float(get_u32(addr)); }
+
+/* An unzoomed map place, by the game's calibration (0056e770), of render x, y. */
+static int wm_unzoomed(uint32_t map, float rx, float ry, float *u, float *v) {
+    float *buf = NULL;
+    if (g_api->guest_ptr(g_api, g_wm_buf, 8, (void **)&buf) != POP_OK || !buf)
+        return 0;
+    buf[0] = rx;
+    buf[1] = ry;
+    uint32_t to_map[4] = {g_wm_buf, g_wm_buf + 4, map + 0x44, map + 0x4c};
+    if (g_api->guest_call(g_api, WM_TO_MAP, 0, to_map, 4, NULL) != POP_OK)
+        return 0;
+    *u = buf[0];
+    *v = buf[1];
+    return isfinite(*u) && isfinite(*v);
+}
+
+/* An object's last drawn quad: centre, half sizes, depth, its least opaque corner (a fade, as the
+ * map's edges have, has corners at 0: what is under it still shows). */
+typedef struct WmDrawn {
+    float x, y, hw, hh, z;
+    uint32_t alpha;
+} WmDrawn;
+static int wm_drawn(uint32_t object, WmDrawn *d) {
+    uint32_t render = get_u32(object + 0x58);
+    const float *mx = NULL;
+    if (!render || get_u32(render + 0x20) == 0 ||
+        g_api->guest_ptr(g_api, render + 0x30, 64, (void **)&mx) != POP_OK || !mx)
+        return 0;
+    d->x = mx[12];
+    d->y = mx[13];
+    d->z = mx[14];
+    d->hw = 0.5f * (fabsf(mx[0]) + fabsf(mx[4]));
+    d->hh = 0.5f * (fabsf(mx[1]) + fabsf(mx[5]));
+    uint32_t quad = get_u32(render + 0x18);
+    d->alpha = 0;
+    if (quad && quad != render + 0x18) {
+        d->alpha = 255;
+        for (int i = 0; i < 4; ++i) {
+            uint32_t a = get_u32(quad + 0x90 + 4 * i) >> 24;
+            if (a < d->alpha)
+                d->alpha = a;
+        }
+    }
+    return isfinite(d->x) && isfinite(d->y) && isfinite(d->z) && isfinite(d->hw) && isfinite(d->hh);
+}
+
+typedef struct WmCovers {
+    float r[160][4];
+    int n;
+    float zmax, w, h;
+    uint32_t skip;  /* the cursor group: drawn over the icons, but it only rings them */
+    uint32_t icons; /* the player's arrow image: its group is not walked */
+} WmCovers;
+
+/* An object's own opacity now, 0..1: its colour (FEObject + 0x2c -> data: blue, green, red, alpha as ints). */
+static float wm_opacity(uint32_t object) {
+    uint32_t data = get_u32(object + 0x2c);
+    if (!data)
+        return 1.0f;
+    int32_t a = (int32_t)get_u32(data + 0xc);
+    return a <= 0 ? 0.0f : a >= 255 ? 1.0f : (float)a / 255.0f;
+}
+
+/* parent: the opacity of the groups it is in (a group's colour fades everything in it: the map's
+ * two heat boxes, left and right, take turns that way, both still "shown"). */
+static void wm_cover_tree(WmCovers *c, uint32_t object, unsigned depth, unsigned *budget, float parent) {
+    for (; object && *budget; object = get_u32(object + 4), --*budget) {
+        uint32_t type = get_u32(object + 0x18);
+        if ((get_u32(object + 0x1c) & 1u) || object == c->skip)
+            continue; /* hidden: so is everything in it */
+        float opacity = parent * wm_opacity(object);
+        if (opacity < 0.25f)
+            continue; /* (nearly) faded out, with everything in it */
+        if (type == 5) {
+            /* The icons group (the player's arrow is in it: the items, their glows, the cursor) is what
+             * is covered, never a cover. */
+            uint32_t child = get_u32(object + 0x64), icons = 0;
+            for (unsigned k = 0; child && k < 600 && !icons; child = get_u32(child + 4), ++k)
+                icons = child == c->icons;
+            if (!icons && depth < 12)
+                wm_cover_tree(c, get_u32(object + 0x64), depth + 1, budget, opacity);
+            continue;
+        }
+        if (type != 1 && type != 9 && type != 12)
+            continue;
+        WmDrawn d;
+        if (!wm_drawn(object, &d) || d.z >= c->zmax || d.alpha < 0x40 || get_u32(object + 0x24) == WM_VIGNETTE)
+            continue;
+        float x0 = fmaxf(d.x - d.hw, 0.0f), y0 = fmaxf(d.y - d.hh, 0.0f);
+        float x1 = fminf(d.x + d.hw, c->w), y1 = fminf(d.y + d.hh, c->h);
+        if (x1 - x0 < 1.0f || y1 - y0 < 1.0f || c->n >= 160)
+            continue;
+        float *r = c->r[c->n++];
+        r[0] = x0, r[1] = y0, r[2] = x1, r[3] = y1;
+    }
+}
+
+static float wm_area(const float *r) { return (r[2] - r[0]) * (r[3] - r[1]); }
+
+/* Overlapping or touching rectangles become one where their union covers little more than they
+ * do (not an L or a frame: its box would cover what is between); then, while there are too
+ * many, the two whose union adds least. */
+static int wm_merge(WmCovers *c, int max) {
+    for (int pass = 0, changed = 1; changed && pass < 6; ++pass) {
+        changed = 0;
+        for (int i = 0; i < c->n; ++i)
+            for (int j = i + 1; j < c->n; ++j) {
+                float *a = c->r[i], *b = c->r[j];
+                if (b[0] > a[2] + 1.0f || a[0] > b[2] + 1.0f || b[1] > a[3] + 1.0f || a[1] > b[3] + 1.0f)
+                    continue;
+                float u[4] = {fminf(a[0], b[0]), fminf(a[1], b[1]), fmaxf(a[2], b[2]), fmaxf(a[3], b[3])};
+                float iw = fminf(a[2], b[2]) - fmaxf(a[0], b[0]), ih = fminf(a[3], b[3]) - fmaxf(a[1], b[1]);
+                float both = wm_area(a) + wm_area(b) - (iw > 0.0f && ih > 0.0f ? iw * ih : 0.0f);
+                if (wm_area(u) > both * 1.1f + 4.0f)
+                    continue;
+                a[0] = fminf(a[0], b[0]), a[1] = fminf(a[1], b[1]), a[2] = fmaxf(a[2], b[2]), a[3] = fmaxf(a[3], b[3]);
+                memcpy(b, c->r[--c->n], sizeof c->r[0]);
+                --j;
+                changed = 1;
+            }
+    }
+    while (c->n > max) {
+        int bi = 0, bj = 1;
+        float best = INFINITY;
+        for (int i = 0; i < c->n; ++i)
+            for (int j = i + 1; j < c->n; ++j) {
+                float *a = c->r[i], *b = c->r[j];
+                float w = fmaxf(a[2], b[2]) - fminf(a[0], b[0]), h = fmaxf(a[3], b[3]) - fminf(a[1], b[1]);
+                float grow = w * h - (a[2] - a[0]) * (a[3] - a[1]) - (b[2] - b[0]) * (b[3] - b[1]);
+                if (grow < best)
+                    best = grow, bi = i, bj = j;
+            }
+        float *a = c->r[bi], *b = c->r[bj];
+        a[0] = fminf(a[0], b[0]), a[1] = fminf(a[1], b[1]), a[2] = fmaxf(a[2], b[2]), a[3] = fmaxf(a[3], b[3]);
+        memcpy(b, c->r[--c->n], sizeof c->r[0]);
+    }
+    return c->n;
+}
+
+static int wm_name_is(uint32_t name, const char *want) {
+    size_t n = strlen(want) + 1;
+    const char *s = NULL;
+    return name && g_api->guest_ptr(g_api, name, (uint32_t)n, (void **)&s) == POP_OK && s && !memcmp(s, want, n);
+}
+
+/* The map's package, and whether another menu than the pause's black screen is up. */
+static uint32_t wm_package(uint32_t map, int *menu) {
+    uint32_t fe = get_u32(get_u32(0x00a97a78u)), mine = get_u32(map + 0xc), found = 0;
+    const char *want = NULL;
+    *menu = 0;
+    if (!fe || !mine || g_api->guest_ptr(g_api, mine, 1, (void **)&want) != POP_OK || !want)
+        return 0;
+    char name[64];
+    snprintf(name, sizeof name, "%s", want); /* package names are short: WorldMapMain.fng */
+    for (uint32_t pkg = get_u32(fe + 0xe0), n = 0; pkg && n < 64; pkg = get_u32(pkg + 4), ++n) {
+        uint32_t s = get_u32(pkg + 0xc);
+        if (!found && (s == mine || wm_name_is(s, name)))
+            found = pkg;
+        else if (!wm_name_is(s, WM_BLACK_SCREEN))
+            *menu = 1;
+    }
+    return found;
+}
+
+static double wm_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+}
+
+/* BEFORE 005c9500, before anything moves: the view the frame on screen was drawn with.
+ * player_item: the player's own arrow (0 if not on the map); shown: our items' players. */
+static void wm_view(uint32_t map, WmShared *sh, uint32_t player_item, const uint32_t *shown, int n_shown) {
+    double t0 = wm_now_us();
+    WmView *v = &sh->view;
+    static WmCovers covers;
+    uint32_t state = get_u32(map + 0x70);
+    if (!state)
+        return;
+    /* 005c9500: s = 1 / zoom (1 when the zoom value is 0), the centre from the state's second value. */
+    float zx = wm_f(state + 0x28), s = zx != 0.0f ? wm_f(WM_ONE) / zx : 1.0f;
+    float ucx = wm_f(map + 0x44) + wm_f(state + 0x80) * wm_f(map + 0x4c);
+    float ucy = wm_f(map + 0x48) + wm_f(state + 0x80 + 0x2c) * wm_f(map + 0x50);
+    float xc = wm_f(WM_MAP_X_CENTRE), yc = 240.0f;
+    /* The calibration is affine: three points give it (physics x, z -> render z, -x, as wm_place). */
+    float u0, v0, ux, vx, uz, vz;
+    if (!wm_unzoomed(map, 0.0f, 0.0f, &u0, &v0) || !wm_unzoomed(map, 0.0f, -1000.0f, &ux, &vx) ||
+        !wm_unzoomed(map, 1000.0f, 0.0f, &uz, &vz) || !isfinite(s) || !isfinite(ucx) || !isfinite(ucy) || !isfinite(xc))
+        return;
+    float m[6] = {s * (ux - u0) / 1000.0f, s * (uz - u0) / 1000.0f, s * (u0 - ucx) + xc,
+                  s * (vx - v0) / 1000.0f, s * (vz - v0) / 1000.0f, s * (v0 - ucy) + yc};
+
+    int menu = 0;
+    uint32_t pkg = wm_package(map, &menu);
+    WmDrawn me = {0};
+    uint32_t player_image = player_item ? get_u32(player_item + 0xc) : 0;
+    int have_me = player_image && !(get_u32(player_image + 0x1c) & 1u) && wm_drawn(player_image, &me);
+    float check[2] = {NAN, NAN}, cursor[2] = {NAN, NAN};
+    uint32_t cursor_obj = get_u32(map + 0x28), cursor_shown = 0;
+    if (have_me) {
+        float pu = wm_f(player_item + 0x10), pv = wm_f(player_item + 0x14);
+        check[0] = me.x - (s * (pu - ucx) + xc);
+        check[1] = me.y - (s * (pv - ucy) + yc);
+        /* The cursor: a sibling of the arrow in the icons group, so the same offset takes it to the screen. */
+        float *buf = NULL;
+        if (cursor_obj && g_api->guest_ptr(g_api, g_wm_buf + 0x40, 16, (void **)&buf) == POP_OK && buf) {
+            uint32_t at_c[3] = {cursor_obj, g_wm_buf + 0x40, g_wm_buf + 0x44};
+            uint32_t at_p[3] = {player_image, g_wm_buf + 0x48, g_wm_buf + 0x4c};
+            wm_call(FE_GET_CENTER, 0, at_c, 3);
+            wm_call(FE_GET_CENTER, 0, at_p, 3);
+            cursor[0] = buf[0] - buf[2] + me.x;
+            cursor[1] = buf[1] - buf[3] + me.y;
+            cursor_shown = !(get_u32(cursor_obj + 0x1c) & 1u);
+        }
+    }
+    covers.n = 0;
+    covers.w = 2.0f * wm_f(WM_FE_X_CENTRE);
+    covers.h = 480.0f;
+    covers.zmax = have_me ? me.z : 900.0f;
+    covers.skip = cursor_obj;
+    covers.icons = player_image;
+    if (pkg) {
+        unsigned budget = 2000;
+        wm_cover_tree(&covers, get_u32(pkg + 0x4c), 0, &budget, 1.0f);
+    }
+    wm_merge(&covers, WM_COVERS);
+
+    float fe_scale = g_fe_scale;
+    if (g_fe_autofit)
+        fe_scale *= fminf(1.0f, g_aspect / (4.0f / 3.0f));
+
+    __atomic_store_n(&v->seq, v->seq + 1, __ATOMIC_RELEASE); /* odd: being written */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    v->magic = WMV_MAGIC;
+    v->frame = sh->updates;
+    v->flags = (player_item ? WMV_PLAYER : 0u) | (menu ? WMV_MENU : 0u);
+    memcpy(v->m, m, sizeof m);
+    v->fe_w = covers.w;
+    v->fe_h = covers.h;
+    v->fe_scale = fe_scale;
+    v->zoom = s;
+    v->arrow = have_me ? 2.0f * me.hw : NAN;
+    v->cursor[0] = cursor[0];
+    v->cursor[1] = cursor[1];
+    v->cursor_shown = cursor_shown;
+    v->check[0] = check[0];
+    v->check[1] = check[1];
+    v->shown_n = (uint32_t)(n_shown < WM_ARROWS ? n_shown : WM_ARROWS);
+    for (int i = 0; i < WM_ARROWS; ++i)
+        v->shown[i] = i < n_shown ? shown[i] : 0;
+    v->covers_n = (uint32_t)covers.n;
+    memcpy(v->covers, covers.r, sizeof(float) * 4 * (size_t)covers.n);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&v->seq, v->seq + 1, __ATOMIC_RELEASE); /* even: whole */
+    v->us = (uint32_t)(wm_now_us() - t0);
 }
 
 static void wm_turn(uint32_t item, uint32_t image, float degrees) {
@@ -302,6 +637,7 @@ static void wm_update(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *
     enum { MAX = 512 }; /* the career map holds a few hundred */
     uint32_t ours[MAX], ids[MAX], used[MAX];
     int n_ours = 0, n_used = 0, has_player = 0;
+    uint32_t player_item = 0;
     uint32_t head = map + 0x64, node = get_u32(head);
     for (int guard = 0; node && node != head && guard < 512; node = get_u32(node), ++guard) {
         uint32_t item = node - 4, image = get_u32(item + 0xc);
@@ -312,9 +648,23 @@ static void wm_update(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *
             }
         } else if (image && image == player) {
             has_player = 1;
+            player_item = item;
         }
         if (image && n_used < MAX)
             used[n_used++] = image;
+    }
+
+    /* Version 3: the view the frame on screen was drawn with, before this frame moves anything,
+     * and which players have an arrow in it. */
+    {
+        uint32_t shown[WM_ARROWS];
+        int n_shown = 0;
+        for (int k = 0; k < n_ours && n_shown < WM_ARROWS; ++k) {
+            uint32_t image = get_u32(ours[k] + 0xc);
+            if (image && !(get_u32(image + 0x1c) & 1u))
+                shown[n_shown++] = ids[k];
+        }
+        wm_view(map, sh, player_item, shown, n_shown);
     }
 
     /* Who should be there: the page's list, in its order (the first get the free arrows), each
@@ -508,7 +858,7 @@ static void worldmap_install(void) {
         g_api->guest_write_u32(g_api, g_wm_methods + i * 4, get_u32(WM_ITEM_METHODS + i * 4));
     memset(sh, 0, sizeof *sh);
     sh->magic = WM_MAGIC;
-    sh->version = 2;
+    sh->version = 3;
     if (g_api->hook_install(g_api, WM_UPDATE, wm_update, POP_HOOK_BEFORE, NULL, &g_wm_hooks[0]) != POP_OK) {
         log_line("core.nfsc: friends on the world map unavailable");
         return;

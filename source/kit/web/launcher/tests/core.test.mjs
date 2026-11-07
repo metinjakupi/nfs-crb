@@ -317,3 +317,19 @@ test("cancelling a pending source response permits resume", async () => {
   assert.ok(!store.files.has(STAMP));
   assert.equal((await importGame(game, memorySource(install()), store)).result, "done");
 });
+
+test("a cut-off manifest is read as empty and the game is checked again", async () => {
+  const store = new MemoryStore();
+  const first = await importGame(game, memorySource(install("Test Game/")), store);
+  assert.equal(first.result, "done");
+  // A write cut short by a full disk or a closed tab (the live error was "Unterminated string in JSON").
+  store.files.set(MANIFEST, new TextEncoder().encode('{"files":{"NFSC.exe":{"size":12,"mtime":3'));
+  assert.equal((await gameStatus(game, store)).state, "notFound");
+  const again = await importGame(game, memorySource(install("Test Game/")), store);
+  assert.equal(again.result, "done");
+  assert.equal((await gameStatus(game, store)).state, "ready");
+  for (const bad of ["", "null", "[]", '{"files":5}']) {
+    store.files.set(MANIFEST, new TextEncoder().encode(bad));
+    await gameStatus(game, store);
+  }
+});

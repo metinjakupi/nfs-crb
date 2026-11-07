@@ -407,10 +407,194 @@
   @media(max-width:850px) { .cm-panel-online .cm-online-list .cm-online-detail { background:#101e26; border:1px solid var(--line); padding:20px; margin:12px 0; } }
 `;
 
+  // ---- Carbon style (2026-11-04, plans/f9-menu-redesign/mockup.html) ----
+  // The workspace above keeps its structure and handlers; this layer gives it the game's own
+  // look: a full-screen pause menu, the categories as a strip across the top (the game's carousel),
+  // slanted option bars with a glowing focus bar, the guide as a carbon-fibre info panel, and the
+  // game's button prompts along the bottom. Saira (SIL Open Font License) is served with the site
+  // (web/fonts), so the menu needs no font from elsewhere.
+  const carbonCss = `
+  @font-face { font-family:"Saira Condensed"; font-weight:500; font-display:swap; src:url("fonts/SairaCondensed-500.woff2") format("woff2"); }
+  @font-face { font-family:"Saira Condensed"; font-weight:600; font-display:swap; src:url("fonts/SairaCondensed-600.woff2") format("woff2"); }
+  @font-face { font-family:"Saira Condensed"; font-weight:700 900; font-display:swap; src:url("fonts/SairaCondensed-700.woff2") format("woff2"); }
+  @font-face { font-family:"Saira"; font-weight:400 500; font-display:swap; src:url("fonts/Saira.woff2") format("woff2"); }
+  .cm { --cyan:#3fe0e8; --line:rgba(63,224,232,.18); --dim:#87a0ad; --cond:"Saira Condensed","Avenir Next Condensed","Arial Narrow",system-ui,sans-serif;
+        --body:"Saira","Avenir Next","Segoe UI",system-ui,sans-serif; --skew:-14deg; font-family:var(--body); }
+  .cm-shade { padding:0; background:linear-gradient(90deg,rgba(2,5,8,.94) 0%,rgba(2,5,8,.80) 50%,rgba(2,5,8,.62) 100%); }
+  .cm .cm-panel,.cm .cm-panel.cm-panel-online { width:100%; height:100dvh; max-height:100dvh; background:transparent; border:0; box-shadow:none; animation:cm-in .26s cubic-bezier(.2,.8,.2,1) both; }
+  @keyframes cm-in { from { opacity:0; transform:translateX(-16px); } }
+  .cm .cm-header { padding:clamp(14px,3vh,30px) clamp(16px,4vw,64px) 6px; border-bottom:0; align-items:flex-end; }
+  .cm .cm-brand { font:italic 600 12px/1 var(--cond); letter-spacing:.32em; color:var(--cyan); margin:0 0 8px; }
+  .cm .cm-title { font:italic 800 clamp(30px,4.2vw,50px)/.95 var(--cond); letter-spacing:.02em; text-transform:uppercase;
+        background:linear-gradient(180deg,#fff 0%,#bfeff2 55%,#59d8e0 100%); -webkit-background-clip:text; background-clip:text; color:transparent;
+        filter:drop-shadow(0 0 14px rgba(63,224,232,.25)); }
+  .cm .cm-resume { font:italic 700 13px/1 var(--cond); letter-spacing:.14em; background:rgba(63,224,232,.06); border-color:var(--line); }
+  .cm .cm-frame { grid-template-columns:minmax(0,1.35fr) minmax(260px,.9fr); grid-template-rows:auto minmax(0,1fr); padding:0 clamp(16px,4vw,64px); column-gap:clamp(16px,3vw,44px); }
+  .cm .cm-rail { grid-column:1 / -1; display:flex; flex-direction:row; align-items:stretch; padding:0; margin:8px 0 clamp(10px,2vh,18px);
+        overflow-x:auto; overflow-y:hidden; border:0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+        background:linear-gradient(90deg,rgba(63,224,232,.06),transparent 70%); scrollbar-width:none; position:static; }
+  .cm .cm-rail::-webkit-scrollbar { display:none; }
+  .cm .cm-rail-caption { display:none; }
+  .cm .cm-rail .cm-nav-item { position:relative; width:auto; flex:none; min-height:0; margin:0; padding:14px clamp(12px,1.5vw,22px) 12px; border:0; background:none; box-shadow:none;
+        font:italic 700 clamp(14px,1.4vw,18px)/1 var(--cond); letter-spacing:.08em; text-transform:uppercase; color:var(--dim); white-space:nowrap; }
+  .cm .cm-rail .cm-nav-item:hover { color:var(--ink); background:none; }
+  .cm .cm-rail .cm-nav-item::after { display:block; content:""; position:absolute; left:10px; right:10px; bottom:-1px; height:3px; background:var(--cyan);
+        transform:skewX(var(--skew)) scaleX(0); transform-origin:left; transition:transform .22s cubic-bezier(.2,.8,.2,1); box-shadow:0 0 14px rgba(63,224,232,.45); }
+  .cm .cm-rail .cm-nav-item[aria-current=page] { color:#fff; background:none; border:0; text-shadow:0 0 18px rgba(63,224,232,.55); }
+  .cm .cm-rail .cm-nav-item[aria-current=page]::after { transform:skewX(var(--skew)) scaleX(1); }
+  .cm .cm-rail .cm-nav-item:focus-visible { outline:none; color:#fff; }
+  .cm .cm-work { padding:4px 10px 24px 4px; }
+  .cm .cm-work h2 { margin:0 0 6px; font:italic 800 clamp(24px,2.6vw,34px)/1 var(--cond); letter-spacing:.03em; text-transform:uppercase; color:var(--ink); }
+  .cm .cm-work h3 { display:flex; align-items:center; gap:12px; margin:18px 0 6px; font:700 12px/1 var(--cond); letter-spacing:.28em; text-transform:uppercase; color:var(--cyan); }
+  .cm .cm-work h3::after { display:block; content:""; flex:1; height:1px; transform:none; background:linear-gradient(90deg,var(--line),transparent); }
+  .cm .cm-work .cm-note,.cm .cm-work p { font-family:var(--body); }
+  .cm .cm-work .cm-item { position:relative; isolation:isolate; min-height:46px; margin:2px 0; padding:8px 18px 8px 22px; border:0; background:none; box-shadow:none; outline:none;
+        font:italic 700 clamp(15px,1.3vw,18px)/1.15 var(--cond); letter-spacing:.05em; text-transform:uppercase; }
+  .cm .cm-work .cm-item::before { content:""; position:absolute; inset:0; z-index:-1; transform:skewX(var(--skew)); background:rgba(255,255,255,.025);
+        border-left:3px solid transparent; transition:background .15s ease,border-color .15s ease,box-shadow .15s ease; }
+  .cm .cm-work .cm-item:hover,.cm .cm-work .cm-item:focus-visible,.cm.cm-pad .cm-work .cm-item:focus { background:none; box-shadow:none; outline:none; }
+  .cm .cm-work .cm-item:hover::before { background:rgba(63,224,232,.07); }
+  .cm .cm-work .cm-item:focus::before { background:linear-gradient(90deg,rgba(63,224,232,.30),rgba(63,224,232,.10) 70%,rgba(63,224,232,.04));
+        border-left-color:var(--cyan); box-shadow:0 0 0 1px rgba(63,224,232,.35),0 0 22px rgba(63,224,232,.18); }
+  .cm .cm-work .cm-quit:focus::before,.cm .cm-work .cm-quit-yes:focus::before { background:linear-gradient(90deg,rgba(255,90,78,.30),rgba(255,90,78,.06)); border-left-color:#ff5a4e; box-shadow:0 0 0 1px rgba(255,90,78,.4); }
+  .cm .cm-work .cm-item .cm-hint { font:600 12px/1.3 var(--cond); letter-spacing:.14em; text-transform:uppercase; font-style:normal; }
+  .cm .cm-work .cm-item .cm-val { font:italic 700 clamp(14px,1.2vw,16px)/1 var(--cond); letter-spacing:.08em; text-transform:uppercase; color:#fff; }
+  .cm .cm-work .cm-item .cm-val.on { color:var(--cyan); }
+  .cm .cm-work .cm-set-row .cm-val { min-width:112px; max-width:170px; text-align:center; color:#fff; font-size:clamp(14px,1.2vw,16px); }
+  .cm .cm-work .cm-set-row:focus .cm-val { text-shadow:0 0 12px rgba(63,224,232,.6); }
+  .cm .cm-work .cm-arr { font:700 24px/1 var(--cond); font-style:normal; color:var(--dim); opacity:1; padding:0 6px; }
+  .cm .cm-work .cm-set-row:focus .cm-arr,.cm .cm-work .cm-set-row:hover .cm-arr { color:var(--cyan); }
+  .cm .cm-set-meta { font:500 12px/1.25 var(--body); letter-spacing:0; text-transform:none; font-style:normal; color:var(--dim); }
+  .cm .cm-work .cm-go::after { font:700 22px/1 var(--cond); }
+  .cm .cm-search { padding:10px 14px; background:rgba(0,0,0,.35); border:1px solid var(--line); font:600 15px/1 var(--cond); letter-spacing:.06em; color:var(--ink); }
+  .cm .cm-search:focus { border-color:var(--cyan); box-shadow:0 0 12px rgba(63,224,232,.25); outline:none; }
+  .cm .cm-search-label { font:700 11px/1 var(--cond); letter-spacing:.24em; text-transform:uppercase; color:var(--cyan); }
+  .cm .cm-inspector { align-self:start; margin-top:2px; padding:22px 24px 24px; border:1px solid var(--line); max-height:100%;
+        clip-path:polygon(0 0,calc(100% - 26px) 0,100% 26px,100% 100%,26px 100%,0 calc(100% - 26px));
+        background-color:#0a0f13; background-size:20px 20px; background-position:0 5px,10px 0,0 10px,10px 5px,0 0,0 0;
+        background-image:linear-gradient(27deg,#0d1317 5px,transparent 5px),linear-gradient(207deg,#0d1317 5px,transparent 5px),
+          linear-gradient(27deg,#10171c 5px,transparent 5px),linear-gradient(207deg,#10171c 5px,transparent 5px),
+          linear-gradient(90deg,#0c1216 10px,transparent 10px),linear-gradient(#0e1519 25%,#0b1115 25%,#0b1115 50%,transparent 50%,transparent 75%,#121a1f 75%,#121a1f); }
+  .cm .cm-inspector-label { margin:0 0 10px; font:700 11px/1 var(--cond); letter-spacing:.3em; color:var(--cyan); }
+  .cm .cm-inspector-icon { display:none; }
+  .cm .cm-guide-title { margin:6px 0 10px; font:italic 800 clamp(20px,2vw,26px)/1.05 var(--cond); letter-spacing:.03em; text-transform:uppercase; color:var(--ink); }
+  .cm .cm-inspector .cm-help { font:14px/1.6 var(--body); color:#c1d4db; }
+  .cm .cm-guide-how { font:13px/1.6 var(--body); }
+  .cm .cm-guide-how strong { font:700 11px/1 var(--cond); letter-spacing:.24em; }
+  .cm .cm-bottom { margin:0; padding:12px clamp(16px,4vw,64px) max(12px,env(safe-area-inset-bottom)); border-top:1px solid var(--line);
+        background:linear-gradient(180deg,rgba(4,8,11,.6),rgba(4,8,11,.95)); font:700 13px/1.9 var(--cond); letter-spacing:.14em; text-transform:uppercase; color:var(--dim); }
+  .cm .cm-bottom kbd { display:inline-grid; place-items:center; min-width:26px; height:24px; padding:0 7px; margin:0 8px 0 0; border:1px solid rgba(255,255,255,.35);
+        border-radius:4px; font:700 12px/1 var(--cond); letter-spacing:.06em; color:#fff; background:rgba(255,255,255,.05); }
+  .cm .cm-online-tabs button { font:italic 700 15px/1.2 var(--cond); letter-spacing:.08em; text-transform:uppercase; }
+  @media(max-width:1000px) {
+    .cm .cm-frame { grid-template-columns:minmax(0,1fr); grid-template-rows:auto auto auto; overflow:auto; }
+    .cm .cm-rail { grid-row:auto; }
+    .cm .cm-inspector { grid-column:1; clip-path:none; margin-top:12px; }
+  }
+  @media(max-width:600px) {
+    .cm .cm-header { padding:12px 16px 4px; }
+    .cm .cm-frame { padding:0 12px; }
+    .cm .cm-rail { position:sticky; top:0; z-index:2; background:#070d12; }
+    .cm .cm-work .cm-item { min-height:52px; padding:8px 8px 8px 16px; }
+    .cm .cm-work .cm-arr { padding:6px 10px; font-size:30px; }
+    .cm .cm-work .cm-set-row .cm-val { min-width:72px; }
+    .cm .cm-bottom { font-size:11px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .cm .cm-panel { animation:none; } .cm .cm-rail .cm-nav-item::after { transition:none; } }
+  /* Primary actions (Create crew, Send invitation, Invite to crew, Accept). The Online page's older rule gave them a
+     cyan background on the button and dark text; the slanted bars above removed that background, leaving dark text on
+     dark. The bar itself is cyan now. */
+  .cm .cm-panel-online .cm-work .cm-primary,.cm .cm-panel-online .cm-work .cm-primary:focus,.cm .cm-panel-online .cm-work .cm-primary:not(:disabled):hover { background:none; border:0; color:#031418; }
+  .cm .cm-work .cm-primary span { color:inherit; }
+  .cm .cm-work .cm-primary::before { background:linear-gradient(90deg,#3fe0e8,#86f2f7); border-left-color:#fff; }
+  .cm .cm-work .cm-primary:hover::before { background:linear-gradient(90deg,#6aeaf0,#b4f8fb); }
+  .cm .cm-work .cm-primary:focus::before { background:linear-gradient(90deg,#6aeaf0,#b4f8fb); border-left-color:#fff; box-shadow:0 0 0 2px #fff,0 0 26px rgba(63,224,232,.65); }
+  .cm .cm-work .cm-primary:disabled { opacity:1; color:#6f8791; }
+  .cm .cm-work .cm-primary:disabled::before { background:rgba(255,255,255,.06); border-left-color:transparent; box-shadow:none; }
+  /* Invite form: the Send invitation button sits beside the name field. */
+  .cm .cm-crew-body { grid-template-columns:minmax(0,1fr) minmax(320px,400px); }
+  .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:8px 10px; }
+  .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form .cm-crew-label { grid-column:1; }
+  .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form .cm-crew-invite { grid-column:2; width:auto; margin:0; padding:8px 18px 8px 22px; min-height:46px; white-space:nowrap; }
+  .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form .cm-note { grid-column:1 / -1; margin:4px 0 0; }
+  .cm .cm-crew-invite-form .cm-crew-friend { min-height:46px; }
+  @media(max-width:1050px) { .cm .cm-crew-body { grid-template-columns:minmax(0,1fr); } }
+  @media(max-width:480px) { .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form { grid-template-columns:minmax(0,1fr); } .cm .cm-panel-online .cm-crew-body .cm-crew-invite-form .cm-crew-invite { grid-column:1; width:100%; } }
+  /* Start a crew: the name field is on the page, not behind a button. */
+  .cm .cm-panel-online .cm-crew-form { max-width:560px; padding:22px 24px 20px; border:1px solid var(--line); border-left:3px solid var(--cyan);
+        background:linear-gradient(90deg,rgba(63,224,232,.09),rgba(0,0,0,.28) 70%); }
+  .cm .cm-crew-form > p { font:15px/1.5 var(--body); color:var(--ink); margin:0 0 12px; }
+  .cm .cm-crew-form .cm-crew-label { font:700 11px/1 var(--cond); letter-spacing:.24em; text-transform:uppercase; color:var(--cyan); }
+  .cm .cm-crew-form input { font:600 22px/1.2 var(--cond); letter-spacing:.06em; min-height:52px; background:rgba(0,0,0,.45); border:1px solid var(--line); }
+  .cm .cm-crew-form input:focus { border-color:var(--cyan); box-shadow:0 0 14px rgba(63,224,232,.3); outline:none; }
+  .cm .cm-crew-form .cm-crew-hint { margin:8px 0 0; font:12px/1.4 var(--body); color:var(--dim); display:flex; justify-content:space-between; gap:12px; }
+  .cm .cm-crew-form .cm-crew-hint.bad { color:var(--amber); }
+  .cm .cm-crew-steps { list-style:none; margin:16px 0 0; padding:14px 0 0; border-top:1px solid var(--line); display:grid; gap:10px; }
+  .cm .cm-crew-steps li { display:flex; align-items:center; gap:12px; font:14px/1.4 var(--body); color:#c1d4db; }
+  .cm .cm-crew-steps b { flex:none; display:grid; place-items:center; width:26px; height:26px; transform:skewX(var(--skew)); background:rgba(63,224,232,.14);
+        border:1px solid var(--line); font:italic 800 14px/1 var(--cond); color:var(--cyan); }
+  .cm .cm-crew-steps b i { font-style:inherit; transform:skewX(14deg); }
+`;
+  // ---- Open races (2026-11-06, logs/race-browser-mockup) ----
+  // One row per race, as the mockup: a stripe and the kind in the kind's colour (race.js), the host in the
+  // game's slanted capitals with a green CREW tag, players gold when one place is left, and a slanted
+  // Join (cyan) / Leave / where-to-join-from button; a race not joinable from here is dimmed, its reason not.
+  const openRacesCss = `
+  .cm .cm-open-races { margin:0 0 18px; }
+  .cm .cm-or-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin:0 0 10px; }
+  .cm .cm-work .cm-or-bar h3 { margin:0 8px 0 0; font:italic 800 clamp(18px,2vw,24px)/1 var(--cond); letter-spacing:.03em; color:var(--ink); }
+  .cm .cm-work .cm-or-bar h3::after { display:none; }
+  .cm .cm-or-filters { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 8px; }
+  .cm .cm-or-filters:empty { display:none; }
+  .cm .cm-or-filter { cursor:pointer; padding:5px 10px; border:1px solid var(--line); border-radius:0; background:transparent; color:var(--dim);
+        font:700 12px/1 var(--cond); letter-spacing:.12em; text-transform:uppercase; }
+  .cm .cm-or-filter[aria-pressed=true] { background:var(--cyan); border-color:var(--cyan); color:#03131a; }
+  .cm .cm-or-filter:hover,.cm .cm-or-filter:focus { outline:none; border-color:var(--cyan); color:var(--ink); }
+  .cm .cm-or-filter[aria-pressed=true]:focus { color:#03131a; box-shadow:0 0 0 2px #fff; }
+  .cm .cm-or-host { margin-left:auto; }
+  .cm .cm-work .cm-or-host .cm-item { width:auto; min-height:36px; margin:0; padding:6px 16px 6px 18px; font-size:15px; gap:10px; }
+  .cm .cm-work .cm-or-host .cm-item .cm-hint { font-size:10.5px; }
+  .cm .cm-or-head,.cm .cm-or-row { display:grid; grid-template-columns:5px minmax(0,1.15fr) minmax(0,1.5fr) 56px 50px 58px 92px; align-items:center; gap:0 12px; padding-right:8px; }
+  .cm .cm-or-head { margin:4px 0; padding-left:2px; font:700 10px/1 var(--cond); letter-spacing:.2em; text-transform:uppercase; color:var(--dim); }
+  .cm .cm-or-head span:nth-child(n+4) { text-align:center; }
+  .cm .cm-or-list { display:flex; flex-direction:column; gap:3px; max-height:max(230px,calc(100dvh - 470px)); overflow:auto; overscroll-behavior:contain;
+        padding:2px 4px 2px 2px; scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
+  .cm .cm-or-row { flex:none; min-height:46px; background:#0c171e; }
+  .cm .cm-or-row:nth-child(even) { background:#101d25; }
+  .cm .cm-or-row:focus-within { background:#12303a; }
+  .cm .cm-or-row.joined { outline:2px solid var(--cyan); outline-offset:-2px; }
+  .cm .cm-or-stripe { align-self:stretch; background:var(--k); }
+  .cm .cm-or-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:italic 800 16px/1.1 var(--cond); letter-spacing:.02em; text-transform:uppercase; color:var(--ink); }
+  .cm .cm-or-name i { margin-left:7px; padding:2px 5px; vertical-align:2px; font:normal 700 10px/1 var(--cond); letter-spacing:.1em; color:#03131a; background:#2ee88a; }
+  .cm .cm-or-event { min-width:0; padding:5px 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:13px/1.3 var(--body); color:var(--dim); }
+  .cm .cm-or-event b { margin-right:7px; font:700 14px/1 var(--cond); letter-spacing:.06em; text-transform:uppercase; color:var(--k); }
+  .cm .cm-or-why { overflow:hidden; text-overflow:ellipsis; font:11.5px/1.35 var(--body); color:#c1d4db; }
+  .cm .cm-or-players { text-align:center; font:700 16px/1 var(--cond); color:var(--ink); }
+  .cm .cm-or-players.full { color:#ffcf3f; }
+  .cm .cm-or-ai,.cm .cm-or-age { text-align:center; font:12px/1 var(--body); color:var(--dim); }
+  .cm .cm-or-row.off :is(.cm-or-stripe,.cm-or-name,.cm-or-event > b,.cm-or-event > span,.cm-or-players,.cm-or-ai,.cm-or-age) { opacity:.5; }
+  .cm .cm-or-go { min-height:32px; padding:6px 4px; cursor:pointer; border:1px solid var(--line); border-radius:0; background:rgba(0,0,0,.3); color:var(--ink);
+        font:italic 700 13px/1 var(--cond); letter-spacing:.12em; text-transform:uppercase; transform:skewX(var(--skew)); }
+  .cm .cm-or-go.join { background:var(--cyan); border-color:var(--cyan); color:#03131a; }
+  .cm .cm-or-go:disabled { cursor:default; border-style:dashed; background:transparent; color:var(--dim); }
+  .cm .cm-or-go:not(:disabled):hover,.cm .cm-or-go:focus { outline:none; box-shadow:0 0 0 2px #fff,0 0 18px rgba(63,224,232,.55); }
+  .cm .cm-or-foot { margin:8px 0 0; font:700 11px/1.4 var(--cond); letter-spacing:.14em; text-transform:uppercase; color:var(--dim); }
+  @media(max-width:850px) {
+    .cm .cm-or-head,.cm .cm-or-row { grid-template-columns:5px minmax(0,1fr) minmax(0,1.3fr) 50px 84px; }
+    .cm .cm-or-ai,.cm .cm-or-age,.cm .cm-or-head span:nth-child(5),.cm .cm-or-head span:nth-child(6) { display:none; }
+  }
+  @media(max-width:600px) {
+    .cm .cm-or-head { display:none; }
+    .cm .cm-or-row { grid-template-columns:4px minmax(0,1fr) 44px 80px; padding:4px 6px 4px 0; }
+    .cm .cm-or-stripe { grid-row:1 / span 2; }
+    .cm .cm-or-event { grid-column:2 / -1; grid-row:2; white-space:normal; padding:2px 0 0; }
+  }
+  @media(prefers-reduced-motion:reduce) { .cm .cm-or-go,.cm .cm-or-filter { transition:none; } }
+  `;
   const root = document.createElement("div");
   root.className = "cm";
   root.innerHTML = `
-  <style>${css}${workspaceCss}${onlineCss}${onlineLayoutCss}</style>
+  <style>${css}${workspaceCss}${onlineCss}${onlineLayoutCss}${carbonCss}${openRacesCss}</style>
   <button class="cm-open" type="button" aria-label="Menu (F9 or F10)" title="Menu (F9 or F10)"><span>☰</span></button>
   <div class="cm-shade" hidden>
     <nav class="cm-panel" role="dialog" aria-modal="true" aria-label="Menu">
@@ -506,6 +690,19 @@
   const compactOnline = matchMedia("(max-width:850px)");
   compactOnline.addEventListener("change",()=>{onlineSignature="";if(onlineOpen){renderOnline();if(matchMedia("(max-width:600px)").matches)railButtons.get(menuView)?.scrollIntoView({block:"nearest",inline:"nearest"});}});
   let onlineOpen = false, onlineTab = "players", playerLimit = 50, selectedPlayer = null, onlineSignature = "", onlineReturn = null;
+  // Open races (2026-11-06, logs/race-browser-mockup): every race other players host, from race.js's
+  // openRaces(), on the Race page (Online → Invitations). The skeleton stays; renderOnline fills it, and
+  // drawActions puts race.js's host button ("+ Host a race") in its bar.
+  const openRacesBox = $(".cm-online-invitations");
+  openRacesBox.classList.add("cm-open-races");
+  openRacesBox.setAttribute("aria-label", "Open races");
+  openRacesBox.innerHTML = `<div class="cm-or-bar"><h3>Open races</h3><div class="cm-or-host"></div></div>
+    <div class="cm-or-filters" role="group" aria-label="Show races"></div>
+    <div class="cm-or-head" aria-hidden="true"><span></span><span>Host</span><span>Event</span><span>Players</span><span>AI</span><span>Open</span><span></span></div>
+    <div class="cm-or-list" role="list"></div><p class="cm-or-foot" role="status"></p>`;
+  openRacesBox.parentNode.prepend(openRacesBox); // first on the Race page, then the race switches, then crew invitations
+  openRacesBox.after($(".cm-online-actions"));
+  let raceFilter = "all";
 
   // ---- Values ----
   function setVal(btn, on) {
@@ -579,6 +776,7 @@
     onlineSignature = "";
     renderOnline();
     if (tab !== "players") void loadCrewPages();
+    if (tab === "crew" && !crewForm.hidden && crewForm.classList.contains("cm-crew-starting")) crewIn.focus();
   }
   function renderOnline() {
     const state = window.recompOnlineState || {}, config = window.recompOnline || {};
@@ -589,10 +787,12 @@
     const filter = $(".cm-online-filter").value;
     const invitationState = window.recompRace?.state?.();
     const invitations = state.open ? invitationState?.invites || [] : [];
+    const open = state.open ? window.recompRace?.openRaces?.(raceFilter) || null : null;
     const signature = JSON.stringify([onlineTab, query, filter, playerLimit, selectedPlayer, mine, state.open, me, compactOnline.matches,
       state.crewId, peers.map(p => [p.id, p.name, p.crew, p.crewId, p.account, p.activity, nearby.has(p.id)]),
+      open && [open.filter, open.filters, open.total, open.rows.map(r => [r.race, r.host, r.crew, r.kind, r.event, r.players, r.max, r.ai, r.minutes, r.button, r.why, r.canJoin, r.joined])],
       invitations.map(i => [i.race, i.name, i.joined]), invitationState?.game?.flow, invitationState?.game?.car,
-      !!invitationState?.race, invitationState?.lobby?.roster?.length, invitationState?.hosting]);
+      !!invitationState?.race, invitationState?.lobby?.roster?.length, invitationState?.hosting, invitationState?.invitesOn]);
     if (signature === onlineSignature) return;
     onlineSignature = signature;
     $(".cm-who").dataset.connected = String(!!state.open);
@@ -608,26 +808,7 @@
     const empty = (parent, message) => { const p = document.createElement("p");p.className = "cm-online-empty";p.textContent = message;parent.append(p); };
     if (onlineTab === "invites") {
       showCrew();
-      const list = $(".cm-online-invitations");
-      const focused = document.activeElement?.dataset.raceInvite;
-      list.replaceChildren();
-      if (!invitations.length) empty(list, "No race invitations. Nearby rival challenges appear in the game.");
-      for (const inv of invitations) {
-        const item = document.createElement("div"), title = document.createElement("p"), action = document.createElement("button");
-        item.className = "cm-online-invite";title.textContent = `${inv.world ? "World map race" : "Quick Race"} · ${inv.name || "Another player"}`;
-        action.type = "button";action.className = "cm-item";action.dataset.raceInvite = String(inv.race);
-        action.textContent = inv.joined ? "Leave invitation" : "Join race";
-        const ready = inv.joined || (window.recompRace?.canJoin?.(inv) ?? (!invitationState?.race && !invitationState?.lobby && invitationState?.game?.flow === 3 && invitationState?.game?.car));
-        action.disabled = !ready;
-        action.addEventListener("click", () => {
-          if (inv.joined) window.recompRace?.leave?.(inv.race); else window.recompRace?.join?.(inv.race);
-          onlineSignature = "";renderOnline();drawActions();
-        });
-        item.append(title, action);
-        if (!ready) { const note = document.createElement("p");note.className = "cm-note";note.textContent = inv.world ? "Enter career free roam to join." : "Return to the game's main menu to join.";item.append(note); }
-        list.append(item);
-      }
-      if (focused) [...list.querySelectorAll("button")].find(b => b.dataset.raceInvite === focused)?.focus({preventScroll:true});
+      drawOpenRaces(open, invitationState, empty);
       return;
     }
     let matches = peers.filter(p =>
@@ -701,6 +882,64 @@
   $(".cm-online-filter").addEventListener("change", () => { playerLimit = 50;onlineSignature = "";renderOnline(); });
   $(".cm-online-more").addEventListener("click", () => { playerLimit += 50;onlineSignature = "";renderOnline(); });
   addEventListener("recomp-open-online", openOnline);
+  // The open races: filters for the kinds present, one row per race (host, kind in its colour, event,
+  // players, AI, minutes open, Join / Leave, or where to join it from and why), a count at the foot.
+  // Focus stays on the same filter or race across redraws (a lobby repeat, a player joining).
+  function drawOpenRaces(open, raceState, empty) {
+    const list = $(".cm-or-list"), filters = $(".cm-or-filters"), foot = $(".cm-or-foot");
+    const focused = document.activeElement, focusRace = focused?.dataset.raceRow, focusFilter = focused?.dataset.raceFilter;
+    const make = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+    filters.replaceChildren();
+    list.replaceChildren();
+    const rows = open?.rows || [];
+    $(".cm-or-head").hidden = !rows.length;
+    if (open?.filters.length > 1) for (const f of open.filters) {
+      const b = make("button", "cm-or-filter", f.id === "all" ? `All · ${f.count}` : f.label);
+      b.type = "button";b.dataset.raceFilter = f.id;b.setAttribute("aria-pressed", String(f.id === open.filter));
+      b.addEventListener("click", () => chooseRaceFilter(f.id));
+      filters.append(b);
+    }
+    if (!rows.length) empty(list, !open ? "Connecting to online play…" : "No open races. Host one with + Host a race, or wait for a friend's: it shows here and on screen.");
+    for (const r of rows) {
+      const row = make("div", `cm-or-row${r.canJoin ? "" : " off"}${r.joined ? " joined" : ""}${r.crew ? " crew" : ""}`);
+      row.setAttribute("role", "listitem");row.style.setProperty("--k", r.color);
+      const host = make("div", "cm-or-name", r.host), event = make("div", "cm-or-event");
+      if (r.crew) host.append(make("i", null, "CREW"));
+      event.append(make("b", null, r.kind), make("span", null, r.event));
+      if (r.why) event.append(make("div", "cm-or-why", r.why));
+      const players = make("div", `cm-or-players${r.max - r.players <= 1 ? " full" : ""}`, `${r.players}/${r.max}`);
+      const go = make("button", `cm-or-go${r.joined ? "" : r.canJoin ? " join" : ""}`, r.button);
+      go.type = "button";go.dataset.raceRow = String(r.race);go.disabled = !r.canJoin;
+      go.setAttribute("aria-label", `${r.button}: ${r.host}'s ${r.kind}, ${r.event}, ${r.players} of ${r.max} players${r.why ? `. ${r.why}` : ""}`);
+      go.addEventListener("click", () => {
+        if (r.joined) window.recompRace?.leave?.(r.race); else window.recompRace?.join?.(r.race);
+        onlineSignature = "";renderOnline();drawActions();
+        list.querySelector(`[data-race-row="${r.race}"]`)?.focus({preventScroll:true});
+      });
+      row.append(make("span", "cm-or-stripe"), host, event, players, make("div", "cm-or-ai", r.ai ? "AI on" : "—"),
+        make("div", "cm-or-age", r.minutes < 1 ? "<1 min" : `${r.minutes} min`), go);
+      list.append(row);
+    }
+    const g = raceState?.game, where = raceState?.race ? "in a race" : raceState?.lobby ? "hosting" : g?.flow === 3 ? "in the menus" : g?.roam ? "in free roam" : g?.racing ? "racing" : "";
+    foot.textContent = !open ? "" : `${rows.length} of ${open.total} ${open.total === 1 ? "race" : "races"}${where ? ` · you are ${where}` : ""}${raceState?.invitesOn === false ? " · race invites are off: they show here only" : ""}`;
+    if (focusRace) (list.querySelector(`[data-race-row="${focusRace}"]:not(:disabled)`) || list.querySelector(".cm-or-go:not(:disabled)") || filters.querySelector("button"))?.focus({preventScroll:true});
+    else if (focusFilter) filters.querySelector(`[data-race-filter="${focusFilter}"]`)?.focus({preventScroll:true});
+  }
+  function chooseRaceFilter(id) {
+    raceFilter = id;
+    onlineSignature = "";renderOnline();
+    $(`.cm-or-filters [data-race-filter="${id}"]`)?.focus({preventScroll:true});
+    $(".cm-or-list").scrollTop = 0;
+  }
+  // ← → on a filter picks the one beside it, as they change a setting.
+  function stepRaceFilter(d) {
+    const buttons = [...root.querySelectorAll(".cm-or-filter")], at = buttons.indexOf(document.activeElement);
+    if (at < 0) return false;
+    chooseRaceFilter(buttons[(at + d + buttons.length) % buttons.length].dataset.raceFilter);
+    return true;
+  }
+  // race.js's chip ("5 races open · F9") opens the menu on this page.
+  addEventListener("recomp-open-races", () => { if (shade.hidden) open(); routeMenu("race"); });
   addEventListener("recomp-race-invitations", () => {
     if (!onlineOpen) return;
     const before = onlineSignature, focused = document.activeElement?.dataset.id;
@@ -715,7 +954,17 @@
   const crewForm = $(".cm-crew-form"), crewIn = $(".cm-crew-in"), crewNote = $(".cm-crew-note");
   const crewNow = () => window.recompOnlineState?.crew || "";
   const crewClean = v => v.replace(/[^A-Za-z0-9 _.-]/g, "");
+  const crewValid = v => /[A-Za-z0-9]/.test(v) && v.trim().length <= 16;
+  function syncCrewOk() {
+    const v = crewIn.value.trim(), text = $(".cm-crew-hint-text"), count = $(".cm-crew-count");
+    $(".cm-crew-ok").disabled = crewBusy || !window.recompOnlineState?.open || !crewValid(v);
+    if (count) count.textContent = `${v.length}/16`;
+    if (text) { text.textContent = v && !/[A-Za-z0-9]/.test(v) ? "Include at least one letter or number." : "Letters, numbers, spaces, _ . -"; text.parentElement.classList.toggle("bad", !!v && !/[A-Za-z0-9]/.test(v)); }
+  }
   const crewState = () => window.recompCrews || { supported: false, account: null, crew: null, pending: 0 };
+  // No crew yet and a protected name: the name field is the page itself, never behind a button, so nothing
+  // (opening or closing the menu, Esc) hides it.
+  const crewStarting = () => { const s = crewState(); return !s.crew && !!s.supported && !!s.account; };
   const crewErrors = {
     reserved: "The Admin name and crew are reserved for the protected Admin account.",
     unavailable: "This server does not support protected crews yet.",
@@ -768,7 +1017,8 @@
     crewBusy = true; crewSay("Saving…"); showCrew();
     try {
       await window.recompCrewRequest(op, { crew: c?.id, revision: c?.revision, ...fields });
-      crewSay(op === "invite" ? "Invitation sent. Your friend can accept in Online → Invitations." : "Saved.");
+      crewSay(op === "invite" ? "Invitation sent. Your friend can accept in Online → Invitations." : op === "create" ? "Crew created. Invite your first friend below." : "Saved.");
+      if (op === "create") crewIn.value = "";
       crewForm.hidden = true;
       await loadCrewPages(true);
       if (op === "accept") chooseOnlineTab("crew");
@@ -779,7 +1029,7 @@
       crewBusy = false; showCrew();
       const active = document.activeElement;
       if (!active || active === document.body || active === root || active.closest("[hidden]")) {
-        (op === "invite" && !$(".cm-crew-invite-form").hidden ? $(".cm-crew-friend") : root.querySelector('[data-online-tab="crew"]')).focus();
+        ((op === "invite" || op === "create") && !$(".cm-crew-invite-form").hidden ? $(".cm-crew-friend") : root.querySelector('[data-online-tab="crew"]')).focus();
       }
     }
   }
@@ -845,14 +1095,18 @@
     if (renderSignature === crewRenderSignature) return;
     crewRenderSignature = renderSignature;
     const connected=!!window.recompOnlineState?.open;
+    const starting=!c&&s.supported&&!!s.account;
     if(c&&!leader)crewForm.hidden=true;
+    if(starting)crewForm.hidden=false;
+    crewForm.classList.toggle("cm-crew-starting",starting);
     $(".cm-crew-title").textContent=c?.name || (!s.supported?"Crews unavailable":!s.account?"Protect your player name":"Start your crew");
     $(".cm-crew-role").textContent=c?`${leader?"Crew leader":"Crew member"} · ${c.count} ${c.count===1?"member":"members"}`:"Invitation-only membership";
-    const edit=$(".cm-crew-edit");edit.textContent=c?"Rename crew":"Create crew";edit.hidden=!s.supported||!s.account||!!c&&!leader;
+    const edit=$(".cm-crew-edit");edit.textContent=c?"Rename crew":"Create crew";edit.hidden=!s.supported||!s.account||!!c&&!leader||starting;
     edit.classList.toggle("cm-primary",!c);edit.disabled=crewBusy||!connected;
-    $(".cm-crew-ok").disabled=crewBusy||!connected;$(".cm-crew-ok span").textContent=c?"Save name":"Create crew";
+    $(".cm-crew-ok span").textContent=c?"Save name":"Create crew";syncCrewOk();
+    crewSteps.hidden=!starting;$(".cm-crew-summary").hidden=starting&&connected;const cancelBtn=$(".cm-crew-cancel");if(cancelBtn)cancelBtn.hidden=starting;
     $(".cm-crew-invite").disabled=crewBusy||!connected;$(".cm-crew-invite-form").hidden=!leader;
-    $(".cm-crew-summary").textContent=!connected?"You are offline. Reconnect before changing your crew.":!s.supported?"This server does not support crew management. You can still browse online players.":!s.account?"Protect your player name with your cloud keyphrase on the start page. You can then create a crew or accept an invitation.":c?leader?"Invite players below. Members join after accepting your invitation.":"Your crew leader manages invitations and membership. You can view all members here.":"Create a crew with a unique name, or ask a crew leader for an invitation. Find received invitations in the Invitations tab.";
+    $(".cm-crew-summary").textContent=!connected?"You are offline. Reconnect before changing your crew.":!s.supported?"This server does not support crew management. You can still browse online players.":!s.account?"Protect your player name with your cloud keyphrase on the start page. You can then create a crew or accept an invitation.":c?leader?(c.count<=1?"Your crew is just you for now. Type a friend's player name under Invite a player and send the invitation. They join when they accept.":"Invite players below. Members join after accepting your invitation."):"Your crew leader manages invitations and membership. You can view all members here.":"Create a crew with a unique name, or ask a crew leader for an invitation. Find received invitations in the Invitations tab.";
     crewHelp.hidden=!!c;membersHeading.hidden=!c;crewManagement.hidden=!c;crewBody.hidden=!c;inviteShortcut.hidden=!leader;
     const controls = $(".cm-crew-controls"), focus = document.activeElement?.dataset.crewAction;
     controls.replaceChildren();
@@ -891,10 +1145,10 @@
   function editCrew() {
     crewIn.value = crewState().crew?.name || "";crewSay("");crewForm.hidden = false;crewIn.focus();crewIn.select();
   }
-  function hideCrew() {crewForm.hidden = true;$(".cm-crew-edit").focus();}
-  function resetCrew() {crewForm.hidden = true;clearCrewConfirm();crewSay("");}
-  crewIn.addEventListener("input", () => {const v=crewIn.value,at=crewIn.selectionStart||0;crewIn.value=crewClean(v);crewIn.setSelectionRange(crewClean(v.slice(0,at)).length,crewClean(v.slice(0,at)).length);});
-  const setCrew = () => crewAction(crewState().crew ? "rename" : "create", { name: crewIn.value.trim() });
+  function hideCrew() {if (crewStarting()) return;crewForm.hidden = true;$(".cm-crew-edit").focus();}
+  function resetCrew() {crewForm.hidden = !crewStarting();clearCrewConfirm();crewSay("");}
+  crewIn.addEventListener("input", () => {const v=crewIn.value,at=crewIn.selectionStart||0;crewIn.value=crewClean(v);crewIn.setSelectionRange(crewClean(v.slice(0,at)).length,crewClean(v.slice(0,at)).length);syncCrewOk();});
+  const setCrew = () => crewValid(crewIn.value.trim()) && crewAction(crewState().crew ? "rename" : "create", { name: crewIn.value.trim() });
   crewIn.addEventListener("keydown", e => {if(e.key === "Enter"){e.preventDefault();setCrew();}});
   $(".cm-crew-ok").addEventListener("click", setCrew);
   $(".cm-crew-edit").addEventListener("click", () => crewForm.hidden ? editCrew() : hideCrew());
@@ -923,10 +1177,27 @@
   // Drawn afresh each time the menu opens, so a script that loads after this
   // one still gets its row; the same id twice is one row (the later one).
   window.recompMenuToggles ||= [];
+  // Two of the game's settings players change most while playing, on the Quick page as switches
+  // (2026-11-04): the performance overlay (on = Counters) and driving through other players'
+  // cars. They are the settings rows' own values (setting, shownValue, ask), shown once the game's
+  // settings block has them; Display & graphics and Game keep the full rows.
+  const OVERLAY_ID = "host.display/performance_overlay", THROUGH_ID = "core.nfsc/mp_ghost_cars";
+  window.recompMenuToggles.unshift(
+    { id: "menu-overlay", label: "Performance overlay", shown: () => !!setting(OVERLAY_ID),
+      get: () => { const s = setting(OVERLAY_ID); return !!s && shownValue(s) !== 0; },
+      set: (on) => { if (setting(OVERLAY_ID)) ask(OVERLAY_ID, on ? 1 : 0); } },
+    { id: "menu-drive-through", label: "Drive through other players' cars",
+      shown: () => (setting(THROUGH_ID)?.choices || []).includes("Drive through"),
+      get: () => { const s = setting(THROUGH_ID); return !!s && shownValue(s) !== 0; },
+      set: (on) => { if (setting(THROUGH_ID)) ask(THROUGH_ID, on ? 1 : 0); } });
   function drawToggles() {
     const all = new Map();
     for (const t of Array.isArray(window.recompMenuToggles) ? window.recompMenuToggles : [])
-      if (t && t.id != null && typeof t.get === "function" && typeof t.set === "function") all.set(String(t.id), t);
+      if (t && t.id != null && typeof t.get === "function" && typeof t.set === "function") {
+        let shown = true;
+        try { shown = typeof t.shown !== "function" || !!t.shown(); } catch (e) { console.warn("[menu]", e); }
+        if (shown) all.set(String(t.id), t);
+      }
     $(".cm-toggles").replaceChildren(...[...all].map(([id, t]) => {
       const btn = document.createElement("button"), label = document.createElement("span"), val = document.createElement("span");
       btn.type = "button";
@@ -993,11 +1264,16 @@
       });
       groups.get(group).push(btn);
     }
-    $(".cm-online-actions").replaceChildren(...(groups.get("Race together") || []));
+    // race.js's host button goes in the open races' bar ("+ Host a race"); the rest stay above the list.
+    const raceButtons = groups.get("Race together") || [], hostButton = raceButtons.find(b => b.dataset.id === "race-host");
+    if (hostButton?.firstChild.textContent.startsWith("+")) hostButton.classList.add("cm-primary"); // not while hosting: then it stops
+    $(".cm-or-host").replaceChildren(...(hostButton ? [hostButton] : []));
+    $(".cm-online-actions").replaceChildren(...raceButtons.filter(b => b !== hostButton));
     groups.delete("Race together");
     $(".cm-career-actions").replaceChildren(...(groups.get("Career") || []));groups.delete("Career");
     $(".cm-report-actions").replaceChildren(...(groups.get("Report a problem") || []));groups.delete("Report a problem");
     displayActions.replaceChildren(...(groups.get("Display") || []));groups.delete("Display");
+    $(".cm-hud-actions").replaceChildren(...(groups.get("HUD styles") || []));groups.delete("HUD styles");
     controlsActions.replaceChildren(...(groups.get("Controls") || []));groups.delete("Controls");
     $(".cm-extra").replaceChildren(...[...groups].flatMap(([name, btns]) => {
       const h = document.createElement("h3");
@@ -1145,6 +1421,57 @@
     }
 
     window.recompMenuActions ||= [];
+    let cashNote = "Set your career cash to $999,999,999. Your save is backed up first.";
+    window.recompMenuActions.push({
+      id: "cash-set", group: "Career", keepOpen: true,
+      shown: () => { const v = block(); return !!v && v.u32[v.p + 114] === 0x31485343; },
+      label: () => "Set cash to $999,999,999",
+      hint: () => cashNote,
+      run: async () => {
+        if (busy >= 0) return;
+        if (status()?.where !== SAFE) { cashNote = "Open this in the game's menus or the Safehouse."; redraw(); return; }
+        busy = 10; cashNote = "Backing up your save…"; redraw();
+        try {
+          await backup();
+          const v = block();
+          if (!v || v.u32[v.p + 114] !== 0x31485343) throw new Error("the game is not ready");
+          Atomics.store(v.u32, v.p + 4, 6);
+          const request = (Atomics.add(v.u32, v.p + 3, 1) + 1) >>> 0;
+          let result = 0;
+          for (let t = 0; t < 150 && !result; t++) {
+            await new Promise((r) => setTimeout(r, 100));
+            if (Atomics.load(v.u32, v.p + 5) === request) result = v.u32[v.p + 6];
+          }
+          cashNote = result === 1 ? "Cash set to $999,999,999. Save from the game menu or leave the Safehouse with autosave on. To undo: start page → Saves → Undo the last restore."
+            : result === 2 ? "Cash was not changed. Open this in the game's menus or the Safehouse."
+            : result ? "The game could not set your cash. Your backup is available in Saves."
+            : "The game has not confirmed the change. Check your cash before trying again.";
+        } catch (e) { cashNote = `Could not prepare the cash change (${e?.message || e}).`; }
+        finally { busy = -1; redraw(); }
+      },
+    });
+    let carsBusy = false, carsNote = "Unlock cars in Car Select. Resets when the game restarts. Your save is backed up before enabling.";
+    window.recompMenuActions.push({
+      id: "cars-unlock", group: "Career", keepOpen: true,
+      shown: () => { const v = block(); return !!v && v.u32[v.p + 113] === 0x31524143; },
+      label: () => { const v = block(); return `Unlock all cars: ${v && v.u32[v.p + 112] === 1 ? "On" : "Off"}`; },
+      hint: () => carsNote,
+      run: async () => {
+        let v = block();
+        if (!v || v.u32[v.p + 113] !== 0x31524143 || carsBusy || busy >= 0) return;
+        if (v.u32[v.p + 112] === 1) { Atomics.store(v.u32, v.p + 112, 0); carsNote = "Normal car locks restored. Reopen Car Select to refresh."; redraw(); return; }
+        if (status()?.where !== SAFE) { carsNote = "Open this in the game's menus or the Safehouse."; redraw(); return; }
+        carsBusy = true; busy = 9; carsNote = "Backing up your save…"; redraw();
+        try {
+          await backup(); v = block();
+          if (v && v.u32[v.p + 113] === 0x31524143) {
+            Atomics.store(v.u32, v.p + 112, 1);
+            carsNote = "Cars are unlocked. Reopen Car Select to refresh. Cars you buy stay owned.";
+          }
+        } catch (e) { carsNote = `Could not back up your save. Cars remain locked (${e?.message || e}).`; }
+        finally { carsBusy = false; busy = -1; redraw(); }
+      },
+    });
     let tuneBusy = false, tuneNote = "Packages bought stay owned. Your save is backed up before enabling.";
     window.recompMenuActions.push({
       id: "performance-unlock", group: "Career", keepOpen: true,
@@ -1696,20 +2023,25 @@
     if (menuView === "support" || menuView === "career") {showMain();$(".cm-back").focus();return;}
     if (onlineOpen) {
       if (!$(".cm-crew-confirm").hidden) {clearCrewConfirm();root.querySelector('[data-online-tab="crew"]').focus();}
-      else if (!crewForm.hidden) hideCrew();
+      else if (!crewForm.hidden && !crewStarting()) hideCrew();
       else close();
     }
     else if (checking) leaveCheck();
     else if (!$(".cm-quit-box").hidden) hideConfirm();
-    else if (!crewForm.hidden) hideCrew();
+    else if (!crewForm.hidden && !crewStarting()) hideCrew();
     else if (!$(".cm-reset-box").hidden) hideReset();
     else if (page) showMain();
     else if (closing) close();
   }
   // The next (d = 1) or previous (d = -1) item, round the ends.
   function step(d) {
-    const list = items(), at = list.indexOf(document.activeElement);
-    const next = list[(at + (d > 0 ? 1 : list.length - 1)) % list.length];
+    const list = items(), at = list.indexOf(document.activeElement), on = (i) => (i + (d > 0 ? 1 : list.length - 1)) % list.length;
+    let i = on(at);
+    // The open races' filters are one stop (← → pick among them): past them in one step, onto the one chosen.
+    const filter = (b) => !!b?.dataset.raceFilter;
+    if (filter(list[at])) while (filter(list[i]) && i !== at) i = on(i);
+    else if (filter(list[i])) { const chosen = list.findIndex((b) => filter(b) && b.getAttribute("aria-pressed") === "true"); if (chosen >= 0) i = chosen; }
+    const next = list[i];
     next?.focus();
     next?.scrollIntoView?.({ block: "nearest" });
   }
@@ -1721,9 +2053,15 @@
     if (e.key === "Escape" || (e.key === "Backspace" && !inField)) {
       e.preventDefault();
       back(e.key === "Escape");
+    } else if (!inField && !e.ctrlKey && !e.metaKey && !e.altKey && ["q", "Q", "e", "E", "PageUp", "PageDown"].includes(e.key)) {
+      e.preventDefault();
+      cycleCategory(e.key === "PageDown" || e.key === "e" || e.key === "E" ? 1 : -1);
     } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       step(e.key === "ArrowDown" ? 1 : -1);
+    } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && document.activeElement?.dataset?.raceFilter) {
+      e.preventDefault();
+      stepRaceFilter(e.key === "ArrowRight" ? 1 : -1);
     } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && row) {
       e.preventDefault();
       change(row.dataset.id, e.key === "ArrowRight" ? 1 : -1);
@@ -1826,6 +2164,7 @@
         select.dispatchEvent(new Event("change", {bubbles:true}));
       }
       else if (dir === "up" || dir === "down") step(dir === "down" ? 1 : -1);
+      else if (stepRaceFilter(dir === "right" ? 1 : -1)) {} // on the open races' filters
       else {
         const row = document.activeElement.closest(".cm-set-row");
         if (row) change(row.dataset.id, dir === "right" ? 1 : -1);
@@ -1839,6 +2178,9 @@
     } else if (press("east")) {
       padUsed();
       back(true);
+    } else if (press("l1") || press("r1")) {
+      padUsed();
+      cycleCategory(press("r1") ? 1 : -1);
     }
   }
 
@@ -1998,10 +2340,22 @@
     $(".cm-quit-no").focus();
   });
   $(".cm-quit-no").addEventListener("click", hideConfirm);
-  $(".cm-quit-yes").addEventListener("click", () => {
+  // Quit to the start page: F9 Quit and race.js's Exit to start page. The game's files are in
+  // the browser's private storage, written from the game's worker threads, and a reload kills
+  // them wherever they are: in the middle of a save, or still holding files the next Play opens
+  // ("The browser changed its game storage while Carbon was loading", players' reports
+  // 2026-10-30..11-03). So the scripts hear it first (recomp-quit), the game gets a moment to
+  // finish a write, and only then the page goes; a second press while closing does nothing.
+  window.recompQuitToStart = async function () {
+    if (window.recompQuitting) return;
+    window.recompQuitting = true;
     dispatchEvent(new Event("recomp-quit"));
+    const yes = $(".cm-quit-yes");
+    if (yes) { yes.disabled = true; yes.querySelector("span").textContent = "Closing…"; }
+    await new Promise((resolve) => setTimeout(resolve, 900));
     location.replace(location.pathname);
-  });
+  };
+  $(".cm-quit-yes").addEventListener("click", () => window.recompQuitToStart());
 
   const MENU_GUIDES = [
     [
@@ -2111,15 +2465,17 @@
   inspector.innerHTML = `<div class="cm-inspector-label">FEATURE GUIDE</div><div class="cm-inspector-icon" aria-hidden="true">i</div><p class="cm-guide-title"></p>`;
   inspector.append($(".cm-help"));
   const how = document.createElement("p");how.className = "cm-guide-how";how.innerHTML = `<strong>HOW TO USE</strong><span></span>`;inspector.append(how);
-  bottom.className = "cm-bottom";bottom.innerHTML = `<span><kbd>↑ ↓</kbd>Navigate &nbsp; <kbd>← →</kbd>Change &nbsp; <kbd>Enter</kbd>Select</span><span><kbd>Esc</kbd>Back &nbsp; <kbd>F9</kbd>Close menu</span>`;
+  bottom.className = "cm-bottom";bottom.innerHTML = `<span><kbd>↑ ↓</kbd>Navigate &nbsp; <kbd>← →</kbd>Change &nbsp; <kbd>Enter</kbd>Select &nbsp; <kbd>Q E</kbd>Category</span><span><kbd>Esc</kbd>Back &nbsp; <kbd>F9</kbd>Close menu</span>`;
   const searchBar = document.createElement("div");searchBar.className = "cm-searchbar";
   searchBar.innerHTML = `<label class="cm-search-label" for="cm-feature-search">Find a setting or get help</label><input class="cm-search" id="cm-feature-search" type="search" placeholder="Try overlay, controller, graphics, or crew…" autocomplete="off">`;
-  const controlsActions = document.createElement("section"), careerPage = document.createElement("section"), supportPage = document.createElement("section"), resultsPage = document.createElement("section"), displayActions = document.createElement("div");
+  const controlsActions = document.createElement("section"), hudPage = document.createElement("section"), careerPage = document.createElement("section"), supportPage = document.createElement("section"), resultsPage = document.createElement("section"), displayActions = document.createElement("div");
   controlsActions.className = "cm-controls-actions";careerPage.className = "cm-career";supportPage.className = "cm-support";resultsPage.className = "cm-search-results";displayActions.className = "cm-display-actions";
-  careerPage.hidden = supportPage.hidden = resultsPage.hidden = true;
+  hudPage.className = "cm-hud";
+  hudPage.hidden = careerPage.hidden = supportPage.hidden = resultsPage.hidden = true;
+  hudPage.innerHTML = `<h2>HUD styles</h2><p class="cm-note">Choose the gauges you drive with. Original Carbon brings back the game's own HUD. Your choice is saved in this browser.</p><div class="cm-hud-actions"></div>`;
   careerPage.innerHTML = `<h2>Career tools · Local only</h2><p class="cm-note">Available on this computer only. Save backups and eligibility checks apply.</p><div class="cm-career-actions"></div>`;
   supportPage.innerHTML = `<h2>Help & support</h2><p class="cm-note">Choose a topic for steps, or send a report with the game log.</p><div class="cm-report-actions"></div><h3>Step-by-step help</h3><div class="cm-guides"></div>`;
-  work.append(searchBar, mainPage, setPage, checkPage, onlinePage, careerPage, supportPage, resultsPage);
+  work.append(searchBar, mainPage, setPage, checkPage, onlinePage, hudPage, careerPage, supportPage, resultsPage);
   frame.append(rail, work, inspector);menuPanel.append(header, frame, bottom);
   $(".cm-main h2").textContent = "Quick actions";
   // These are the existing settings buttons, with their original event handlers.
@@ -2135,9 +2491,27 @@
   }
   navButton("quick", "Quick actions");
   for (const name of ["display", "controls", "game"]) navButton(name, PAGES[name].title, root.querySelector(`.cm-go[data-page="${name}"]`));
+  navButton("hud", "HUD styles");
   navButton("online", "Online & crews", $(".cm-online-go"));
   $(".cm-online-go span").textContent = "Online & crews";
-  navButton("race", "Race together");navButton("career", "Career tools · Local only");navButton("support", "Help & support");
+  navButton("crew", "Crew");navButton("race", "Race together");navButton("career", "Career tools · Local only");navButton("support", "Help & support");
+  // The strip across the top uses short names, as the game's own menus do; each page keeps its full
+  // title, and the button keeps it as its accessible name and tooltip.
+  const SHORT_NAMES = { quick: "Quick", display: "Display", hud: "HUD", controls: "Controls", game: "Game", online: "Online", crew: "Crew", race: "Race", career: "Career", support: "Help" };
+  for (const [view, b] of railButtons) {
+    const label = b.querySelector("span") || b, full = label.textContent.trim();
+    b.setAttribute("aria-label", full);b.title = full;
+    label.textContent = SHORT_NAMES[view] || full;
+  }
+  // Q / E, PageUp / PageDown and the controller's shoulder buttons step through the categories.
+  function cycleCategory(d) {
+    const views = [...railButtons].filter(([, b]) => b.isConnected && !b.hidden).map(([v]) => v);
+    if (!views.length) return;
+    const at = Math.max(0, views.indexOf(menuView === "search" ? "quick" : menuView));
+    const next = views[(at + d + views.length) % views.length];
+    routeMenu(next);
+    railButtons.get(next)?.scrollIntoView?.({ block: "nearest", inline: "center" });
+  }
   $(".cm-resume").addEventListener("click", close);
   for (const [selector,title,body,instructions] of [
     [".cm-back","Back to the game","Closes the F9 browser menu.","F9 and F10 also close this menu. Esc steps back through pages first."],
@@ -2156,6 +2530,12 @@
   $(".cm-online-crew").prepend(crewHeading);crewHeading.append(crewHeadingIdentity, $(".cm-crew-edit"));
   const crewNameLabel=document.createElement("label");crewNameLabel.className="cm-crew-label";crewNameLabel.htmlFor="cm-crew-name";crewNameLabel.textContent="Crew name";
   crewIn.id="cm-crew-name";crewIn.placeholder="Night Shift";crewForm.insertBefore(crewNameLabel,crewForm.querySelector(".cm-row"));
+  crewForm.querySelector("p").textContent="Pick a name for your crew. It stays yours: nobody else can take it.";
+  const crewHint=document.createElement("p");crewHint.className="cm-crew-hint";crewHint.innerHTML=`<span class="cm-crew-hint-text">Letters, numbers, spaces, _ . -</span><span class="cm-crew-count">0/16</span>`;
+  crewForm.querySelector(".cm-row").after(crewHint);
+  const crewSteps=document.createElement("ol");crewSteps.className="cm-crew-steps";
+  crewSteps.innerHTML=`<li><b><i>1</i></b>Name your crew</li><li><b><i>2</i></b>Invite friends by their player name</li><li><b><i>3</i></b>They accept under Online → Invitations</li>`;
+  crewForm.append(crewSteps);
   const cancelCrew=document.createElement("button");cancelCrew.type="button";cancelCrew.className="cm-item cm-crew-cancel";cancelCrew.textContent="Cancel";cancelCrew.addEventListener("click",hideCrew);crewForm.querySelector(".cm-row").append(cancelCrew);
   $(".cm-crew-ok").classList.add("cm-primary");$(".cm-crew-invite").classList.add("cm-primary");
   $(".cm-crew-friend").placeholder="Alex";
@@ -2178,7 +2558,7 @@
   crewTools.append($(".cm-crew-invite-form"),$(".cm-crew-outbox"),crewManagement);crewBody.append(crewRoster,crewTools);$(".cm-online-crew").append(crewBody);
   const inviteShortcut=document.createElement("button");inviteShortcut.type="button";inviteShortcut.className="cm-item cm-primary cm-crew-invite-shortcut";inviteShortcut.textContent="Invite a player";inviteShortcut.addEventListener("click",()=>{$(".cm-crew-friend").focus();$(".cm-crew-invite-form").scrollIntoView({block:"nearest"});});$(".cm-crew-summary").after(inviteShortcut);
 
-  const panels = [mainPage, setPage, checkPage, onlinePage, careerPage, supportPage, resultsPage];
+  const panels = [mainPage, setPage, checkPage, onlinePage, hudPage, careerPage, supportPage, resultsPage];
   function guide(title, body, instructions = "", timing = "") {
     $(".cm-guide-title").textContent = title;
     $(".cm-help b").textContent = timing;$(".cm-help b").className = "";
@@ -2200,7 +2580,7 @@
     const descriptions = {
       quick: ["Quick actions", "Common switches and session actions.", "Choose a category on the left. F9 or F10 closes this menu. Esc steps back."],
       online: ["Online & crews", "See players, manage your protected crew, and respond to invitations.", "Crew actions use your protected player identity. Only the crew leader can manage members."],
-      race: ["Race together", "Use the existing shared Quick Race controls and invitations.", "Enable Host a race together, then choose a Quick Race. Race controls appear here when available."],
+      race: ["Race together", "Every race other players host here, and your own.", "Join one from Open races, or press + Host a race, then choose a Quick Race. Race controls appear here when available."],
       career: ["Career tools · Local only", "These tools use the existing save backup and eligibility checks.", "Use the game menus or Safehouse. Shop prices still apply. Purchased packages remain owned."],
       support: ["Help & support", "Find practical steps for graphics, controllers, online play, and saves.", "Open a topic below. Download log saves a text file; Send a report opens the report form."],
     };
@@ -2209,31 +2589,33 @@
   function routeMenu(view) {
     if (["display", "controls", "game"].includes(view)) {showPage(view);return;}
     if (view === "quick") {showMain();$(".cm-back").focus();return;}
-    if (view === "online" || view === "race") {
+    if (view === "online" || view === "race" || view === "crew") {
       openOnline();
-      if (view === "race") {menuView = "race";for (const [name,b] of railButtons) {if(name === "race") b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");}chooseOnlineTab("invites");guide("Race together", "Existing Quick Race controls and invitations.", "Enable hosting, choose a Quick Race, and press Start. Invitations appear when another player hosts a race.");}
+      if (view === "crew") {menuView = "crew";for (const [name,b] of railButtons) {if(name === "crew") b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");}chooseOnlineTab("crew");guide("Crew", "Create a crew, invite friends and manage members.", "Name your crew, then invite friends by their protected player name. They join when they accept under Invitations.");
+        const start = $(".cm-crew-starting:not([hidden]) .cm-crew-in"); (start || root.querySelector('[data-online-tab="crew"]')).focus();}
+      if (view === "race") {menuView = "race";for (const [name,b] of railButtons) {if(name === "race") b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");}chooseOnlineTab("invites");$(".cm-or-list").scrollTop = 0;guide("Race together", "Every race other players host here, and your own.", "Join one from Open races (Q E changes the page; ← → on a filter picks another), or press + Host a race, choose a Quick Race and press Start.");}
       return;
     }
     if (view === "career" && window.recompSite) return;
     activateMenu(view);page = null;rowEls.clear();
-    const panel = view === "career" ? careerPage : supportPage;panel.hidden = false;
+    const panel = view === "career" ? careerPage : view === "hud" ? hudPage : supportPage;panel.hidden = false;
     (panel.querySelector("button") || railButtons.get(view))?.focus();
   }
   function updateRail() {
     railButtons.get("career").hidden = !!window.recompSite || !$(".cm-career-actions").querySelector("button");
     const hasOnline = !!window.recompOnline || !!window.recompOnlineState;
-    railButtons.get("online").hidden = !hasOnline;railButtons.get("race").hidden = !hasOnline;
+    railButtons.get("online").hidden = !hasOnline;railButtons.get("race").hidden = !hasOnline;railButtons.get("crew").hidden = !hasOnline;
     if (menuView === "career" && railButtons.get("career").hidden) routeMenu("quick");
   }
   const featureHelp = {
     radar: ["Shows nearby online players on the radar.", "Turn Off to hide the radar. Your choice is saved in this browser."],
     chat: ["Shows room chat during driving, the garage, and the main menu.", "Press Y to open chat. Turn Off here to hide the chat interface."],
-    "world-hud": ["Enables the custom gauges.", "Turn Off to restore the original Carbon gauges. Choose HUD style under Display & graphics to change the design."],
+    "world-hud": ["Enables the custom gauges.", "Turn Off to restore the original Carbon gauges. Choose a style on the HUD styles tab to change the design."],
     "hud-style": ["Choose and preview a gauge design in the existing HUD picker.", "Choose a style, then apply it. Original Carbon restores the original gauges."],
-    "race-host": ["Host a shared Quick Race using the existing race system.", "Enable hosting, choose a Quick Race, and press Start. Available when no shared race or lobby is active."],
+    "race-host": ["Host a race others can join: a Quick Race from the menus, or an event on the world map in free roam.", "Press + Host a race, then choose a Quick Race and press Start. Available when no shared race or lobby is active."],
     "race-start": ["Starts the current race lobby.", "Check the player count before starting."],
     "race-cancel": ["Cancels the current race lobby.", "Players return from the pending lobby. This does not start a free-roam race."],
-    "race-join": ["Join or leave the selected player's race invitation.", "Available when an invitation exists and no other race or lobby is active."],
+    "race-invites": ["Shows other players' hosted races on screen: a card, or a small chip when three or more are open.", "Turn Off to stop them. Open races below still lists every race, and you can still host your own. Your choice is saved in this browser."],
     "report-log": ["Downloads the game log as a text file.", "Use this when asked to share diagnostics. A log download alone does not send a report."],
     "report-send": ["Opens the existing report form with the game log.", "Describe the steps, what happened, and what you expected. Submit the form to send the report."],
     "performance-unlock": ["Makes performance packages available in the shop. Prices still apply.", "Local only. Use menus or Safehouse. A successful save backup is required before enabling. Reopen the shop to refresh."],
@@ -2280,7 +2662,7 @@
       if(matches(s.label,s.help,WEB_NOTE[s.id])) result(labelOf(s),PAGES[pageOf(s)]?.title || "Display & graphics",()=>{showPage(s.id===FULLSCREEN.id?"display":pageOf(s));rowEls.get(s.id)?.focus();});
     }
     for(const btn of new Set([...root.querySelectorAll(".cm-toggle,.cm-action"), ...displayActions.querySelectorAll(".cm-action"), ...controlsActions.querySelectorAll(".cm-action")])) {
-      const owner=btn.closest(".cm-career-actions")?"career":btn.closest(".cm-online-actions")?"race":btn.closest(".cm-report-actions")?"support":btn.closest(".cm-display-actions")?"display":"quick";
+      const owner=btn.closest(".cm-career-actions")?"career":btn.closest(".cm-online-actions,.cm-open-races")?"race":btn.closest(".cm-report-actions")?"support":btn.closest(".cm-display-actions")?"display":"quick";
       if(owner==="career"&&window.recompSite)continue;
       if(matches(btn.textContent,...(featureHelp[btn.dataset.id]||[])))result(btn.querySelector("span")?.textContent||btn.textContent,owner==="career"?"Career tools · Local only":owner==="race"?"Race together":"Menu action",()=>{routeMenu(owner);btn.focus();});
     }

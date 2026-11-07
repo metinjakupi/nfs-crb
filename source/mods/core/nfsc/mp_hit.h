@@ -108,7 +108,7 @@ static int hit_ours(uint32_t car) {
 static uint32_t hit_nearest_ai(uint32_t player, const float p[3]) {
     uint32_t node = get_u32(MP_CARS), best = 0;
     float bd = 1e30f;
-    for (int n = 0; node && node != MP_CARS && n < 64; ++n, node = get_u32(node)) {
+    for (int n = 0; node && node != MP_CARS && n < 256; ++n, node = get_u32(node)) {
         const uint32_t car = node - 0xd0;
         MpPose pose;
         if (car == player || hit_ours(car) || !hit_pose_of(car, &pose))

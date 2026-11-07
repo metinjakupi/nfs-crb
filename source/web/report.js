@@ -48,6 +48,7 @@
       try {
         if (args.length === 1 && typeof args[0] === 'string') {
           recordRendererLine(args[0]);
+          if (args[0].startsWith(CRASH)) setTimeout(() => checkpoint(true));
           if (args[0].includes('audio sink:')) window.recompPerformance?.audio(args[0]);
         }
         const log = window.recompLog;
@@ -80,6 +81,7 @@
   function rememberError(kind, error, extra = {}) {
     errors.push({ at: new Date().toISOString(), kind, ...shortError(error), ...extra });
     if (errors.length > 20) errors.shift();
+    if (sessionKey) setTimeout(() => checkpoint(true)); // a tab that dies next keeps what stopped it
   }
   addEventListener("error", e => rememberError("error", e.error || e.message || "Resource failed to load",
     { source: cleanUrl(e.filename || e.target?.src || e.target?.href), line: e.lineno || 0, column: e.colno || 0 }), true);
@@ -137,6 +139,132 @@
     ]); } catch (e) { return { unavailable: shortError(e) }; }
     finally { clearTimeout(timer); }
   }
+
+  // ---- Where a game thread crashed ----
+  // The runtime's crash-capture.js (a --pre-js of CarbonRecomp.js) prints one "[crash] {json}" line
+  // into the game's log when a thread traps: its own stack (wasm-function[N] frames) and the guest's
+  // register file (crash_probe.cpp). The release's CarbonRecomp.js.symbols ("N:name" per line) names
+  // the frames; a release that does not publish it keeps the numbers, which
+  // tools/carbon-crash-symbolize.mjs names later from the build's own symbols file.
+  const CRASH = "[crash] {";
+  function crashRecords(lines) {
+    const out = [];
+    for (const l of lines || []) {
+      const text = String(l);
+      if (!text.startsWith(CRASH)) continue;
+      try { const c = JSON.parse(text.slice(8)); if (c && typeof c === "object") out.push(c); } catch {}
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+  const symbolTables = new Map();
+  function symbolTable(source) {
+    let url;
+    try { url = new URL("CarbonRecomp.js.symbols", source || location.href).href; } catch { return Promise.resolve(null); }
+    if (!symbolTables.has(url)) symbolTables.set(url, (async () => {
+      try {
+        const r = await fetch(url, { cache: "no-cache", credentials: "omit", signal: AbortSignal.timeout?.(8000) });
+        if (!r.ok) return { url: cleanUrl(url), missing: `HTTP ${r.status}` };
+        const text = await r.text();
+        if (!/^\d+:/.test(text)) return { url: cleanUrl(url), missing: "not a symbols file" };
+        const names = new Map();
+        for (const line of text.split("\n")) {
+          const i = line.indexOf(":");
+          if (i > 0) names.set(Number(line.slice(0, i)), line.slice(i + 1).trim());
+        }
+        return { url: cleanUrl(url), names };
+      } catch (e) { return { url: cleanUrl(url), missing: String(e?.name || e) }; }
+    })());
+    return symbolTables.get(url);
+  }
+  // One line per frame: "wasm N 0xOFFSET name" for wasm frames, the JS frame otherwise.
+  function crashFrames(stack, table) {
+    const frames = [];
+    for (const raw of String(stack || "").split("\n")) {
+      const line = raw.trim();
+      if (!line || /^(?:Uncaught )?\w*Error\b/.test(line)) continue;
+      const m = /wasm-function\[(\d+)\](?::(0x[0-9a-f]+))?/i.exec(line);
+      if (m) {
+        const n = Number(m[1]);
+        const own = /^at ([^\s(]+) \(/.exec(line)?.[1] || /^([^@\s]+)@/.exec(line)?.[1] || "";
+        const name = table?.names?.get(n) || (own && !own.startsWith("wasm") && !own.includes("wasm-function") ? own : "?");
+        frames.push(`wasm ${n}${m[2] ? " " + m[2] : ""} ${name}`);
+      } else frames.push(line.replace(/^at /, "js ").slice(0, 300));
+      if (frames.length >= 64) break;
+    }
+    return frames;
+  }
+  async function crashSection(records) {
+    if (!records.length) return [];
+    const out = ["Crash location (the crashed thread's own stack, newest frame first; wasm N = wasm-function[N]):"];
+    for (const c of records.slice(0, 4)) {
+      const table = /wasm-function\[\d+\]/.test(String(c.stack)) ? await symbolTable(c.source) : null;
+      const frames = crashFrames(c.stack, table);
+      out.push(`  ${c.where || "?"}${c.thread ? ` (pthread ${Number(c.thread).toString(16)})` : ""} at ${c.at || "?"}: ` +
+        `${c.name ? c.name + ": " : ""}${String(c.message || "").slice(0, 300)}`);
+      if (c.guest) out.push(`  Guest: ${String(c.guest).slice(0, 1500)}`);
+      if (Number(c.memoryBytes) > 0) out.push(`  WebAssembly memory then: ${c.memoryBytes} bytes`);
+      out.push(`  Names: ${!table ? "none needed" : table.names ? `from ${table.url}` : `not available (${table.missing}, ${table.url}); name the numbers with tools/carbon-crash-symbolize.mjs`}`);
+      if (!frames.length) out.push("  (the browser gave no stack)");
+      frames.forEach((f, i) => out.push(`  #${i} ${f}`));
+    }
+    return out;
+  }
+
+  // ---- The last lines, kept in case the tab itself dies ----
+  // start.js marks a running game in localStorage (its key) and clears the mark on a clean exit;
+  // this keeps the end of the log beside it (key + ".tail"), every 10 s while the log grows, when
+  // the tab is hidden and right after an error or a crash line. A tab the browser kills (out of
+  // memory, a renderer crash) leaves both, and the next start page offers to send them.
+  let sessionKey = "", sessionTimer = 0, sessionLines = -1, sessionAt = 0;
+  const TAIL_MAX = 96 * 1024;
+  function sessionSnapshot(logLines, pageKeep) {
+    const log = (window.recompLog || []).map(String);
+    return { version: 1, at: new Date().toISOString(), page: location.origin + location.pathname,
+      pageBuild: window.recompPageBuild?.id || "", runtimeBuild: window.recompRuntimeBuild?.id || "",
+      wasm: window.recompRuntimeBuild?.wasm || "", reporterBuild: reporterBuild?.id || "",
+      phase: window.recompStartupPhase || "", stopped: stopped(), failure: window.recompFailure || null,
+      wasmMemoryBytes: window.Module?.HEAPU8?.buffer?.byteLength ?? globalThis.wasmMemory?.buffer?.byteLength ?? null, visibility: document.visibilityState,
+      race: raceSnapshot(), raceHistory: raceHistory.slice(-8), errors: errors.slice(-6), crashes: crashRecords(log),
+      logLines: log.length, log: log.filter(l => !l.startsWith(CRASH)).slice(-logLines).map(l => l.slice(0, 400)),
+      pageLines: pageLines.slice(-pageKeep).map(l => l.slice(0, 400)) };
+  }
+  function checkpoint(force) {
+    if (!sessionKey) return;
+    const lines = window.recompLog?.length || 0;
+    if (!force && lines === sessionLines && Date.now() - sessionAt < 60000) return;
+    sessionLines = lines; sessionAt = Date.now();
+    try {
+      let keep = 160, text;
+      do { text = safeJson(sessionSnapshot(keep, keep / 2)); keep >>= 1; } while (text.length > TAIL_MAX && keep >= 10);
+      if (text.length <= TAIL_MAX) localStorage.setItem(sessionKey + ".tail", text);
+    } catch { /* storage full or blocked: the mark alone still says the tab died */ }
+  }
+  function watchSession(key) {
+    if (!key) return;
+    sessionKey = String(key);
+    clearInterval(sessionTimer);
+    sessionTimer = setInterval(() => checkpoint(false), 10000);
+    checkpoint(true);
+  }
+  function endSession() {
+    const key = sessionKey;
+    sessionKey = "";
+    clearInterval(sessionTimer);
+    try { if (key) localStorage.removeItem(key + ".tail"); } catch {}
+  }
+  // The tail a previous page left under key (start.js's mark), removed as it is read.
+  function takeSession(key) {
+    let tail = null;
+    try {
+      const text = localStorage.getItem(String(key) + ".tail");
+      localStorage.removeItem(String(key) + ".tail");
+      const parsed = text && text.length <= TAIL_MAX * 2 ? JSON.parse(text) : null;
+      if (parsed?.version === 1 && Array.isArray(parsed.log)) tail = parsed;
+    } catch {}
+    return tail;
+  }
+  document.addEventListener?.("visibilitychange", () => { if (document.visibilityState === "hidden") checkpoint(true); });
 
   // ---- What the report says ----
   function playerName() {
@@ -223,7 +351,8 @@
   }
   setInterval(() => { recordRace(); recordInput(); }, 500);
   const bytes = (s) => encoder.encode(s).length;
-  async function build(budget, note) {
+  async function build(budget, note, previous = null) {
+    const prev = previous && typeof previous === "object" ? previous : null;
     const canvas = document.getElementById("canvas");
     recordInput();
     const head = [
@@ -239,12 +368,12 @@
       `GPU: ${await gpuName()}`,
       `Screen: canvas ${canvas?.width || 0}x${canvas?.height || 0}, window ${innerWidth}x${innerHeight}, ` +
         `display ${screen.width}x${screen.height}, pixel ratio ${devicePixelRatio}; isolated ${crossOriginIsolated}`,
-      `Stopped: ${stopped()}`,
+      `Stopped: ${prev ? "the game closed unexpectedly (the tab ended without a clean exit; sent from the next start page)" : stopped()}`,
       `Startup phase: ${window.recompStartupPhase || "unknown"}`,
     ];
     head.push(`Environment: ${safeJson({ secure: globalThis.isSecureContext, isolated: crossOriginIsolated,
       online: navigator.onLine, cores: navigator.hardwareConcurrency ?? null, deviceMemoryGiB: navigator.deviceMemory ?? null,
-      wasmMemoryBytes: window.Module?.HEAPU8?.buffer?.byteLength ?? null })}`);
+      wasmMemoryBytes: window.Module?.HEAPU8?.buffer?.byteLength ?? globalThis.wasmMemory?.buffer?.byteLength ?? null })}`);
     head.push(`Storage estimate (browser quota, not disk capacity): ${diagnosticJson(await storageSnapshot())}`);
     head.push(`Active graphics adapter: ${diagnosticJson(window.carbonGraphicsInfo || { unavailable: true })}`);
     head.push(`Browser timing (last 30 seconds): ${diagnosticJson(timingSnapshot())}`);
@@ -253,15 +382,21 @@
     head.push(`Controller history (sampled every 500 ms): ${diagnosticJson(inputHistory)}`);
     head.push(`Recent errors: ${diagnosticJson(errors)}`);
     if (window.carbonDiagnostics) head.push(`Startup diagnostics: ${diagnosticJson(window.carbonDiagnostics)}`);
+    if (prev) {
+      const { log: _log, pageLines: _page, crashes: _crashes, ...about } = prev;
+      head.push(`Previous session (what the closed tab saved last): ${diagnosticJson(about)}`);
+    }
     try {
       const resources = performance.getEntriesByType("resource").slice(-30).map(r => ({ url: cleanUrl(r.name),
         type: r.initiatorType, durationMs: Math.round(r.duration), transferBytes: r.transferSize,
         encodedBytes: r.encodedBodySize, decodedBytes: r.decodedBodySize, status: r.responseStatus ?? null }));
       head.push(`Recent resource timing (zero may mean browser restriction): ${diagnosticJson(resources)}`);
     } catch {}
-    const f = window.recompFailure;
+    const f = prev ? prev.failure : window.recompFailure;
     if (f) head.push(`Failure details: ${diagnosticJson(f)}`);
     if (f?.stack) head.push("Stack:", ...String(f.stack).split("\n").slice(0, 30).map((l) => "  " + l));
+    const allLog = (prev ? prev.log : window.recompLog || []).map((l) => String(l));
+    head.push(...await crashSection(prev ? (Array.isArray(prev.crashes) ? prev.crashes : []) : crashRecords(allLog)));
     if (window.carbonTestAssets) head.push(`Game files: ${safeJson(window.carbonTestAssets)}`);
     try { if (window.carbonCockpitDiagnostics) head.push(`Cockpit diagnostics: ${safeJson(window.carbonCockpitDiagnostics())}`); } catch {}
     const race = raceSnapshot();
@@ -269,10 +404,11 @@
     recordRace();
     if (raceHistory.length) head.push(`Race history: ${safeJson(raceHistory)}`);
     if (note) head.push("", "Player's note:", ...note.slice(0, 2000).split("\n").map((l) => "  " + l));
-    const page = pageLines.slice(-400);
+    const page = (prev ? (Array.isArray(prev.pageLines) ? prev.pageLines.map(String) : []) : pageLines).slice(-400);
     let pageText = page.join("\n");
     while (bytes(pageText) > budget / 6 && page.length) { page.shift(); pageText = page.join("\n"); }
-    const log = (window.recompLog || []).map((l) => String(l));
+    // A crash line is in the section above, whole; the log keeps its place, not its 24 KB.
+    const log = allLog.map((l) => l.startsWith(CRASH) ? "[crash] (see Crash location above)" : l);
     let room = budget - bytes(head.join("\n")) - bytes(pageText) - 400;
     const kept = [];
     for (let i = log.length - 1; i >= 0 && room > 0; i--) {
@@ -284,7 +420,7 @@
     const text = [
       ...head,
       "",
-      `--- The game's log: ${kept.length === log.length ? `all ${log.length}` : `the last ${kept.length} of ${log.length}`} lines ---`,
+      `--- The game's log${prev ? ` (previous session: the last lines it saved, of ${Number(prev.logLines) || "?"} written)` : ""}: ${kept.length === log.length ? `all ${log.length}` : `the last ${kept.length} of ${log.length}`} lines ---`,
       ...kept,
       "",
       `--- The page's messages: the last ${page.length} ---`,
@@ -302,8 +438,8 @@
   }
 
   // ---- Download log ----
-  async function download() {
-    const text = await build(SAVE_MAX, "");
+  async function download(previous = null) {
+    const text = await build(SAVE_MAX, "", previous);
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
@@ -324,10 +460,10 @@
       return { base: `${url.protocol}//${url.host}`, key: url.searchParams.get("key") || s.key || "" };
     } catch { return null; }
   }
-  async function send(note) {
+  async function send(note, previous = null) {
     const s = server();
     if (!s) return { ok: false, text: "This page has no online server to send to. Use Download log instead." };
-    const body = await build(SEND_MAX, note);
+    const body = await build(SEND_MAX, note, previous);
     let r;
     try {
       r = await fetch(`${s.base}/reports${s.key ? `?key=${encodeURIComponent(s.key)}` : ""}`, {
@@ -393,7 +529,8 @@
     " plus recent timing, controller input, storage and error details, and what you write here. The server keeps no address.";
 
   let dialog = null;
-  function openDialog() {
+  function openDialog(previous = null) {
+    if (previous instanceof Event) previous = null; // called as a click handler
     addStyle();
     dialog?.remove();
     dialog = make("div", "rp");
@@ -421,13 +558,13 @@
       sendBtn.disabled = true;
       say.className = "rp-say";
       say.textContent = "Sending…";
-      const r = await send(note.value.trim());
+      const r = await send(note.value.trim(), previous);
       say.className = r.ok ? "rp-say" : "rp-say bad";
       say.textContent = r.text;
       sendBtn.disabled = r.ok;
     };
     saveBtn.onclick = async () => {
-      const name = await download();
+      const name = await download(previous);
       say.className = "rp-say";
       say.textContent = `Saved ${name} to your downloads.`;
     };
@@ -464,7 +601,7 @@
     saveBtn.type = sendBtn.type = "button";
     const say = make("div", "rp-say");
     saveBtn.onclick = async () => { say.textContent = `Saved ${await download()} to your downloads.`; };
-    sendBtn.onclick = openDialog;
+    sendBtn.onclick = () => openDialog();
     row.append(saveBtn, sendBtn);
     wrap.append(row, say);
     statusEl.append(wrap);
@@ -668,10 +805,10 @@
   }
   installPerformanceReports();
 
-  window.recompReport = { build, download, send, openDialog, offer };
+  window.recompReport = { build, download, send, openDialog, offer, watchSession, endSession, takeSession, checkpoint };
   const actions = (window.recompMenuActions ||= []);
   actions.push(
     { id: "report-log", group: "Report a problem", label: "Download log", hint: "a text file of what the game wrote", run: () => { download(); } },
-    { id: "report-send", group: "Report a problem", label: "Send a report", hint: "the log, to the game's server", run: openDialog },
+    { id: "report-send", group: "Report a problem", label: "Send a report", hint: "the log, to the game's server", run: () => openDialog() },
   );
 })();

@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "description": "Repo-level helper scripts (the game itself builds with python tools/build.py)",
+  "scripts": {
+    "reports:sync": "bash tools/carbon-reports-sync.sh",
+    "reports:view": "node tools/carbon-reports-viewer.mjs --summary",
+    "reports": "npm run reports:sync && npm run reports:view",
+    "test:reports": "node --test tools/tests/carbon-reports-viewer.test.mjs tools/tests/carbon-reports-serve.test.mjs",
+    "reports:serve": "node tools/carbon-reports-serve.mjs"
+  }
+}

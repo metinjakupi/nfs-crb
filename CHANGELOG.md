@@ -4,7 +4,60 @@ Game features, performance improvements, and bug fixes for NFS Carbon in the bro
 
 ## Unreleased
 
-- Play the story movies and start-up movies in the browser. They were skipped on the web; the game's own VP6 decoder plays them there. Skip intro movies still skips only the EA logo and the street-racing warning.
+- Play the story movies and start-up movies in the browser. They were skipped on the web; the game's own VP6 decoder plays them there. Skip intro movies is now on by default and skips only the EA logo and the street-racing warning.
+- Limit how many connections one internet address can hold on the online server, and slow connection floods at the web server, without counting addresses behind a proxy.
+- Add a Content Security Policy to the site, so an injected script cannot run or send data out, and stop other sites showing it in a frame.
+- Treat lookalike letters as the real ones when checking names, so "Admin" or a claimed name cannot be copied with Cyrillic or Greek letters.
+- Keep impossible times and scores off the leaderboards.
+- Import a career from the PC game version 1.4, with the game's own checks and signature run first, and Undo if you change your mind.
+- Load careers made on another copy of the PC game: the import clears the save's serial number, which made the game refuse them.
+- Keep the cloud save keyphrase in plain view: a large panel at the top of Cloud save, with whole words, Copy and Save as text file, and the section opens by itself until it is written down.
+- Redesign the start page: Home, Saves, Settings and Help tabs, a clear career card, the live player count at the top, and plainer wording.
+- Give the loading screens the Carbon look: the same picture and logo as the start page, slanted progress bars, and a percentage in place of byte counts.
+- Lay out the start page for phones: Play first and pinned while scrolling, a smaller logo, and no keyboard-only items.
+- Fit the F9 menu to phone screens: a slim bar with categories at the side, leaving nearly the whole screen for settings.
+- Add a compact Online panel on phones to hide the badge and chat and turn race invitations on or off, and a Camera button while driving.
+- Give the phone controls drawn icons, with a NOS + Gas button above Gas: a thumb slides up to it and the throttle never lifts.
+- Add a Crew button to the phone controls, beside Speedbreaker (G) on the left, and My crew to the Online panel.
+- Move and resize the phone's driving buttons, each one or all together: F9 menu, Controls, Move and resize touch buttons.
+- Keep the chat message line in view above the keyboard on a phone held sideways.
+- Hide the phone controls while a controller is in use. Touching the screen or unplugging it brings them back.
+- Use a new picture on the start page and loading screens.
+- Rebuild the phone controls: a D-pad with OK and Back in menus and on the pause screen, steering and pedals only while driving.
+- Add proportional steering: drag a thumb anywhere on the left, tilt the phone, or use the buttons. The choice is remembered.
+- Let a thumb slide from Gas to Brake without lifting, and make the pedals larger.
+- Keep the gas held when Safari's toolbars resize the page during a race.
+- Stop pinch zoom, the long-press menu and page bounce from interrupting play on phones.
+- Stop the game writing to its whole 2 GB memory area at start, which crashed iPhones and used about 1.8 GB more memory on every device.
+- Render phones at a lower resolution and start fewer background workers on touch devices, to use less memory.
+
+- Remove traffic from every race together and from all Drift and Canyon Drift races: each player's traffic exists in their own game alone.
+- Keep other players' cars hidden until everyone has loaded, so nobody sits on the grid looking like a bot.
+- Bring your car to a stop after you finish while the results wait for the others, instead of the game's AI driving it on.
+- Start a host's own race after the Automatic or Manual question, which left it behind so the race was cancelled for everyone.
+- Show the host's real car to the other players after the real Start, and let a player join from any menu screen.
+- Allow Canyon Duel from the world map, and send players left in a canyon after a world-map race to the safehouse instead of stranding them.
+- Let a host start again after a cancelled race, which opened no lobby and sent no invite.
+- Require two players for a Canyon Duel: alone it was won at once.
+- Tell players when someone in view goes to the safehouse or leaves, and say who cancelled a world-map race and why.
+- Redesign the Race Together card in the chat and F9 menu style: about half the size, with a Minimize button.
+- Give two-player races the full race intro with the starter and burnouts: a hidden third racer fills the grid until go, then leaves.
+- Start a shared race for players on the Wingman screen too.
+- Take a player's car off the road when they leave a race, instead of leaving it parked until the race ends.
+- Stop one slow player cancelling a race: the host can start without them after 15 s, and the loading timeout starts the race for those ready.
+- Show other players' cars in shared Canyon Drift: the race's scripted start switched them off, leaving only their names.
+- Stop other players' cars counting towards your drift score and running TOO SLOW at double speed in shared Drift and Canyon Drift.
+- Let cars pass through each other in shared Canyon Drift, so another player cannot end your run.
+- Start a shared race for players on the Quick Race list, the screen every race returns to, so a second race no longer hangs for them.
+- Repeat the race start, ready, go, finish and cancel messages until they arrive, so one lost message cannot stall a race.
+- Stop waiting on the results screen for a player who left or whose game hung; a real finish that arrives late still counts.
+- Add a Race invites switch, hide race invites during any race, shared or solo, and keep "Not now" dismissed.
+
+- Stop police copies colliding with the player they chase, other copies and local traffic, which their owners' games have already settled, so chases seen from outside no longer shudder.
+- Give a friend shown in the wrong car their real model as soon as it can be built, instead of leaving them in the substitute until they leave.
+- Make police cars in other players' chases look driven: they now steer, brake and shift, and update more often.
+- Prepare police car models ahead like other cars, build arriving cops one at a time, and add no police cars behind a paused game.
+- Let a far-away car wait longer for its files, and keep a friend moving in their old car while a new model downloads.
 - Keep shared effect values in their effect pool, as Direct3D does, instead of copying each per-object matrix into every other effect of the pool, cutting about 1.5% of the game thread's CPU time in races.
 - Remember Direct3D interface pointers between calls instead of reading them back from guest memory and the object table each time.
 - Reduce the cost of every Direct3D and Windows call from the game: the scheduler's call counter is no longer atomic, and the clock is read less often in the browser.

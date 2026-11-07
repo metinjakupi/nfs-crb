@@ -84,6 +84,14 @@ function decodeBinary(b) {
     return { t: "where", bin: true, bytes: b, p };
   }
   if (b[0] === 3) return { t: "cops", bin: true, bytes: b, id: b.readUInt32LE(2), n: b[1], ts: b.readUInt32LE(6) };
+  if (b[0] === 4) { // Where, version 2: u32 id, i16 x, i16 z, u16 heading | state << 9
+    const p = [];
+    for (let at = 1; at < b.length; at += 10) {
+      const hs = b.readUInt16LE(at + 8);
+      p.push([b.readUInt32LE(at), b.readInt16LE(at + 4), b.readInt16LE(at + 6), hs & 0x1ff, hs >> 9]);
+    }
+    return { t: "where", bin: true, v: 2, bytes: b, p };
+  }
   return { t: "binary", bin: true, bytes: b };
 }
 
@@ -132,7 +140,11 @@ async function connect(t, relay, room = "lobby", name, physics = false, bin = fa
 // Execute the actual worker Blob produced by net.js. Only its browser launch
 // and clock are supplied here; WebSocket, shared memory, relay and worker
 // message handlers are real. No game data or browser profile is needed.
-async function gameLink(t, relay, name, crew = "") {
+// more: a game with mp.h's MpMore (2026-11-05): 20 car slots, the 12 past the version-2 block.
+const MP_MORE = 0x18f0, MP_MORE_SLOT0 = 0x1940, MP_MORE_LABELS = 0x2540;
+const mpSlotAt = (i) => (i < 8 ? 0x60 + i * 0x100 : MP_MORE_SLOT0 + (i - 8) * 0x100);
+const mpLabelAt = (i) => (i < 8 ? 0x860 + i * 16 : MP_MORE_LABELS + (i - 8) * 16);
+async function gameLink(t, relay, name, crew = "", { more = false, script } = {}) {
   let blob;
   const captured = new Error("worker captured");
   const page = vm.createContext({
@@ -141,12 +153,17 @@ async function gameLink(t, relay, name, crew = "") {
     URL: { createObjectURL: (value) => value },
     Worker: class { constructor(value) { blob = value; throw captured; } },
   });
-  const clientScript = process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
+  const clientScript = script || process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
   assert.throws(() => vm.runInContext(fs.readFileSync(clientScript, "utf8"), page), (e) => e === captured);
   const timers = [], timeouts = [], sockets = [], posted = [];
-  let now = 1000;
+  let now = 1000, holdModels = false;
   const worker = vm.createContext({
-    onmessage: null, postMessage(data) { posted.push(data); }, console, atob, btoa,
+    onmessage: null, console, atob, btoa,
+    // As the page does for a model that is here: the car goes on at once.
+    postMessage(data) {
+      posted.push(data);
+      if (data?.t === "prepare-model" && !holdModels) queueMicrotask(() => worker.onmessage({ data: { t: "model-ready", key: data.key, ready: true } }));
+    },
     performance: { now: () => now },
     setInterval: (fn) => timers.push(fn),
     setTimeout(fn, delay = 0) {
@@ -161,15 +178,18 @@ async function gameLink(t, relay, name, crew = "") {
   });
   t.after(() => { for (const socket of sockets) socket.close(); });
   vm.runInContext(await blob.text(), worker);
-  const buffer = new SharedArrayBuffer(0x18f0);
+  const buffer = new SharedArrayBuffer(more ? 0x2600 : 0x18f0);
   const u32 = new Uint32Array(buffer), i32 = new Int32Array(buffer), f32 = new Float32Array(buffer);
   u32[0] = 0x31504d43; u32[1] = 2;
+  if (more) { u32[MP_MORE / 4] = 0x2b504d43; u32[MP_MORE / 4 + 1] = 20; }
+  const slots = more ? 20 : 8;
   worker.onmessage({ data: { t: "block", memory: { buffer }, ptr: 0 } });
   worker.onmessage({ data: { t: "start", relay: relay.ws(), name, crew, ghost: false } });
   const id = await until(() => u32[0x5c / 4] || false, "game link identity");
   return {
     id, u32, i32, f32, posted,
     post(data) { worker.onmessage({ data }); },
+    holdModels(on) { holdModels = on; },
     close() { for (const socket of sockets) socket.close(); },
     tick(ms = 40) {
       now += ms;
@@ -184,7 +204,7 @@ async function gameLink(t, relay, name, crew = "") {
       Atomics.add(i32, 3, 1);
     },
     slot(other) {
-      for (let i = 0; i < 8; i++) if (u32[(0x60 + i * 0x100) / 4] === other) return i;
+      for (let i = 0; i < slots; i++) if (u32[mpSlotAt(i) / 4] === other) return i;
       return -1;
     },
   };
@@ -297,6 +317,39 @@ test("authentication and a room limit of eight (CARBON_ROOM_MAX) preserve room c
   assert.deepEqual(await relay.stats(), { players: 8, here: 8 });
 });
 
+// A connection as nginx passes it on: true if the relay took it. The socket stays open.
+function knock(t, relay, realIp) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: relay.port });
+    t.after(() => socket.destroy());
+    socket.on("error", () => resolve({ taken: false, socket }));
+    socket.on("close", () => resolve({ taken: false, socket }));
+    socket.once("data", (b) => resolve({ taken: b.toString().startsWith("HTTP/1.1 101"), socket }));
+    const url = new URL(relay.ws());
+    socket.write([`GET ${url.pathname}${url.search} HTTP/1.1`, `Host: 127.0.0.1:${relay.port}`, "Upgrade: websocket", "Connection: Upgrade",
+      "Sec-WebSocket-Version: 13", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", ...(realIp ? [`X-Real-IP: ${realIp}`] : []), "", ""].join("\r\n"));
+  });
+}
+
+test("one public address holds at most CARBON_CLIENT_MAX connections, and internal ones are never limited", async (t) => {
+  const relay = await start(t, { CARBON_CLIENT_MAX: "2" });
+  const first = await knock(t, relay, "8.8.8.8");
+  assert.equal(first.taken, true);
+  assert.equal((await knock(t, relay, "8.8.8.8")).taken, true);
+  assert.equal((await knock(t, relay, "8.8.8.8")).taken, false, "a third from the same address");
+  assert.equal((await knock(t, relay, "8.8.4.4")).taken, true, "another address");
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2::1")).taken, true);
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2::2")).taken, true);
+  assert.equal((await knock(t, relay, "2a01:4f8:1:2:ffff::3")).taken, false, "the same /64");
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await knock(t, relay, "172.18.0.2")).taken, true, "a proxy's internal address");
+    assert.equal((await knock(t, relay)).taken, true, "no address given, from this machine");
+    assert.equal((await knock(t, relay, "not an address")).taken, true);
+  }
+  first.socket.destroy();
+  await until(async () => (await knock(t, relay, "8.8.8.8")).taken, "the place freed by leaving");
+});
+
 test("an engine impact reaches its owner once, then the owner pose acknowledges it", async (t) => {
   const relay = await start(t);
   const a = await connect(t, relay, "lobby", "Driver", true);
@@ -321,6 +374,20 @@ test("an engine impact reaches its owner once, then the owner pose acknowledges 
   const acknowledged = await a.read("pose", b.welcome.id);
   assert.deepEqual(acknowledged.acks, [[a.welcome.id, 1]]);
   assert.equal(a.messages.some((m) => m.t === "impact"), false);
+});
+
+test("a paused player's car stays in the others' games: the unchanged pose goes again every second", async (t) => {
+  const relay = await start(t);
+  const a = await gameLink(t, relay, "A"), b = await gameLink(t, relay, "B");
+  a.publish(1500); b.publish(1500); a.tick(); b.tick();
+  await until(() => b.slot(a.id) >= 0, "A's car in B's game");
+  // A pauses: its game publishes the same pose with state 0 and its clock stands still.
+  a.publish(1500, pose.s, 0);
+  for (let i = 0; i < 80; i++) { // 8 s of both games' time, longer than STALE (5 s)
+    a.tick(100); b.publish(1500 + i); b.tick(100);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.ok(b.slot(a.id) >= 0, "A's paused car is still in B's game");
 });
 
 test("game workers retain a hit queued before its frame and return the owner's acknowledgement", async (t) => {
@@ -809,7 +876,8 @@ test("car looks reach the others, wait for players who join later, and are check
   alice.send({ t: "look", k, data });
   assert.deepEqual(await bob.read("look"), { t: "look", id: alice.welcome.id, k, data });
   const carol = await connect(t, relay, "lobby", "Carol");
-  assert.equal(carol.messages[0]?.t, "look", "the looks come right after the welcome");
+  // The relay's private moderation state may come first.
+  assert.equal(carol.messages.find((m) => m.t !== "moderation")?.t, "look", "the looks come right after the welcome");
   assert.deepEqual(await carol.read("look"), { t: "look", id: alice.welcome.id, k, data });
   await delay(100);
   assert.equal(carol.messages.filter((m) => m.t === "look").length, 0, "only kept looks, once each");
@@ -1017,6 +1085,37 @@ test("interest: each player gets its K nearest cars, sets do not flap, and a car
   assert.equal(a.messages.some((m) => m.t === "look" || m.t === "pose"), false);
 });
 
+test("interest: a picked player in a menu keeps its place while it sends; past KEEP_RANGE the hold ends", async (t) => {
+  // logs/no-vanish-20261106: the game keeps a paused friend's car standing; the relay must not drop it then.
+  const relay = await start(t, { CARBON_INTEREST_K: "1" });
+  const r = await join(t, relay, "R"), a = await join(t, relay, "A"), b = await join(t, relay, "B");
+  r.send(still(0)); a.send(still(100)); b.send(still(400));
+  await interestTick();
+  // A goes into a menu (m 0, still sending); B drives nearer than A, but not clearly nearer (60 m against 100 m).
+  a.send(still(100, 0, { m: 0, ts: 2000 })); b.send(still(60, 0, { ts: 2000 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x, m] of [[a, 100, 0], [b, 60, 1]]) { p.send(still(x, 0, { m, ts: 2100 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "A in its menu keeps its place");
+  // B right beside R (20 m, clearly nearer than A's 100 m): it takes the place.
+  b.send(still(20, 0, { ts: 2200 }));
+  await until(() => posesFrom(r, b).length, "B picked");
+  // A stops sending altogether: after ACTIVE_MS it would come last anyway (not tested here: 5 s).
+  // KEEP_RANGE: B (picked) drives off to 1100 m; A drives again at 700 m. At half B's distance B would stay;
+  // past 1000 m it counts whole, so A (700 m) takes the place.
+  b.send(still(1100, 0, { ts: 2300 })); a.send(still(700, 0, { ts: 2300 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x] of [[a, 700], [b, 1100]]) { p.send(still(x, 0, { ts: 2400 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "past KEEP_RANGE the nearer player");
+  // Within KEEP_RANGE the hold stands: A (picked, 900 m) stays against B at 600 m.
+  a.send(still(900, 0, { ts: 2500 })); b.send(still(600, 0, { ts: 2500 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x] of [[a, 900], [b, 600]]) { p.send(still(x, 0, { ts: 2600 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "within KEEP_RANGE the pick holds");
+});
+
 test("interest: crew-mates within 1000 m come first, followed players before everyone", async (t) => {
   const relay = await start(t, { CARBON_INTEREST_K: "1" });
   const r = await join(t, relay, "R", "Night Owls");
@@ -1101,6 +1200,136 @@ test("the map feed: everyone driving, once a second, in whole metres and degrees
   watcher.messages.length = 0;
   const next = await until(() => watcher.messages.find((m) => m.t === "where"), "the next feed");
   assert.deepEqual(next, { t: "where", p: expected });
+});
+
+// ---- Where, version 2 (the relay header's "Where, version 2") ----
+const presence = (a, s = 0) => ({ t: "race", k: "presence", v: 1, a, s, ts: 100 });
+const byId = (list) => [...list].sort((a, b) => a[0] - b[0]);
+
+test("the map feed, version 2: everyone in free roam with a state; pages from before get the drivers as before", async (t) => {
+  const relay = await start(t, { CARBON_INTEREST_K: "1" });
+  const oldJson = await join(t, relay, "Old JSON");
+  const oldBin = await connect(t, relay, "lobby", "Old binary", false, true);
+  const v2Json = await connect(t, relay, "lobby", "New JSON", false, false, { where: 2 });
+  const v2Bin = await connect(t, relay, "lobby", "New binary", false, true, { where: 2 });
+  assert.equal(oldJson.welcome.where, undefined, "a page that does not ask gets the old feed");
+  assert.equal(v2Json.welcome.where, 2);
+  assert.equal(v2Bin.welcome.where, 2);
+  const driver = await join(t, relay, "Driver"), paused = await join(t, relay, "Paused"), hidden = await join(t, relay, "Hidden");
+  const menu = await join(t, relay, "Menu"), racer = await join(t, relay, "Racer"), away = await join(t, relay, "Away");
+  const quarter = Math.SQRT1_2;
+  menu.send(still(1, 1, { m: 0 }));                                   // never drove in free roam: not listed
+  hidden.send(still(400.4, -400.6, { ts: 7000 }));
+  await sync(hidden, v2Json);
+  hidden.send(still(999, 999, { m: 0, ts: 7001 }));                   // the tab hidden: m 0, the place stays
+  racer.send(still(10, 10, { ts: 100 }));
+  racer.send(presence("race", 5));                                    // racing: left out of version 2
+  away.send(presence("away"));                                        // presence away (front end, loading)
+  for (let i = 0; i < 9; i++) {                                       // 3.6 s: the paused clock stands still
+    driver.send(still(100, 200, { ts: 1000 + 400 * i }));
+    paused.send(still(-300, 50, { ts: 5000 }, [0, quarter, 0, quarter]));
+    racer.send(still(3000, 3000, { ts: 200 + 400 * i }));
+    away.send(still(20, 20, { ts: 300 + 400 * i }));
+    await delay(400);
+  }
+  for (const c of [oldJson, oldBin, v2Json, v2Bin]) c.messages.length = 0;
+  const id = (c) => c.welcome.id;
+  const want2 = byId([[id(driver), 100, 200, 0, 1], [id(paused), -300, 50, 90, 2], [id(hidden), 400, -401, 0, 3], [id(away), 20, 20, 0, 3]]);
+  const got2 = await until(() => v2Json.messages.find((m) => m.t === "where"), "the version-2 JSON feed");
+  assert.deepEqual(byId(got2.p), want2, "driving 1, paused 2, hidden 3, presence away 3; no racer, no menu player");
+  const bin2 = await until(() => v2Bin.messages.find((m) => m.t === "where"), "the version-2 binary feed");
+  assert.equal(bin2.v, 2, "type 4");
+  assert.equal(bin2.bytes.length, 1 + 10 * want2.length);
+  assert.deepEqual(bin2.p, got2.p, "binary and JSON: the same players, places, headings and states, in the same order");
+  // The pages from before: as before, the players driving now (racer and presence-away ones too), 4 numbers each.
+  const want1 = byId([[id(driver), 100, 200, 0], [id(paused), -300, 50, 90], [id(racer), 3000, 3000, 0], [id(away), 20, 20, 0]]);
+  const got1 = await until(() => oldJson.messages.find((m) => m.t === "where"), "the old JSON feed");
+  assert.deepEqual(byId(got1.p), want1);
+  const bin1 = await until(() => oldBin.messages.find((m) => m.t === "where"), "the old binary feed");
+  assert.equal(bin1.v, undefined, "type 2");
+  assert.equal(bin1.bytes.length, 1 + 14 * want1.length);
+  assert.deepEqual(bin1.p, got1.p);
+  // Back from the race: free-roam poses put the racer on the version-2 map again, driving.
+  racer.send(presence("roam"));
+  racer.send(still(-50, -60, { ts: 9000 }));
+  await sync(racer, v2Json);
+  v2Json.messages.length = 0;
+  const back = await until(() => v2Json.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === id(racer))), "the racer back");
+  assert.deepEqual(back.p.find((e) => e[0] === id(racer)), [id(racer), -50, -60, 0, 1]);
+});
+
+test("the map feed, version 2: a place older than CARBON_WHERE_KEEP drops off; driving again brings it back", async (t) => {
+  const relay = await start(t, { CARBON_WHERE_KEEP: "1" });
+  const watcher = await connect(t, relay, "lobby", "Watcher", false, true, { where: 2 });
+  const a = await join(t, relay, "A"), b = await join(t, relay, "B");
+  a.send(still(10, 20, { ts: 100 }));
+  b.send(still(30, 40, { ts: 100 }));
+  await sync(a, watcher); await sync(b, watcher);
+  a.send(still(10, 20, { m: 0, ts: 101 }));                           // into the menus
+  await sync(a, watcher);
+  watcher.messages.length = 0;
+  const first = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.length === 2), "both listed");
+  assert.equal(first.p.find((e) => e[0] === a.welcome.id)[4], 3, "A away");
+  // 2.8 s on: A's last free-roam place is too old; B keeps sending its pose, its clock standing still.
+  for (let i = 0; i < 7; i++) { b.send(still(30, 40, { ts: 100 })); await delay(400); }
+  await sync(b, watcher);
+  watcher.messages.length = 0;
+  const later = await until(() => watcher.messages.find((m) => m.t === "where"), "the next feed");
+  assert.deepEqual(later.p.map((e) => e[0]), [b.welcome.id], "A dropped; B stays (its place is refreshed by each m 1 pose)");
+  assert.equal(later.p[0][4], 2, "B's clock stood still past 2.5 s: paused");
+  a.send(still(11, 21, { ts: 200 }));
+  await sync(a, watcher);
+  watcher.messages.length = 0;
+  const again = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === a.welcome.id)), "A back");
+  assert.deepEqual(again.p.find((e) => e[0] === a.welcome.id), [a.welcome.id, 11, 21, 0, 1]);
+});
+
+test("game workers read the version-2 feed (JSON and binary) and pass non-driving players on; a hidden tab reports away", async (t) => {
+  for (const bin of [1, 0]) {
+    const relay = await start(t, { CARBON_RELAY_BIN: String(bin) });
+    const g = await gameLink(t, relay, "G");
+    const watcher = await connect(t, relay, "lobby", "Watcher", false, true, { where: 2 });
+    const driver = await join(t, relay, "Driver"), parked = await join(t, relay, "Parked");
+    driver.send(still(100, 200, { ts: 2000 }));
+    parked.send(still(-30, 40, { ts: 2000 }));
+    await sync(parked, driver);
+    parked.send(still(-30, 40, { m: 0, ts: 2001 }));                   // out of the car
+    g.publish(1500); g.tick();                                          // G drives, then its tab is hidden
+    await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === g.id && e[4] === 1)), "G driving");
+    g.post({ t: "visibility", hidden: true });
+    g.tick(40);
+    const seen = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === g.id && e[4] === 3)), "G away");
+    assert.deepEqual(seen.p.find((e) => e[0] === g.id), [g.id, 12, -40, 0, 3], `hidden tab: away at its last place (bin ${bin})`);
+    driver.send(still(100, 200, { ts: 2400 }));
+    g.posted.length = 0;
+    const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length === 2), "the worker's map list");
+    assert.deepEqual(byId(Array.from(where.p, (e) => Array.from(e))),
+      byId([[driver.welcome.id, 100, 200, 0, 1], [parked.welcome.id, -30, 40, 0, 3]]), `the worker keeps the parked player, marked (bin ${bin})`);
+  }
+});
+
+test("a page from before (net.js of 2026-11-06 ee13152) still gets its 4-number feed of drivers from this relay", async (t) => {
+  let old;
+  try {
+    old = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "where-old-")), "net.js");
+    fs.writeFileSync(old, (await import("node:child_process")).execFileSync("git", ["show", "ee13152:source/web/net.js"],
+      { cwd: fileURLToPath(new URL("../..", import.meta.url)) }));
+  } catch { t.skip("git or commit ee13152 not available"); return; }
+  for (const bin of [1, 0]) {
+    const relay = await start(t, { CARBON_RELAY_BIN: String(bin) });
+    const g = await gameLink(t, relay, "Old G", "", { script: old });
+    const driver = await join(t, relay, "Driver"), parked = await join(t, relay, "Parked");
+    // Someone else asks for version 2 in the same room: the old page's feed must not change.
+    await connect(t, relay, "lobby", "New", false, true, { where: 2 });
+    driver.send(still(100, 200, { ts: 2000 }));
+    parked.send(still(-30, 40, { ts: 2000 }));
+    await sync(parked, driver);
+    parked.send(still(-30, 40, { m: 0, ts: 2001 }));
+    await sync(parked, driver);
+    g.posted.length = 0;
+    const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length >= 1), "the old worker's list");
+    assert.deepEqual(Array.from(where.p, (e) => Array.from(e)), [[driver.welcome.id, 100, 200, 0]], `drivers only, 4 numbers (bin ${bin})`);
+  }
 });
 
 test("chat reaches the whole room without driving; the horn stays nearby or crew", async (t) => {
@@ -1199,7 +1428,72 @@ test("game workers prioritize nearest players and racers, ignore legacy crew tag
   // The where feed reaches the page, without this player.
   const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length === bots.size), "the where feed");
   assert.equal(where.p.some((e) => e[0] === g.id), false);
-  assert.deepEqual(Array.from(where.p.find((e) => e[0] === bots.get(10).welcome.id)), [bots.get(10).welcome.id, 22, -40, 0]);
+  // This page asks for the version-2 feed: a state follows, 1 = driving.
+  assert.deepEqual(Array.from(where.p.find((e) => e[0] === bots.get(10).welcome.id)), [bots.get(10).welcome.id, 22, -40, 0, 1]);
+});
+
+test("a game with 20 car slots (MpMore) fills all of them, looks too, and hears who left the room", async (t) => {
+  const relay = await start(t);
+  const g = await gameLink(t, relay, "G", "", { more: true });
+  g.publish(1500); g.tick();
+  const here = (d, extra) => still(12 + d, -40, extra, undefined, 3);
+  let n = 0;
+  async function gsync(from) {
+    const k = ++n;
+    from.send({ t: "race", k: "sync", n: 3000 + k });
+    await until(() => g.posted.some((x) => x.t === "msg" && x.m.t === "race" && x.m.n === 3000 + k), "worker sync");
+  }
+  // A look block of version 2: an entry for each of the 20 slots.
+  const lookBuffer = new SharedArrayBuffer(0x460 * 21), lu32 = new Uint32Array(lookBuffer);
+  lu32[0] = 0x4b4c4d43; lu32[1] = 2;
+  g.post({ t: "look-block", memory: { buffer: lookBuffer }, ptr: 0 });
+  const lookEntry = (id) => { for (let i = 0; i < 20; i++) if (lu32[(0x460 + i * 0x460) / 4] === id) return i; return -1; };
+  const bots = new Map();
+  for (let d = 10; d <= 220; d += 10) bots.set(d, await join(t, relay, `At ${d}`));
+  for (const [d, b] of bots) b.send({ t: "look", k: pose.k, data: Buffer.alloc(16, d).toString("base64") });
+  for (const [, b] of bots) { b.send(here(0, { ts: 2000 + n })); await gsync(b); } // every one at 12, -40: then by distance
+  for (const [d, b] of bots) { b.send(here(d, { ts: 2100 + n })); await gsync(b); }
+  g.tick(3000);
+  for (const [d, b] of bots) { b.send(here(d, { ts: 2200 + n })); await gsync(b); }
+  g.tick(250);
+  const has = (d) => g.slot(bots.get(d).welcome.id) >= 0;
+  assert.equal([...bots.keys()].filter(has).length, 20, "20 of the 22 have a slot");
+  const ids = Array.from({ length: 20 }, (_, i) => g.u32[mpSlotAt(i) / 4]);
+  assert.equal(new Set(ids).size, 20, "every slot a different player");
+  assert.ok(ids.slice(8).every((id) => [...bots.values()].some((b) => b.welcome.id === id)), "slots 8-19 in MpMore");
+  // The pose went into slot 12's ring in MpMore: count 1 or more, the sender's x.
+  const at = mpSlotAt(12) / 4, count = g.u32[at + 4];
+  assert.ok(count >= 1);
+  const ring = (mpSlotAt(12) + 0x20 + ((count - 1) % 4) * 0x38) / 4;
+  const d12 = [...bots].find(([, b]) => b.welcome.id === ids[12])[0];
+  assert.equal(g.f32[ring + 5], 12 + d12, "slot 12's newest pose is its player's");
+  assert.ok([...bots.values()].filter((b) => lookEntry(b.welcome.id) >= 0).length >= 20, "a look entry for each slot's player");
+  // The page's state names 20 slots.
+  const state = g.posted.filter((x) => x.t === "state").at(-1);
+  assert.equal(state.slots.length, 20);
+  // A player who leaves the room goes into the gone ring (mp.h lets its kept car go).
+  const leaver = bots.get(150);
+  const leaverId = leaver.welcome.id;
+  leaver.ws.close();
+  await until(() => g.u32[(MP_MORE + 8) / 4] >= 1, "the gone ring");
+  assert.equal(g.u32[(MP_MORE + 0x10) / 4], leaverId);
+  assert.equal(g.slot(leaverId), -1, "and its slot is empty");
+  // Acknowledgements are read from slot 12's label in MpMore.
+  assert.equal(mpLabelAt(12), MP_MORE_LABELS + 4 * 16);
+});
+
+test("a game without MpMore keeps 8 car slots and no gone ring", async (t) => {
+  const relay = await start(t);
+  const g = await gameLink(t, relay, "G");
+  g.publish(1500); g.tick();
+  const bots = [];
+  for (let d = 10; d <= 120; d += 10) bots.push(await join(t, relay, `At ${d}`));
+  for (const [j, b] of bots.entries()) { b.send(still(22 + 10 * j, -40, { ts: 2000 + j }, undefined, 3)); await sync(b, b); }
+  await until(() => bots.filter((b) => g.slot(b.welcome.id) >= 0).length === 8, "8 slots");
+  g.tick(250);
+  assert.equal(bots.filter((b) => g.slot(b.welcome.id) >= 0).length, 8);
+  assert.equal(g.u32.length * 4, 0x18f0, "nothing written past the version-2 block");
+  assert.equal(g.posted.filter((x) => x.t === "state").at(-1).slots.length, 8);
 });
 
 // worldmap.js in a context of its own: the page's online state and where feed in, the
@@ -1212,7 +1506,7 @@ test("the world map shows 10 players: crew-mates first, then the nearest, at the
   const people = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i >= 10 ? "OWLS" : "", crewId: i >= 10 ? "verified-owls" : null }));
   const feed = (moves = {}) => people.map((p) => [p.id, moves[p.id] ?? 100 * p.id, 0, 90]);
   const page = vm.createContext({
-    performance: { now: () => clock }, setInterval() {}, Atomics,
+    performance: { now: () => clock }, setInterval() {}, requestAnimationFrame() {}, Atomics,
     addEventListener: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
     carbonWorldMapBlock: { memory: { buffer }, ptr: 0 },
     recompOnlineState: { open: true, crew: "Owls", crewId: "verified-owls", people, slotIds: [3, 4, 0, 0, 0, 0, 0, 0] },
@@ -1250,6 +1544,35 @@ test("the world map shows 10 players: crew-mates first, then the nearest, at the
   fire("carbon-worldmap");
   assert.deepEqual(Array.from({ length: 8 }, (_, i) => u32[(0x10 + i * 0x20) / 4]), [1, 2, 3, 4, 5, 6, 7, 8]);
   assert.equal(page.recompWorldMap().shown, u32[0x110 / 4]);
+});
+
+test("the world map prefers drivers for its 10 arrows; with the page's markers (version 3) they are for drivers only", () => {
+  const clock = 1000;
+  const listeners = new Map();
+  const buffer = new SharedArrayBuffer(0x400), u32 = new Uint32Array(buffer);
+  u32[0] = 0x32504d57; u32[1] = 2;
+  const people = Array.from({ length: 14 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i === 13 ? "OWLS" : "", crewId: i === 13 ? "verified-owls" : null }));
+  // 1-6 driving (5 numbers, state 1, and 4 without: a relay from before), 7-13 paused or away and nearer, 14 a paused crew-mate.
+  const feed = people.map((p) => p.id <= 3 ? [p.id, 1000 * p.id, 0, 0, 1] : p.id <= 6 ? [p.id, 1000 * p.id, 0, 0] : [p.id, 10 * p.id, 0, 0, p.id % 2 ? 2 : 3]);
+  const page = vm.createContext({
+    performance: { now: () => clock }, setInterval() {}, requestAnimationFrame() {}, Atomics,
+    addEventListener: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
+    carbonWorldMapBlock: { memory: { buffer }, ptr: 0 },
+    recompOnlineState: { open: true, crew: "Owls", crewId: "verified-owls", people, slotIds: [7, 0, 0, 0, 0, 0, 0, 0] },
+    recompCrewKey: (c) => String(c || "").toLowerCase().replace(/\s+/g, ""),
+    recompCrewColor: (c) => (c ? "#ff66cc" : ""),
+    recompOnlineSelf: () => [0, 3, 0],
+    recompOnlineWhere: { at: clock, p: feed },
+  });
+  page.window = page;
+  vm.runInContext(fs.readFileSync(new URL("../../source/web/worldmap.js", import.meta.url), "utf8"), page);
+  const fire = (type) => { for (const fn of listeners.get(type) || []) fn({}); };
+  const ids = () => Array.from({ length: 10 }, (_, i) => u32[(0x10 + i * 0x30) / 4]);
+  fire("recomp-online");
+  assert.deepEqual(ids(), [1, 2, 3, 4, 5, 6, 14, 7, 8, 9], "a version-2 game (arrows only): the drivers, then the others (crew first, then nearest)");
+  u32[1] = 3; // the page draws markers for everyone without an arrow
+  fire("carbon-worldmap");
+  assert.deepEqual(ids(), [1, 2, 3, 4, 5, 6, 0, 0, 0, 0], "version 3: drivers only (7 in a slot but paused: a marker too)");
 });
 
 // ---- Compact poses: binary frames for pages that ask in their hi (see the relay header) ----
@@ -1388,6 +1711,57 @@ test("a game worker coalesces a recovered pose backlog to the newest pose", asyn
   assert.equal(ben.f32[at + 5], 42, "the recovered car resumes at the newest position");
 });
 
+test("a car whose model is not ready waits longer far away, and its files can release it early", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  ben.holdModels(true);
+  ben.publish(1000, [0, 0, 0, 1, 212, 3, -40, 0, 0, 0, 0, 0, 0]); ben.tick(); // 200 m from Ana's pose
+  const ana = await connect(t, relay, "lobby", "Ana");
+  ana.send({ ...pose, k: 111, ts: 1000 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 111); }, "model asked for");
+  // Ana keeps driving, as a real car does: her poses keep her in the room.
+  const step = async (ms, ts) => {
+    ana.send({ ...pose, k: 111, ts });
+    await until(() => ben.u32[0] && true, "tick");
+    await delay(30);
+    ben.tick(ms);
+  };
+  for (let i = 1; i <= 2; i++) await step(1000, 1000 + 1000 * i);
+  assert.equal(ben.slot(ana.welcome.id), -1, "far away it outlasts the near limit");
+  for (let i = 3; i <= 7; i++) await step(1000, 1000 + 1000 * i);
+  assert.ok(ben.slot(ana.welcome.id) >= 0, "and goes on at the far limit");
+  assert.ok(ben.posted.some((m) => m.t === "model-stat" && m.ready === false), "the late model is counted");
+  ana.ws?.close?.();
+
+  const cy = await connect(t, relay, "lobby", "Cy");
+  ben.publish(1100, pose.s); ben.tick();
+  cy.send({ ...pose, k: 222, ts: 1000 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 222); }, "second model asked for");
+  ben.post({ t: "model-ready", key: 222, ready: true });
+  await until(() => { ben.tick(40); return ben.slot(cy.welcome.id) >= 0; }, "ready car shown");
+  assert.equal(ben.u32[(0x60 + ben.slot(cy.welcome.id) * 0x100) / 4 + 2], 222);
+  assert.ok(ben.posted.some((m) => m.t === "model-stat" && m.ready === true), "the ready model is counted");
+});
+
+test("a friend who changes cars keeps moving in the old car until the new model is ready", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  ben.publish(1000, pose.s); ben.tick();
+  const ana = await connect(t, relay, "lobby", "Ana");
+  ana.send({ ...pose, k: 111, ts: 1000 });
+  const slot = await until(() => { ben.tick(40); return ben.slot(ana.welcome.id) + 1; }, "Ana's car") - 1;
+  const base = (0x60 + slot * 0x100) / 4;
+  ben.holdModels(true);
+  ana.send({ ...pose, k: 222, ts: 1100 });
+  await until(() => { ben.tick(40); return ben.posted.some((m) => m.t === "prepare-model" && m.key === 222); }, "new model asked for");
+  const before = ben.u32[base + 4];
+  ana.send({ ...pose, k: 222, ts: 1200 });
+  await until(() => { ben.tick(40); return ben.u32[base + 4] > before; }, "poses keep coming");
+  assert.equal(ben.u32[base + 2], 111, "still the old car");
+  ben.post({ t: "model-ready", key: 222, ready: true });
+  await until(() => ben.u32[base + 2] === 222, "the new car");
+});
+
 test("a hidden or paused game keeps a stationary paused car until disconnect and restores it", async (t) => {
   const relay = await start(t);
   const ana = await gameLink(t, relay, "Ana"), ben = await gameLink(t, relay, "Ben");
@@ -1442,6 +1816,25 @@ async function copsJoin(t, relay, name, hi) {
   return client;
 }
 
+test("player vehicles: blocked JSON and binary models disconnect while normal road cars remain usable", async (t) => {
+  const relay = await start(t);
+  const observer = await connect(t, relay, "vehicle-policy", "Observer", false, true);
+  const cases = [
+    ["fire truck", 0xacd9eea7], ["police", 0xbb9b2938],
+    ["traffic van", 0xdbb93c72], ["demo Gallardo", 0xc1b2de36],
+  ];
+  for (const binary of [false, true]) for (const [name, k] of cases) {
+    const actor = await connect(t, relay, "vehicle-policy", `${name}${binary ? "B" : "J"}`, false, binary);
+    actor.send({ ...pose, k: 0x4e085fb3 }); // legitimate bonus BMW M3 GTR
+    assert.equal((await observer.read("pose", actor.welcome.id)).k, 0x4e085fb3);
+    if (binary) actor.ws.send(binaryPose({ k, n: [0, 0, 0, 32767, 12000, 3000, -40000, 500, 0, 0, 0, 0, 0] }));
+    else actor.send({ ...pose, k });
+    await until(() => actor.ws.readyState === WebSocket.CLOSED, `blocked ${name} (${binary ? "binary" : "JSON"})`);
+    await observer.read("left", actor.welcome.id);
+    assert.equal(observer.messages.some(m => m.t === "pose" && m.k === k), false, "blocked car was never forwarded");
+  }
+});
+
 test("police chases: cops frames reach nearby players who asked, checked and rate-limited; old pages get none", async (t) => {
   const relay = await start(t);
   const ana = await copsJoin(t, relay, "Ana", { bin: 1, cops: 1 });
@@ -1450,11 +1843,12 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   const json = await copsJoin(t, relay, "Json", { cops: 1 });        // no compact poses: no cops either
   assert.equal(ana.welcome.cops, 1);
   assert.equal(ben.welcome.cops, 1);
+  assert.equal(ana.welcome.copsMax, 16, "the cars a frame may carry (shared traffic, Step B)");
   assert.equal(old.welcome.cops, undefined);
   assert.equal(json.welcome.cops, undefined);
   for (const c of [ana, ben, old, json]) c.send(still(10));
   await sync(ana, ben);
-  const frame = copsFrame([{ c: 1 }, { c: 7, f: 0x21, k: 0xdeadbeef, p: [20, 3, -45] }]);
+  const frame = copsFrame([{ c: 1 }, { c: 7, f: 0x21, k: 0xbb9b2938, p: [20, 3, -45] }]);
   ana.ws.send(frame);
   const got = await ben.read("cops");
   assert.equal(got.id, ana.welcome.id);
@@ -1464,11 +1858,16 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   await sync(ana, old);
   await sync(ana, json);
   for (const c of [ana, old, json]) assert.equal(c.messages.filter((m) => m.t === "cops").length, 0);
-  // Malformed frames are dropped: a number 0, a number twice, more than 8 cops, a wrong length.
+  // A full frame (COPS_MAX = 16 cars: cops and shared traffic) passes.
+  ana.ws.send(copsFrame(Array.from({ length: 16 }, (_, i) => ({ c: i + 1, f: 8 }))));
+  assert.equal((await ben.read("cops")).n, 16);
+  // Malformed frames are dropped: a number 0, a number twice, more than 16 cars, a wrong length.
   ana.ws.send(copsFrame([{ c: 0 }]));
   ana.ws.send(copsFrame([{ c: 3 }, { c: 3 }]));
-  ana.ws.send(copsFrame(Array.from({ length: 9 }, (_, i) => ({ c: i + 1 }))));
+  ana.ws.send(copsFrame(Array.from({ length: 17 }, (_, i) => ({ c: i + 1 }))));
   ana.ws.send(Buffer.concat([copsFrame([{ c: 2 }]), Buffer.alloc(1)]));
+  // A car farther than COPS_NEAR (500 m) from the sender's own car (Ana at x 10): not hers to send.
+  ana.ws.send(copsFrame([{ c: 1 }, { c: 2, p: [700, 3, -40] }]));
   // A page that did not ask sends none either.
   old.ws.send(copsFrame([{ c: 1 }]));
   await sync(ana, ben);
@@ -1488,8 +1887,8 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   for (let i = 0; i < 30; i++) ana.ws.send(copsFrame([{ c: 1 }], 3000 + i));
   await sync(ana, ben);
   const passed = ben.messages.filter((m) => m.t === "cops").length;
-  // Three frames passed above, so 7 of the burst are left (and a few refilled since).
-  assert.ok(passed >= 7 && passed <= 12, `burst limit (${passed} passed)`);
+  // Four frames passed above, so 6 of the burst are left (and a few refilled since).
+  assert.ok(passed >= 6 && passed <= 11, `burst limit (${passed} passed)`);
 });
 
 test("police chases: a hit on a cop reaches its chased player only, checked against its newest cops frame", async (t) => {
@@ -1552,6 +1951,7 @@ test("game workers send their chase, show a friend's cops in the game's slots, a
   a.u32[3] = 2;
   ana.tick(100);
   await until(() => { ben.tick(10); return b.u32[0x220 / 4] === ana.id; }, "Ana's cop in Ben's game");
+  assert.ok(ben.posted.some((m) => m.t === "prepare-model" && m.key === 0xc0c0a), "a cop's model is prepared like a friend's");
   const slot = 0x220 / 4;
   assert.equal(b.u32[slot + 1] % 2, 0, "the slot is not left half written");
   assert.deepEqual([b.u32[slot + 2], b.u32[slot + 3], b.u32[slot + 5], b.u32[slot + 6]], [0xc0c0a, 1, 3, 0x21]);
@@ -1575,6 +1975,30 @@ test("game workers send their chase, show a friend's cops in the game's slots, a
   a.u32[3] = 5; a.u32[5] = 0; a.u32[3] = 6;
   ana.tick(100);
   await until(() => { ben.tick(10); return b.u32[slot] === 0 && b.u32[slot + 3] === 0; }, "the cop gone from Ben's game");
+});
+
+test("a chased player's cops get slots even when traffic copies fill all 16", async (t) => {
+  const relay = await start(t);
+  const ben = await gameLink(t, relay, "Ben");
+  const buffer = new SharedArrayBuffer(0x1a30), u32 = new Uint32Array(buffer);
+  u32[0] = 0x31504f43; u32[1] = 1;
+  ben.post({ t: "cop-block", memory: { buffer }, ptr: 0 });
+  ben.publish(1500); ben.tick();
+  const senders = [];
+  for (const name of ["Ann", "Cid", "Dan"]) {
+    const c = await copsJoin(t, relay, name, { bin: 1, cops: 1 });
+    c.send(still(12, -40)); senders.push(c);
+  }
+  await until(() => { ben.tick(10); return true; }, "joined");
+  for (let i = 0; i < 20; i++) { ben.publish(1500 + i); ben.tick(50); await new Promise((r) => setTimeout(r, 5)); }
+  const eight = (f) => Array.from({ length: 8 }, (_, j) => ({ c: j + 1, f, p: [12 + j, 3, -40] }));
+  senders[0].ws.send(copsFrame(eight(8)));   // two traffic owners: 16 traffic cars
+  senders[1].ws.send(copsFrame(eight(8)));
+  const slots = () => Array.from({ length: 16 }, (_, i) => [u32[(0x220 + i * 0x100) / 4], u32[(0x220 + i * 0x100) / 4 + 6]]);
+  await until(() => { ben.tick(10); return slots().filter(([o]) => o).length === 16; }, "16 traffic cars in Ben's slots");
+  senders[2].ws.send(copsFrame(eight(3).slice(0, 3))); // a chase: 3 cops, light bar and chasing
+  await until(() => { ben.tick(10); return slots().filter(([o, f]) => o && !(f & 8)).length === 3; }, "the chase's cops took traffic slots");
+  assert.equal(slots().filter(([o]) => o).length, 16);
 });
 
 // ---- Car lights (lights.h, net.js; the relay header's "Car lights") ----

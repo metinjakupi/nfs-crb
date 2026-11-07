@@ -6,9 +6,12 @@ const html = await readFile(process.env.CARBON_PLAYER_SOURCE || new URL('../../s
 // These startup fixtures isolate graphics/download recovery; the real customization
 // installer is verified in an OPFS browser against its complete asset catalog.
 const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).find(s => s.includes("window.recompBoot ="))
-  .replace('import(new URL("./custom-install.js", document.baseURI).href)', 'Promise.resolve({prepareCustomization:async()=>{}})');
+  .replace('import(new URL("./custom-install.js", document.baseURI).href)', 'Promise.resolve(window.testCustomInstall||{prepareCustomization:async()=>{}})')
+  // The city artwork installer (full imports) is an optional add-on with its own OPFS checks.
+  .replace('import(new URL("./billboards.js", document.baseURI).href)', 'Promise.resolve(window.testBillboards||{prepareBillboards:async()=>({state:"skipped"})})')
+  .replace('import(new URL("./cockpit-assets.js", document.baseURI).href)', 'Promise.resolve({prepareCockpitAssets:async()=>{}})');
 const settle = async () => { for (let i=0;i<8;i++) await new Promise(r=>setImmediate(r)); };
-async function page({ adapters = ['ok'], storageError, workerResult, workerResults, isolated = true, userAgent = '', runtimeFetch, wasm = WebAssembly, pageUrl = 'http://localhost/nfsc/', perf = false, deviceFeatures = [], deviceRequest, adapterInfo = {}, fallbackAdapter = false, runtimeBytes, clock = Date, observerThrows = false } = {}) {
+async function page({ adapters = ['ok'], storageError, workerResult, workerResults, isolated = true, userAgent = '', runtimeFetch, wasm = WebAssembly, pageUrl = 'http://localhost/nfsc/', perf = false, deviceFeatures = [], deviceRequest, adapterInfo = {}, fallbackAdapter = false, runtimeBytes, clock = Date, observerThrows = false, gpu = true, estimate = {quota:10,usage:10}, storageErrors, customInstall, billboards } = {}) {
   const node = () => ({ textContent:'', hidden:false, append(){}, remove(){}, addEventListener(){}, focus(){}, setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]}, style:{} });
   const status=node(), canvas=node(), appended=[], calls=[], events={}, nodes={status,canvas},intervals=[],observers=[];
   const location=new URL(pageUrl);let replaced='';location.replace=url=>{replaced=String(url)};
@@ -17,18 +20,20 @@ async function page({ adapters = ['ok'], storageError, workerResult, workerResul
     if(name!=='.stamp'||workerResult||queuedWorkers) throw Error('missing');
     return {getFile:async()=>({text:async()=> 'verified'})};
   }};
-  let workerStopped=0,workerCount=0;
+  let workerStopped=0,workerCount=0,storageCalls=0;
   const c={recompPerformance:perf ? {enabled:true} : undefined,URL,URLSearchParams,TextEncoder,Error,Number,Date:clock,Promise,Response,ReadableStream,Uint8Array,recompPageBuild:runtimeBytes?{wasmBytes:runtimeBytes}:undefined,performance:{now:()=>clock.now()},PerformanceObserver:class {constructor(fn){observers.push(fn)}observe(){if(observerThrows)throw Error("Unsupported timing observer")}disconnect(){}},console:{warn(){},error(){},log(){}},
-    location,screen:{width:1920,height:1080},innerWidth:1280,innerHeight:720,devicePixelRatio:1,crossOriginIsolated:isolated,WebAssembly:wasm,setTimeout:fn=>{queueMicrotask(fn);return 1;},
+    location,screen:{width:1920,height:1080},innerWidth:1280,innerHeight:720,devicePixelRatio:1,crossOriginIsolated:isolated,WebAssembly:wasm,setTimeout:fn=>{queueMicrotask(fn);return 1;},clearTimeout(){},
     matchMedia:()=>({matches:false}),setInterval:fn=>{intervals.push(fn);return intervals.length},clearInterval(){},
     document:{baseURI:'http://localhost/nfsc/',documentElement:{dataset:{}},getElementById:id=>nodes[id] ||= node(),createElement:node,body:{append:n=>appended.push(n)}},
-    addEventListener(type,fn){events[type]=fn;}, navigator:{userAgent,storage:{getDirectory:async()=>{if(storageError)throw storageError;return dir;},estimate:async()=>({quota:10,usage:10})},gpu:{requestAdapter:async options=>{
+    addEventListener(type,fn){events[type]=fn;}, navigator:{userAgent,storage:{getDirectory:async()=>{storageCalls++;if(storageErrors?.length)throw storageErrors.shift();if(storageError)throw storageError;return dir;},estimate:async()=>estimate},gpu:!gpu?undefined:{requestAdapter:async options=>{
       calls.push(options);const next=adapters.shift();if(next instanceof Error)throw next;if(next==='ok')return {info:adapterInfo,isFallbackAdapter:fallbackAdapter,features:new Set(deviceFeatures),limits:{},requestDevice:deviceRequest || (async()=>({lost:new Promise(()=>{}),addEventListener(){}}))};return null;
     }}},fetch:async(url,...args)=>String(url).endsWith('.wasm') ? runtimeFetch(url,...args) : ({json:async()=>[{id:'nfsc',title:'Carbon',sha256:'verified',executable:'NFSC.exe',streamAssets:!!workerResult||!!queuedWorkers,downloadManifest:'manifest'}]}),
     BroadcastChannel:class {postMessage(){}},Worker:class {constructor(){workerCount++}postMessage(){const data=queuedWorkers?.shift()||{result:workerResult};queueMicrotask(()=>this.onmessage({data}));}terminate(){workerStopped++}}
   };
+  if(customInstall)c.testCustomInstall={prepareCustomization:customInstall};
+  if(billboards)c.testBillboards={prepareBillboards:billboards};
   c.window=c;vm.createContext(c);vm.runInContext(script,c);await settle();c.recompBoot();await settle();
-  return {c,status,calls,appended,workerStopped,workerCount,nodes,intervals,resource:entry=>observers.forEach(fn=>fn({getEntries:()=>[entry]})),get replaced(){return replaced},events};
+  return {c,status,get storageCalls(){return storageCalls},calls,appended,workerStopped,workerCount,nodes,intervals,resource:entry=>observers.forEach(fn=>fn({getEntries:()=>[entry]})),get replaced(){return replaced},events};
 }
 for(const first of [null,new Error('adapter request rejected')]) test(`startup falls back after ${first?'rejection':'no adapter'}`,async()=>{
   const p=await page({adapters:[first,'ok']});assert.equal(p.calls.length,2);assert.ok(p.c.Module);assert.equal(p.c.recompFailure,undefined);
@@ -204,4 +209,69 @@ test('loader identifies preparation separately after the code stream ends',async
 test('missing resource timing support does not prevent startup or streaming compilation',async()=>{
  const p=await page({observerThrows:true,runtimeFetch:async()=>new Response(tinyWasm,{headers:{'Content-Type':'application/wasm'}})});
  assert.equal(p.c.recompFailure,undefined);assert.ok((await instantiate(p)).instance instanceof WebAssembly.Instance);
+});
+
+// ---- 2026-11-06: in-app browsers, platform WebGPU advice, private windows, optional add-ons ----
+const FB_ANDROID='Mozilla/5.0 (Linux; Android 16; ELI-NX9 Build/HONORELI-N39) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156.0.8078.70 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/585.0.0.47.54;IABMV/1;]';
+const FB_IOS='Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/22H352 Safari/604.1 [FBAN/FBIOS;FBAV/585.0.0.64.71;FBBV/1101557913;FBDV/iPhone14,5;FBMD/iPhone]';
+test('Facebook on Android gets an Open in Chrome screen with a Chrome intent and no click tracker, before any start page',async()=>{
+ const p=await page({isolated:false,userAgent:FB_ANDROID,pageUrl:'https://nfscrb.xyz/?fbclid=IwY2xj&room=r1'});
+ assert.equal(p.c.Module,undefined);assert.equal(p.calls.length,0);assert.equal(p.appended.some(n=>n.src==='start.js'),false);
+ assert.equal(p.nodes['open-browser'].hidden,false);assert.equal(p.nodes['ob-title'].textContent,'Open in Chrome');
+ assert.match(p.nodes['ob-text'].textContent,/Facebook's built-in browser cannot run the game/);
+ const href=p.nodes['ob-open'].href;assert.match(href,/^intent:\/\/nfscrb\.xyz\/\?room=r1#Intent;scheme=https;package=com\.android\.chrome;S\.browser_fallback_url=https%3A%2F%2Fnfscrb\.xyz%2F%3Froom%3Dr1;end$/);
+ assert.equal(p.nodes['ob-link'].value,'https://nfscrb.xyz/?room=r1');assert.equal(p.c.carbonDiagnostics.openInBrowser.app,'Facebook');
+});
+for (const [name,ua,app] of [['TikTok','Mozilla/5.0 (Linux; Android 15; 23021RAAEG Build/AQ3A.240829.003; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156.0.8078.47 Mobile Safari/537.36 musical_ly_2024706030 AppName/musical_ly','TikTok'],['LINE','Mozilla/5.0 (Linux; Android 16; 25128RN17A; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156.0.8078.47 Mobile Safari/537.36 Line/26.16.0/IAB','LINE'],['an unnamed WebView','Mozilla/5.0 (Linux; Android 16; X; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156 Mobile Safari/537.36','this app']])
+ test(`${name} is detected as an in-app browser`,async()=>{const p=await page({isolated:false,userAgent:ua});assert.equal(p.c.carbonDiagnostics.openInBrowser.app,app);assert.equal(p.nodes['ob-title'].textContent,'Open in Chrome');});
+test('Facebook on iPhone (isolated, no WebGPU) gets Open in Safari steps and a copy button, no intent link',async()=>{
+ const p=await page({gpu:false,userAgent:FB_IOS});
+ assert.equal(p.nodes['ob-title'].textContent,'Open in Safari');assert.equal(p.nodes['ob-open'].hidden,true);
+ assert.match(p.status.textContent,/Facebook's built-in browser cannot run the game: it does not provide WebGPU/);assert.equal(typeof p.nodes['ob-copy'].onclick,'function');
+});
+test('a desktop page without isolation is told to open the link directly, not as an in-app browser',async()=>{
+ const p=await page({isolated:false,userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'});
+ assert.match(p.status.textContent,/secure browser environment/);assert.equal(p.nodes['ob-title'].textContent,'Open the game directly');assert.equal(p.c.carbonDiagnostics.openInBrowser.app,null);
+});
+for (const [name,ua,gpu,adapters,pattern] of [
+ ['iPhone on iOS 18 Safari','Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7.5 Mobile/15E148 Safari/604.1',false,[],/iOS or iPadOS 26 or newer: update/],
+ ['iPad Chrome on iPadOS 18','Mozilla/5.0 (iPad; CPU OS 18_7_11 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/138.0.7204.119 Mobile/15E148 Safari/604.1',false,[],/iOS or iPadOS 26 or newer: update/],
+ ['Windows 7 Chrome 109','Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',false,[],/Windows 7 and 8 stop at Chrome 109.*Windows 10 or 11 with the current Google Chrome or Microsoft Edge/],
+ ['Mac Safari 18','Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15',false,[],/Safari 18 has no WebGPU: use Safari 26 or newer, or the current Google Chrome/],
+ ['Windows Edge without an adapter','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0',true,[null,null],/hardware acceleration.*current Google Chrome or Microsoft Edge/],
+ ['Linux Chrome without an adapter','Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',true,[null,null],/chrome:\/\/gpu/],
+ ['Android Chrome without an adapter','Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36',true,[null,null],/Android.*current Chrome.*cannot run this build/],
+]) test(`no WebGPU names what works: ${name}`,async()=>{const p=await page({gpu,adapters,userAgent:ua});assert.match(p.status.textContent,pattern);assert.equal(p.c.Module,undefined);});
+test('a Private Browsing window (WebKit UnknownError, 1000 MiB quota) is retried once, then explained',async()=>{
+ const unknown=()=>Object.assign(new Error('The operation failed for an unknown transient reason (e.g. out of memory).'),{name:'UnknownError'});
+ const p=await page({storageErrors:[unknown(),unknown()],estimate:{quota:1048576000,usage:0},userAgent:'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Mobile/15E148 Safari/604.1'});
+ assert.equal(p.storageCalls,2);assert.match(p.status.textContent,/Private Browsing window/);assert.match(p.status.textContent,/normal Safari tab/);
+ assert.equal(p.c.carbonDiagnostics.storageOpen.privateWindow,true);assert.equal(p.c.Module,undefined);
+});
+test('a transient storage failure that clears on the retry starts normally',async()=>{
+ const p=await page({storageErrors:[Object.assign(new Error('transient'),{name:'UnknownError'})]});
+ assert.equal(p.storageCalls,2);assert.ok(p.c.Module);assert.equal(p.c.recompFailure,undefined);
+});
+test('customization that may be left out starts the game without it and shows a notice',async()=>{
+ const p=await page({customInstall:async()=>{throw Object.assign(new Error('A customization file could not be downloaded.'),{customizationOptional:true})}});
+ assert.ok(p.c.Module);assert.equal(p.c.recompFailure,undefined);
+ p.c.Module.ENV={};p.c.Module.preRun[0]();assert.equal(p.c.Module.ENV.RECOMP_CUSTOMIZATION,'0');assert.equal(p.c.Module.ENV.RECOMP_CUSTOM_COSMETICS_SHOP,'0');
+ assert.equal(p.nodes['addon-notice'].hidden,false);assert.match(p.nodes['addon-notice-text'].textContent,/starts without them/);
+ assert.equal(p.c.carbonDiagnostics.failures.at(-1).kind,'optional');
+});
+test('customization that must not be left out still stops the start',async()=>{
+ const p=await page({customInstall:async()=>{throw Object.assign(new Error('Customization backup verification failed: X'),{customizationOptional:false})}});
+ assert.equal(p.c.Module,undefined);assert.match(p.status.textContent,/backup verification failed/);
+});
+test('a car left out is named in the notice and customization stays on',async()=>{
+ const p=await page({customInstall:async()=>({state:'partial',skipped:['CARS/300C','CARS/SPOILER_HATCH']})});
+ assert.ok(p.c.Module);p.c.Module.ENV={};p.c.Module.preRun[0]();assert.equal(p.c.Module.ENV.RECOMP_CUSTOMIZATION,'1');
+ assert.match(p.nodes['addon-notice-text'].textContent,/Custom parts for 300C, SPOILER_HATCH could not be installed/);
+ assert.deepEqual(p.c.carbonDiagnostics.customizationSkipped,['CARS/300C','CARS/SPOILER_HATCH']);
+});
+test('city artwork that rolled back is skipped; a failed rollback stops the start',async()=>{
+ const ok=await page({billboards:async()=>{throw Object.assign(new Error('Artwork write failed'),{restored:true})}});
+ assert.ok(ok.c.Module);assert.match(ok.nodes['addon-notice-text'].textContent,/City artwork/);
+ const bad=await page({billboards:async()=>{throw Object.assign(new Error('Rollback failed'),{restored:false})}});
+ assert.equal(bad.c.Module,undefined);
 });
