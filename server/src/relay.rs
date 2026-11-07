@@ -3,19 +3,21 @@
 //! near it. The same protocol and rules as tools/carbon-net-relay.mjs (its header is the protocol
 //! reference, "Interest" included; this follows its version of 2026-10-25):
 //!
-//!   browser -> relay: {t:"hi", name, crew, physics?, bin?, cops?, drive?}  {t:"pose", k, s, m, ts, ghost?, acks?}
+//!   browser -> relay: {t:"hi", name, crew, physics?, bin?, cops?, drive?, where?}  {t:"pose", k, s, m, ts, ghost?, acks?}
 //!                     {t:"chat", text}  {t:"horn", on}  {t:"crew", crew}  {t:"physics", on}
 //!                     {t:"impact", to, seq, k, ts, s}  {t:"race", k, ...}  {t:"look", k, data}
 //!                     {t:"follow", ids}  {t:"cophit", to, c, seq, k, ts, s}  a cops frame
 //!                     {t:"pursuit", to, k, a, b, f}  {t:"lights", s}  {t:"ping", n}
-//!   relay -> browser: {t:"welcome", id, physics?, bin?, cops?, copsMax?, drive?, peers:[{id, name, crew, physics?}]}
+//!   relay -> browser: {t:"welcome", id, physics?, bin?, cops?, copsMax?, drive?, where?, peers:[{id, name, crew, physics?}]}
 //!                     {t:"join", id, name, crew, physics?}  {t:"left", id}
 //!                     {t:"pose", id, k, s, m, ts, physics?, ghost?, acks?}
 //!                     {t:"chat", id, text}  {t:"horn", id, on}  {t:"crew", id, crew}
 //!                     {t:"physics", id, on}  {t:"impact", id, seq, k, ts, s}
 //!                     {t:"race", id, k, ...} (to the whole room, the sender too)
 //!                     {t:"look", id, k, data} (to the players that get the sender's car)
-//!                     {t:"where", p:[[id, x, z, heading], ...]} (every second, to everyone)
+//!                     {t:"where", p:[[id, x, z, heading], ...]} (every second, to everyone; a page whose
+//!                     hi says where:2 gets [id, x, z, heading, state] for every player in free roam
+//!                     instead: "Where, version 2" in the Node relay's header)
 //!                     {t:"cophit", id, c, seq, k, ts, s} (to the chased player alone)
 //!                     a cops frame (to the players that get the chased player's car)
 //!                     {t:"pursuit", id, k, a, b, f} (shared police chase: to the players that get the
@@ -29,7 +31,8 @@
 //!
 //! Interest, in short (the Node relay's header has the whole of it): every 500 ms each player
 //! picks the K (CARBON_INTEREST_K, 24) players whose cars it gets: the ones it follows, then its
-//! crew-mates within 1000 m (16 at most), then the nearest, with a hold so the picks do not flap.
+//! crew-mates within 1000 m (16 at most), then the nearest, with a hold so the picks do not flap
+//! (within KEEP_RANGE; a picked player in a menu keeps its last place while it still sends).
 //! Poses, looks, chat and the horn go only to the players concerned; a player picked later gets
 //! the sender's look and newest pose at once. The idea is nfsu2-web's free-roam hub (NOTICE).
 //!
@@ -97,6 +100,19 @@ const BIN_WHERE: u8 = 2;
 const POSE_BYTES: usize = 46;
 const ACK_BYTES: usize = 8;
 const WHERE_BYTES: usize = 14;
+// Where, version 2 (the Node relay's header): every player in free roam with a state, for the
+// pages whose hi says where:2. Type 4: u32 id, i16 x, i16 z, u16 heading | state << 9.
+const BIN_WHERE2: u8 = 4;
+const WHERE2_BYTES: usize = 10;
+/// A free-roam place stays on the version-2 map this long (CARBON_WHERE_KEEP seconds).
+const WHERE_KEEP: usize = 600;
+/// A driving pose whose physics clock has stood still this long: paused.
+const PAUSED: Duration = Duration::from_millis(2500);
+/// The version-2 feed leaves out a place farther out than this (whole metres; 16-bit layout).
+const WHERE2_LIMIT: f64 = 32767.0;
+const WHERE_DRIVING: u16 = 1;
+const WHERE_PAUSED: u16 = 2;
+const WHERE_AWAY: u16 = 3;
 // Driving (the Node relay's header, "Driving"): flags bit 3 = this many DRIVE bytes follow the acks.
 const DRIVE_BIT: u8 = 8;
 const DRIVE_BYTES: usize = 8;
@@ -132,6 +148,9 @@ fn limit(i: usize) -> f64 {
 pub const TICK: Duration = Duration::from_millis(250);
 const FAR_EVERY: Duration = TICK;
 const MID_EVERY: Duration = Duration::from_millis(100);
+/// Picks past the nearest k (CARBON_INTEREST_EXTRA, default none) get a player's poses at FAR_EVERY whatever the distance,
+/// so more cars can be drawn for little more work: a car past k is about a quarter of a near one.
+const EXTRA_MAX: usize = 40;
 const CREW_RANGE: f64 = 1000.0;
 const CREW_MAX: usize = 16;
 const FOLLOW_MAX: usize = 8;
@@ -141,7 +160,9 @@ const ACTIVE: Duration = Duration::from_millis(5000);
 const HOLD: Duration = Duration::from_millis(5000);
 const HELD: f64 = 0.25;
 const KEPT: f64 = 0.5;
-/// Within this every pose goes (the game removes a car beyond 500 m); then one per MID_EVERY
+/// The hold counts only within this (metres, as counted): farther, a pick counts at its whole distance.
+const KEEP_RANGE: f64 = 1000.0;
+/// Within this every pose goes (the game removed a car beyond 500 m; 1000 m from no-vanish-20261106); then one per MID_EVERY
 /// within MID_RANGE, beyond one per FAR_EVERY.
 const FULL_RANGE: f64 = 500.0;
 const MID_RANGE: f64 = 700.0;
@@ -196,6 +217,26 @@ impl Limit {
 struct Bucket {
     tokens: f64,
     at: Instant,
+}
+
+/// A player's presence (web/net.js activity; {t:"race", k:"presence", a}): None before any.
+#[derive(Clone, Copy, PartialEq)]
+enum Activity {
+    None,
+    Roam,
+    Race,
+    Away,
+}
+
+/// A player's last free-roam place (Where, version 2): x, z and heading of its newest pose with m 1
+/// while not racing, when it came, its ts, and when ts last changed (paused when long ago).
+struct Roam {
+    x: f64,
+    z: f64,
+    h: i64,
+    at: Instant,
+    ts: f64,
+    moved: Instant,
 }
 
 struct Pose {
@@ -368,6 +409,8 @@ struct Edge {
     sent: Option<Instant>,
     /// how long a held-back pose waits since `sent` (zero: none held back)
     owed: Duration,
+    /// a pick past the receiver's nearest k (see EXTRA_MAX)
+    extra: bool,
 }
 
 struct Member {
@@ -420,6 +463,11 @@ struct Member {
     chase: Option<(Instant, Vec<(u8, u32, [f64; 3])>)>,
     /// the last cophit seq it sent that was passed on
     cop_hit_seq: f64,
+    /// the map feed it reads: 1 as before, 2 every player in free roam with a state (hi where:2)
+    where_v: u8,
+    /// its newest presence, and its last free-roam place (Where, version 2)
+    activity: Activity,
+    roam: Option<Roam>,
 }
 
 impl Member {
@@ -454,6 +502,22 @@ impl Member {
     /// Driving now: its newest pose says so and is fresh.
     fn active(&self, now: Instant) -> bool {
         self.pose.as_ref().is_some_and(|p| p.m == 1.0 && now.duration_since(p.at) <= ACTIVE)
+    }
+
+    /// Its state on the version-2 map (the Node relay's header), or 0: not listed.
+    fn where_state(&self, now: Instant, keep: Duration) -> u16 {
+        let Some(r) = &self.roam else { return 0 };
+        if !self.named || self.activity == Activity::Race || now.duration_since(r.at) > keep {
+            return 0;
+        }
+        if self.activity == Activity::Away || !self.active(now) {
+            return WHERE_AWAY;
+        }
+        if now.duration_since(r.moved) > PAUSED {
+            WHERE_PAUSED
+        } else {
+            WHERE_DRIVING
+        }
     }
 
     /// Its newest pose as a page of that kind reads it, each kind made once per pose.
@@ -505,6 +569,8 @@ pub struct Relay {
     k: usize,
     /// the binary format it speaks (CARBON_RELAY_BIN), 0 = JSON only
     bin: usize,
+    /// how long a free-roam place stays on the version-2 map (CARBON_WHERE_KEEP seconds)
+    where_keep: Duration,
     ticks: u64,
 }
 
@@ -553,6 +619,7 @@ impl Default for Relay {
             client_max: env_count("CARBON_CLIENT_MAX", CLIENT_MAX, 0, 100000),
             k: env_count("CARBON_INTEREST_K", INTEREST_K, 1, 1000),
             bin: env_count("CARBON_RELAY_BIN", BIN, 0, 1),
+            where_keep: Duration::from_secs(env_count("CARBON_WHERE_KEEP", WHERE_KEEP, 0, 86400) as u64),
             ticks: 0,
         }
     }
@@ -624,14 +691,17 @@ fn speed(s: &[f64; 13]) -> [f64; 3] {
 }
 
 /// How far c's car counts from r's: the nearer of the two cars 1 s and 4 s on at their speeds.
-/// FAR when c is not driving now or r has never driven.
-fn apart(r: &Member, c: &Member, now: Instant) -> f64 {
+/// FAR when c is not driving now or r has never driven; but with held (r already picked c), a fresh
+/// pose of c that is not driving keeps c's last driving place, standing.
+fn apart(r: &Member, c: &Member, now: Instant, held: bool) -> f64 {
     let (Some(ra), Some(ca)) = (r.at, c.at) else { return FAR };
-    if !c.active(now) {
+    let standing =
+        held && !c.active(now) && c.pose.as_ref().is_some_and(|p| now.duration_since(p.at) <= ACTIVE);
+    if !c.active(now) && !standing {
         return FAR;
     }
     let rv = if r.active(now) { r.vel } else { [0.0; 3] };
-    let cv = c.vel;
+    let cv = if standing { [0.0; 3] } else { c.vel };
     let mut best = FAR;
     for t in [1.0, 4.0] {
         let d = length3(
@@ -664,7 +734,7 @@ fn enter(room: &mut Room, i: usize, j: usize, now: Instant) {
     let (bin, drive) = (room.members[i].bin != 0, room.members[i].drive);
     let pose = if fresh { room.members[j].pose_frame(bin, drive) } else { None };
     let out = room.members[i].out.clone();
-    let mut edge = Edge { id: rid, sent: None, owed: Duration::ZERO };
+    let mut edge = Edge { id: rid, sent: None, owed: Duration::ZERO, extra: false };
     if let Some(f) = look {
         out.push(0, f);
     }
@@ -687,6 +757,12 @@ fn unlink(room: &mut Room, i: usize, sid: u64) {
     }
 }
 
+/// How many picks past k a player gets (CARBON_INTEREST_EXTRA).
+fn extra_picks() -> usize {
+    static EXTRA: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EXTRA.get_or_init(|| env_count("CARBON_INTEREST_EXTRA", 0, 0, EXTRA_MAX))
+}
+
 /// Picks whose cars player i gets now (the Node relay's pick) and applies the change.
 fn pick(room: &mut Room, i: usize, now: Instant, k: usize) {
     let r = &room.members[i];
@@ -699,9 +775,10 @@ fn pick(room: &mut Room, i: usize, now: Instant, k: usize) {
         if j == i || !c.named {
             continue;
         }
-        let mut d = apart(r, c, now);
-        if let Some(since) = r.linked(c.id) {
-            d *= if now.duration_since(since) < HOLD { HELD } else { KEPT };
+        let since = r.linked(c.id);
+        let mut d = apart(r, c, now, since.is_some());
+        if let Some(since) = since.filter(|_| d <= KEEP_RANGE || d >= FAR) {
+            d *= if now.duration_since(since) < HOLD { HELD } else { KEPT }; // FAR: picked ones first
         }
         let group = if r.follow.contains(&c.id) {
             0
@@ -727,27 +804,34 @@ fn pick(room: &mut Room, i: usize, now: Instant, k: usize) {
     }
     rest.sort_by(by_distance);
     chosen.extend(rest);
-    chosen.truncate(k);
+    chosen.truncate(k + extra_picks());
     let gone: Vec<u64> =
         room.members[i].interest.iter().map(|(s, _)| *s).filter(|s| !chosen.iter().any(|x| x.2 == *s)).collect();
     for s in gone {
         unlink(room, i, s);
     }
-    for (_, _, id, j) in chosen {
+    let rid = room.members[i].id;
+    for (rank, (_, _, id, j)) in chosen.into_iter().enumerate() {
         if !room.members[i].out.is_open() {
             return;
         }
         if room.members[i].linked(id).is_none() {
             enter(room, i, j, now);
         }
+        if let Some(edge) = room.members[j].audience.iter_mut().find(|e| e.id == rid) {
+            edge.extra = rank >= k;
+        }
     }
 }
 
 /// The least time between two of s's poses to r: none within FULL_RANGE or for a player r
-/// follows (every pose), MID_EVERY within MID_RANGE, otherwise FAR_EVERY.
-fn every(s: &Member, r: &Member) -> Duration {
+/// follows (every pose), MID_EVERY within MID_RANGE, otherwise FAR_EVERY; FAR_EVERY for an extra pick.
+fn every(s: &Member, r: &Member, extra: bool) -> Duration {
     if r.follow.contains(&s.id) {
         return Duration::ZERO;
+    }
+    if extra {
+        return FAR_EVERY;
     }
     let (Some(a), Some(b)) = (s.at, r.at) else { return Duration::ZERO };
     let d = length3(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
@@ -772,7 +856,7 @@ fn forward(room: &mut Room, i: usize, now: Instant) {
         if !r.out.is_open() {
             continue;
         }
-        let gap = every(s, r);
+        let gap = every(s, r, s.audience[e].extra);
         if !gap.is_zero() && s.audience[e].sent.is_some_and(|t| now.duration_since(t) < gap) {
             room.members[i].audience[e].owed = gap;
             continue;
@@ -843,6 +927,40 @@ fn heading(s: &[f64; 13]) -> i64 {
     let (qx, qy, qz, qw) = (s[0], s[1], s[2], s[3]);
     let h = js_round((2.0 * (qx * qz + qw * qy)).atan2(1.0 - 2.0 * (qx * qx + qy * qy)) * 180.0 / std::f64::consts::PI);
     (h as i64).rem_euclid(360)
+}
+
+/// The version-2 map feed for a room: every player in free roam ([id, x, z, heading, state]), in
+/// the room's order, or None while nobody is.
+fn where2_list(room: &Room, now: Instant, keep: Duration) -> Option<Vec<(u64, i64, i64, i64, u16)>> {
+    let mut list = Vec::new();
+    for x in &room.members {
+        let st = x.where_state(now, keep);
+        let Some(r) = x.roam.as_ref().filter(|_| st != 0) else { continue };
+        let (px, pz) = (js_round(r.x), js_round(r.z));
+        if px.abs() <= WHERE2_LIMIT && pz.abs() <= WHERE2_LIMIT {
+            list.push((x.id, px as i64, pz as i64, r.h, st));
+        }
+    }
+    (!list.is_empty()).then_some(list)
+}
+
+fn where2_json(list: &[(u64, i64, i64, i64, u16)]) -> Arc<[u8]> {
+    let p: Vec<String> = list.iter().map(|(id, x, z, h, st)| format!("[{id},{x},{z},{h},{st}]")).collect();
+    text_frame(format!(r#"{{"t":"where","p":[{}]}}"#, p.join(",")))
+}
+
+/// The version-2 feed as binary pages get it: type 4, then per player id (u32), x, z (i16) and
+/// heading | state << 9 (u16).
+fn where2_binary(list: &[(u64, i64, i64, i64, u16)]) -> Arc<[u8]> {
+    let mut b = Vec::with_capacity(1 + WHERE2_BYTES * list.len());
+    b.push(BIN_WHERE2);
+    for &(id, x, z, h, st) in list {
+        b.extend_from_slice(&(id as u32).to_le_bytes());
+        b.extend_from_slice(&(x as i16).to_le_bytes());
+        b.extend_from_slice(&(z as i16).to_le_bytes());
+        b.extend_from_slice(&(h as u16 | st << 9).to_le_bytes());
+    }
+    ws::frame(&b, 2).into()
 }
 
 /// The map feed for a room: every player driving now ([id, x, z, heading]), or None while nobody is.
@@ -1090,6 +1208,9 @@ impl Relay {
             drive: false,
             chase: None,
             cop_hit_seq: 0.0,
+            where_v: 1,
+            activity: Activity::None,
+            roam: None,
         });
         Some(id)
     }
@@ -1150,7 +1271,7 @@ impl Relay {
     pub fn tick(&mut self) {
         let now = Instant::now();
         self.ticks += 1;
-        let (k, picks, feed) = (self.k, self.ticks % 2 == 0, self.ticks % 4 == 0);
+        let (k, picks, feed, keep) = (self.k, self.ticks % 2 == 0, self.ticks % 4 == 0, self.where_keep);
         for room in self.rooms.values_mut() {
             flush_owed(room, now);
             if picks {
@@ -1159,15 +1280,20 @@ impl Relay {
                 }
             }
             if feed {
-                if let Some(list) = where_list(room, now) {
-                    // Each kind made once, if a page here reads it.
-                    let (mut json, mut bin) = (None, None);
-                    for p in room.members.iter().filter(|p| p.named) {
-                        let f = if p.bin != 0 {
-                            bin.get_or_insert_with(|| where_binary(&list)).clone()
-                        } else {
-                            json.get_or_insert_with(|| where_json(&list)).clone()
-                        };
+                // The pages from before get the players driving now, version-2 pages everyone in free
+                // roam with a state; each kind made once, if a page here reads it.
+                let list = where_list(room, now);
+                let v2 = room.members.iter().any(|p| p.named && p.where_v == 2);
+                let list2 = if v2 { where2_list(room, now, keep) } else { None };
+                let (mut json, mut bin, mut json2, mut bin2) = (None, None, None, None);
+                for p in room.members.iter().filter(|p| p.named) {
+                    let f = match (p.where_v == 2, p.bin != 0) {
+                        (true, true) => list2.as_ref().map(|l| bin2.get_or_insert_with(|| where2_binary(l)).clone()),
+                        (true, false) => list2.as_ref().map(|l| json2.get_or_insert_with(|| where2_json(l)).clone()),
+                        (false, true) => list.as_ref().map(|l| bin.get_or_insert_with(|| where_binary(l)).clone()),
+                        (false, false) => list.as_ref().map(|l| json.get_or_insert_with(|| where_json(l)).clone()),
+                    };
+                    if let Some(f) = f {
                         p.out.push(0, f);
                     }
                 }
@@ -1357,6 +1483,15 @@ fn race(members: &mut [Member], i: usize, m: &Map<String, Value>, bytes: usize, 
         .is_some_and(|k| (1..=12).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_lowercase()));
     if !kind_ok || bytes > RACE_MAX || !members[i].allow(Limit::Race, now) {
         return;
+    }
+    // Its presence (Activity), for the map feed: whether it is racing, in free roam or away.
+    if m.get("k").and_then(Value::as_str) == Some("presence") && number(m.get("v")) == Some(1.0) {
+        match m.get("a").and_then(Value::as_str) {
+            Some("roam") => members[i].activity = Activity::Roam,
+            Some("race") => members[i].activity = Activity::Race,
+            Some("away") => members[i].activity = Activity::Away,
+            _ => {}
+        }
     }
     let id = members[i].id;
     let mut out = format!(r#"{{"t":"race","id":{id}"#);
@@ -1588,9 +1723,12 @@ fn hi(
     members[i].cops = members[i].bin != 0 && number(m.get("cops")) == Some(1.0);
     // Driving: controls inside compact poses, so only for a page that also got them.
     members[i].drive = members[i].bin != 0 && number(m.get("drive")) == Some(1.0);
+    // Where, version 2: every player in free roam with a state (the Node relay's header).
+    members[i].where_v = if number(m.get("where")).is_some_and(|w| w.fract() == 0.0 && w >= 2.0) { 2 } else { 1 };
     let peers: Vec<String> = members.iter().filter(|p| p.id != id && p.named).map(|p| format!("{{{}}}", p.identity())).collect();
     let welcome = format!(
-        r#"{{"t":"welcome","whispers":1,"id":{id}{}{}{}{}{},"peers":[{}]}}"#,
+        r#"{{"t":"welcome","whispers":1,"id":{id}{}{}{}{}{}{},"peers":[{}]}}"#,
+        if members[i].where_v == 2 { r#","where":2"# } else { "" },
         if physics == Some(0.0) || physics == Some(1.0) { r#","physics":1"# } else { "" },
         if members[i].bin != 0 { format!(r#","bin":{}"#, members[i].bin) } else { String::new() },
         if members[i].cops { format!(r#","cops":1,"copsMax":{COPS_MAX}"#) } else { String::new() },
@@ -1751,10 +1889,26 @@ fn pose_binary(room: &mut Room, i: usize, data: &[u8], now: Instant) {
 /// Its frames are made when first needed (Member::pose_frame), one for every receiver of a kind;
 /// only the newest unsent pose per car is kept for a slow reader.
 fn posed(room: &mut Room, i: usize, pose: Pose, wire: Wire, now: Instant) {
+    if pose.m == 1.0 && crate::player_vehicles::blocked(pose.k as u32) {
+        let p = &mut room.members[i];
+        p.pose = None;
+        p.wire = None;
+        p.at = None;
+        p.out.finish(Some(ws::close_frame(1008, "Vehicle not allowed")));
+        return;
+    }
     let p = &mut room.members[i];
     if pose.m == 1.0 {
         p.at = Some([pose.s[4], pose.s[5], pose.s[6]]);
         p.vel = speed(&pose.s);
+        // Its last free-roam place (Where, version 2): when its physics clock last moved, for paused.
+        if p.activity != Activity::Race {
+            let moved = match &p.roam {
+                Some(r) if r.ts == pose.ts => r.moved,
+                _ => now,
+            };
+            p.roam = Some(Roam { x: pose.s[4], z: pose.s[6], h: heading(&pose.s), at: now, ts: pose.ts, moved });
+        }
     }
     p.pose = Some(pose);
     p.wire = Some(wire);
@@ -2042,6 +2196,32 @@ mod tests {
         assert!(!cops_near(Some([600.0, -2.5, 0.0]), &list), "a car beyond COPS_NEAR");
         assert!(!cops_near(None, &list), "no pose yet");
         assert!(cops_near(None, &[]), "the end of a chase always passes");
+    }
+
+    #[test]
+    fn where_version_2_layout() {
+        // Two players: the binary frame (2-byte WebSocket header, type 4, 10 bytes each) and the
+        // JSON say the same; the state sits above the heading's 9 bits.
+        let list = [(7u64, -300i64, 50i64, 90i64, WHERE_PAUSED), (4_000_000_000, 32767, -32767, 359, WHERE_AWAY)];
+        let b = where2_binary(&list);
+        assert_eq!(&b[..2], &[0x82, 21]);
+        let d = &b[2..];
+        assert_eq!(d[0], BIN_WHERE2);
+        assert_eq!(d.len(), 1 + 2 * WHERE2_BYTES);
+        let rec = |j: usize| {
+            let at = 1 + j * WHERE2_BYTES;
+            let hs = u16::from_le_bytes([d[at + 8], d[at + 9]]);
+            (
+                u32::from_le_bytes(d[at..at + 4].try_into().unwrap()) as u64,
+                i16::from_le_bytes([d[at + 4], d[at + 5]]) as i64,
+                i16::from_le_bytes([d[at + 6], d[at + 7]]) as i64,
+                (hs & 0x1ff) as i64,
+                hs >> 9,
+            )
+        };
+        assert_eq!([rec(0), rec(1)], list);
+        let j = where2_json(&list);
+        assert_eq!(&j[2..], br#"{"t":"where","p":[[7,-300,50,90,2],[4000000000,32767,-32767,359,3]]}"#);
     }
 
     #[test]

@@ -3003,6 +3003,127 @@ static void test_audio_ring_and_clock() {
     CHECK_EQ(host_audio_lock_violations(), 0u);
 }
 
+// A guest that streams a ring (the race's 96,256-byte mix ring, written about 62 ms ahead of the
+// head) and then stalls. The head runs out of what was written and reaches the previous lap; that
+// lap must not be heard again (the echo players reported). A ring written fewer than three laps is
+// a loop and is left alone. RECOMP_AUDIO_STALE_SILENCE=0 turns the silencing off, and with it the
+// first half of this test.
+static void test_audio_stale_ring_is_silent() {
+    const double rate = 48000.0;
+    if (!host_audio_offline_begin(rate, 4096)) {
+        printf("  (this machine has no audio engine, so the stale ring is not tested)\n");
+        return;
+    }
+    const char *sw = getenv("RECOMP_AUDIO_STALE_SILENCE");
+    const bool silencing = !(sw && sw[0] == '0');
+    const uint32_t ring_frames = 24064, step = 480, lead = 3000;
+    double phase = 0.0;
+    auto tone = [&](std::vector<uint8_t> &b, uint32_t frames) {
+        b.resize((size_t)frames * 4);
+        for (uint32_t i = 0; i < frames; ++i) {
+            int16_t v = (int16_t)(0.3 * 32767.0 * sin(phase));
+            phase += 2.0 * M_PI * 440.0 / rate;
+            for (int c = 0; c < 2; ++c) {
+                b[(size_t)i * 4 + c * 2] = (uint8_t)(v & 0xff);
+                b[(size_t)i * 4 + c * 2 + 1] = (uint8_t)((v >> 8) & 0xff);
+            }
+        }
+    };
+    // What a guest's Lock/Unlock does: a run at the write offset, split at the wrap.
+    auto write_run = [&](int32_t ch, uint32_t &wp, uint32_t frames) {
+        std::vector<uint8_t> b;
+        tone(b, frames);
+        uint32_t first = frames, second = 0;
+        if (wp + frames > ring_frames) {
+            first = ring_frames - wp;
+            second = frames - first;
+        }
+        host_audio_write(ch, b.data(), wp * 4, first * 4);
+        if (second)
+            host_audio_write(ch, b.data() + (size_t)first * 4, 0, second * 4);
+        wp = (wp + frames) % ring_frames;
+    };
+    auto render = [&](uint32_t frames) {
+        float peak = 0.0f;
+        host_audio_offline_render(frames, &peak);
+        return peak;
+    };
+
+    std::vector<uint8_t> silent((size_t)ring_frames * 4, 0);
+    HostAudioPlay play;
+    memset(&play, 0, sizeof play);
+    play.channel = 23;
+    play.pcm = silent.data();
+    play.bytes = (uint32_t)silent.size();
+    play.sample_rate = (int32_t)rate;
+    play.channels = 2;
+    play.bits = 16;
+    play.loop = 1;
+    host_audio_play(&play);
+
+    uint32_t wp = 0, rendered = 0;
+    while (wp < lead)
+        write_run(23, wp, step);
+
+    // Five laps of a guest that keeps up: every 10 ms block sounds.
+    int quiet = 0;
+    const int steps = (int)(5 * ring_frames / step);
+    for (int i = 0; i < steps; ++i) {
+        write_run(23, wp, step);
+        float pk = render(step);
+        rendered += step;
+        if (i > 3 && pk < 0.1f)
+            ++quiet;
+    }
+    CHECK_EQ(quiet, 0);
+
+    // The guest stalls for 300 ms: after the lead the head must not replay the old lap.
+    int stale = 0;
+    for (int i = 0; i < 30; ++i) {
+        float pk = render(step);
+        rendered += step;
+        if (i >= 8 && pk > 0.05f)
+            ++stale;
+    }
+    printf("  (%d of 22 blocks after the lead sounded the old lap%s)\n", stale,
+           silencing ? "" : "; silencing is off");
+    if (silencing)
+        CHECK_EQ(stale, 0);
+
+    // The guest resumes, writing its lead ahead of the head as GetCurrentPosition tells it.
+    wp = (rendered % ring_frames + lead) % ring_frames;
+    int resumed_quiet = 0;
+    for (int i = 0; i < 40; ++i) {
+        write_run(23, wp, step);
+        float pk = render(step);
+        if (i > 8 && pk < 0.1f)
+            ++resumed_quiet;
+    }
+    CHECK_EQ(resumed_quiet, 0);
+    host_audio_stop(23);
+    host_audio_offline_end();
+
+    // A loop the guest only rewrote twice is not a stream: it keeps looping.
+    if (!host_audio_offline_begin(rate, 4096))
+        return;
+    std::vector<uint8_t> loop_pcm;
+    tone(loop_pcm, ring_frames);
+    play.channel = 24;
+    play.pcm = loop_pcm.data();
+    host_audio_play(&play);
+    uint32_t w2 = 0;
+    write_run(24, w2, ring_frames);
+    write_run(24, w2, ring_frames);
+    int quiet_loop = 0;
+    for (uint32_t i = 0; i < 4 * ring_frames / step; ++i)
+        if (render(step) < 0.1f)
+            ++quiet_loop;
+    CHECK_EQ(quiet_loop, 0);
+    host_audio_stop(24);
+    host_audio_offline_end();
+    CHECK_EQ(host_audio_lock_violations(), 0u);
+}
+
 // One channel, two sounds, the way QMixer replaces: play, convert to a stream,
 // and 50 ms later do it again with a different sound on the same channel.
 //
@@ -11368,6 +11489,7 @@ int main(int argc, char **argv) {
         test_audio_format_change();
         test_audio_clipper_takes_only_the_overshoot();
         test_audio_ring_and_clock();
+        test_audio_stale_ring_is_silent();
         test_audio_replace_on_one_channel();
         test_audio_every_sound_started_is_heard();
         test_audio_voice_remaining_versus_queued();
@@ -11534,6 +11656,7 @@ int main(int argc, char **argv) {
         {"format change", test_audio_format_change},
         {"clipper", test_audio_clipper_takes_only_the_overshoot},
         {"ring and clock", test_audio_ring_and_clock},
+        {"stale ring is silent", test_audio_stale_ring_is_silent},
         {"replace on a channel", test_audio_replace_on_one_channel},
         {"every sound heard", test_audio_every_sound_started_is_heard},
         {"voice vs queued", test_audio_voice_remaining_versus_queued},

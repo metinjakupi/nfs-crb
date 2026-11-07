@@ -48,6 +48,7 @@ mod lan;
 mod messenger;
 mod moderation;
 mod olmsg;
+mod player_vehicles;
 mod relay;
 mod reports;
 mod saves;

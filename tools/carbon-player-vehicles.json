@@ -1,0 +1,522 @@
+{
+  "version": 1,
+  "scope": "Player vehicles only. AI police, traffic and scene assets remain available.",
+  "blocked": [
+    {
+      "name": "trailera",
+      "key": 14167946,
+      "model": "TRAILERA",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copheli",
+      "key": 105275058,
+      "model": "COPHELI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "traffire",
+      "key": 147320032,
+      "model": "TRAFFIRE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semilog",
+      "key": 177392743,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "truck",
+      "key": 371162468,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "temp_exotic_03",
+      "key": 456253705,
+      "model": "CARRERAGT",
+      "reason": "demo scene vehicle"
+    },
+    {
+      "name": "trailerb",
+      "key": 480926608,
+      "model": "TRAILERB",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "temp_muscle_02",
+      "key": 496995021,
+      "model": "CHARGER69",
+      "reason": "demo scene vehicle"
+    },
+    {
+      "name": "tractors",
+      "key": 588166928,
+      "model": "''",
+      "reason": "police or utility variant"
+    },
+    {
+      "name": "garb",
+      "key": 593937244,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "semicon",
+      "key": 621673210,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copsuvpatrol",
+      "key": 773103276,
+      "model": "COPSUV",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "cs_semi",
+      "key": 880729926,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailercmt",
+      "key": 923662918,
+      "model": "TRAILERCMT",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copsuv",
+      "key": 951288358,
+      "model": "COPSUV",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafsuva",
+      "key": 1049534608,
+      "model": "TRAFSUVA",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "rbtractor",
+      "key": 1130704618,
+      "model": "",
+      "reason": "police or utility variant"
+    },
+    {
+      "name": "trafstwag",
+      "key": 1137593283,
+      "model": "TRAFSTWAG",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailercon",
+      "key": 1170647601,
+      "model": "TRAILERCON",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafcemtr",
+      "key": 1177767274,
+      "model": "TRAFCEMTR",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafficcoup",
+      "key": 1394226312,
+      "model": "TRAFFICCOUP",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafvanb",
+      "key": 1407692666,
+      "model": "TRAFVANB",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copsuvl",
+      "key": 1420889656,
+      "model": "COPSUVL",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copmidsize_nis_ld",
+      "key": 1567506004,
+      "model": "COPMIDSIZE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "traf4dsedc",
+      "key": 1590265686,
+      "model": "TRAF4DSEDC",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "traf4dsedb",
+      "key": 1714104611,
+      "model": "TRAF4DSEDB",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafcamper",
+      "key": 1749358113,
+      "model": "TRAFCAMPER",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafamb",
+      "key": 1869084661,
+      "model": "TRAFAMB",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "exotic",
+      "key": 1886488231,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "player_dumptruck",
+      "key": 1998148470,
+      "model": "TRAFDMPTR",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copsport",
+      "key": 2051656907,
+      "model": "COPSPORT",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "tuner",
+      "key": 2062885638,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "trafpickupa",
+      "key": 2109639133,
+      "model": "TRAFPICKUPA",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "pizza",
+      "key": 2290419632,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "street",
+      "key": 2404903596,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "tractor",
+      "key": 2467614939,
+      "model": "",
+      "reason": "police or utility variant"
+    },
+    {
+      "name": "copter",
+      "key": 2485624493,
+      "model": "COPHELI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "player_cop_gto",
+      "key": 2500824978,
+      "model": "COPSPORTHENCH",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copmidsize_nis",
+      "key": 2503453879,
+      "model": "COPMIDSIZEINT",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "taxi",
+      "key": 2604767721,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "trafha",
+      "key": 2697444185,
+      "model": "TRAFHA",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailercrate",
+      "key": 2699977158,
+      "model": "TRAILERCRATE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copghost",
+      "key": 2745291138,
+      "model": "COPGHOST",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copmidsize_weak",
+      "key": 2758051216,
+      "model": "COPMIDSIZE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copmidsizeint",
+      "key": 2762272508,
+      "model": "",
+      "reason": "police or utility variant"
+    },
+    {
+      "name": "copsportghost",
+      "key": 2766890632,
+      "model": "COPSPORTGHOST",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailerbox",
+      "key": 2782182566,
+      "model": "TRAILERBOX",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semibox",
+      "key": 2792933787,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "racers",
+      "key": 2796276001,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "cops",
+      "key": 2843810707,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "semib",
+      "key": 2847214020,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "choppers",
+      "key": 2857623538,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "copmidsize_ce",
+      "key": 2893222352,
+      "model": "COPMIDSIZE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "player_firetruck",
+      "key": 2899963559,
+      "model": "TRAFFIRE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copsporthench",
+      "key": 3002281954,
+      "model": "COPSPORTHENCH",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "player_cop_corvette",
+      "key": 3006666286,
+      "model": "COPSPORTHENCH",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copmidsize",
+      "key": 3147508024,
+      "model": "COPMIDSIZE",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semicmt",
+      "key": 3223840706,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "demo_vid_gallardo",
+      "key": 3249724982,
+      "model": "GALLARDO",
+      "reason": "demo scene vehicle"
+    },
+    {
+      "name": "trafdmptr",
+      "key": 3312194361,
+      "model": "TRAFDMPTR",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafgarb",
+      "key": 3426097812,
+      "model": "TRAFGARB",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailers",
+      "key": 3427441545,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "copgto",
+      "key": 3432534870,
+      "model": "COPGTO",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "player_cop_suv",
+      "key": 3500317914,
+      "model": "COPSUV",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "van",
+      "key": 3503414170,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "temp_muscle_01",
+      "key": 3537483459,
+      "model": "CUDA",
+      "reason": "demo scene vehicle"
+    },
+    {
+      "name": "copcross",
+      "key": 3548151917,
+      "model": "COPSPORT",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semi",
+      "key": 3574286522,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "pickupa",
+      "key": 3583397753,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "traftaxi",
+      "key": 3590420638,
+      "model": "TRAFTAXI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "cemtr",
+      "key": 3634728644,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "trafnews",
+      "key": 3686349938,
+      "model": "TRAFNEWS",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trailerlog",
+      "key": 3707500446,
+      "model": "TRAILERLOG",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semia",
+      "key": 3712834604,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "traf4dseda",
+      "key": 3751483097,
+      "model": "TRAF4DSEDA",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "traffic",
+      "key": 3751543468,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "cars",
+      "key": 3823062013,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "trafcourt",
+      "key": 3866921014,
+      "model": "TRAFCOURT",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafminivan",
+      "key": 3872702185,
+      "model": "TRAFMINIVAN",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "semicrate",
+      "key": 3908647713,
+      "model": "SEMI",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "copgtoghost",
+      "key": 3924565494,
+      "model": "COPGTOGHOST",
+      "reason": "non-road vehicle"
+    },
+    {
+      "name": "trafpizza",
+      "key": 3954125094,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "default",
+      "key": 4005701402,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "muscle",
+      "key": 4022882888,
+      "model": "",
+      "reason": "abstract vehicle template without geometry"
+    },
+    {
+      "name": "cop",
+      "key": 4074116497,
+      "model": "",
+      "reason": "legacy police or traffic alias"
+    },
+    {
+      "name": "player_cop",
+      "key": 4118654313,
+      "model": "COPMIDSIZE",
+      "reason": "non-road vehicle"
+    }
+  ]
+}

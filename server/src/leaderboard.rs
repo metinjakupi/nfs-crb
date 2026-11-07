@@ -15,6 +15,14 @@
 //! - "game" boards are what a player's own game sends with UpdateStats (career and quick race
 //!   bests, Canyon Duel, drift and pursuit records). Nobody else saw those races; a modified page
 //!   can send any number. They are left out unless CARBON_LEADERBOARD_GAME=1.
+//! - "ingame" boards ("In-game leaderboard", only with ?source=ingame or ?source=all; the plain
+//!   answer is as before) are exactly what the game's own LEADERBOARD and ONLINE PLAYER STATS
+//!   screens show (stats.rs Stats::ingame_boards, the rows of GetTopN): per race the best
+//!   (Evt_Bst_<race>, whatever the lap count), the best lap, the races and the wins, and the
+//!   game's own online wins and best win streak (counted before the reset, and before the games'
+//!   reports were cross-checked); every name, claimed or not, except names banned from the
+//!   boards. The page labels them as the game's records, not verified ones. All time, this week
+//!   and today. CARBON_LEADERBOARD_INGAME=0 leaves them out.
 //!
 //! On every board: a result much better than the board's established top waits in the review
 //! queue (stats.rs Stats::record) until an admin approves it; names banned from the boards and
@@ -334,10 +342,11 @@ impl Review {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Board {
     /// "Evt_Bst:30F07253", "Evt_Bst:30F07253:2" (a circuit of 2 laps), "Evt_Bst_Lap:30F07253",
-    /// "Overall_Solo_On_Wins"; game boards start "game:".
+    /// "Overall_Solo_On_Wins"; game boards start "game:", in-game boards "ingame:".
     pub id: String,
     pub family: String,
-    /// "race" (counted by the race host) or "game" (the player's own game said so)
+    /// "race" (counted by the race host), "game" (the player's own game said so) or "ingame"
+    /// (what the game's own leaderboard shows)
     pub source: &'static str,
     /// the race's Attrib key in hex (the page names it from its own data), or None
     pub race: Option<String>,
@@ -349,7 +358,12 @@ pub struct Board {
     pub players: usize,
     pub all: Vec<Row>,
     pub week: Vec<Row>,
+    /// today (UTC); in-game boards only
+    pub day: Vec<Row>,
 }
+
+/// The label of the in-game group, for the page.
+pub const INGAME_LABEL: &str = "In-game leaderboard";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -359,54 +373,90 @@ pub struct Row {
     pub car: String,
     /// when it was set (seconds since 1970), 0 when not known (kept before times were kept)
     pub when: u64,
+    /// in-game best times: the two numbers the game's board shows by race type (a circuit's
+    /// best lap and top speed in m/s, a sprint's top speed and NOS), as elements 4 and 5
+    pub numbers: Option<(f64, f64)>,
 }
 
 fn rows_json(rows: &[Row], limit: usize) -> Value {
     Value::Array(
         rows.iter()
             .take(limit)
-            .map(|r| json!([r.name, (r.value * 1000.0).round() / 1000.0, r.car, if r.when > 0 { json!(r.when) } else { Value::Null }]))
+            .map(|r| {
+                let mut row = vec![json!(r.name), json!((r.value * 1000.0).round() / 1000.0), json!(r.car), if r.when > 0 { json!(r.when) } else { Value::Null }];
+                if let Some((a, b)) = r.numbers {
+                    row.extend([json!((a * 1000.0).round() / 1000.0), json!((b * 1000.0).round() / 1000.0)]);
+                }
+                Value::Array(row)
+            })
             .collect(),
     )
 }
 
-/// The JSON for `boards`: every board, or the one asked for; one period or both.
-pub fn answer(boards: &[Board], made: u64, week: u32, board: Option<&str>, period: Option<&str>, limit: usize) -> Value {
+/// Which boards an answer has: `source` None is the plain answer as before (race boards, and
+/// game boards when on); "ingame" only the in-game group; "all" everything. A board asked for by
+/// id is found in any group.
+fn wanted(b: &Board, board: Option<&str>, source: Option<&str>) -> bool {
+    match (board, source) {
+        (Some(id), _) => b.id == id,
+        (None, Some("all")) => true,
+        (None, Some("ingame")) => b.source == "ingame",
+        (None, _) => b.source != "ingame",
+    }
+}
+
+/// The JSON for `boards`: every board of the group, or the one asked for; one period or all.
+/// In-game boards also have "day", and their best times two more numbers per row.
+#[allow(clippy::too_many_arguments)]
+pub fn answer(boards: &[Board], made: u64, week: u32, board: Option<&str>, period: Option<&str>, limit: usize, source: Option<&str>) -> Value {
     let limit = limit.clamp(1, MAX_ROWS);
-    let list: Vec<Value> = boards
+    let chosen: Vec<&Board> = boards.iter().filter(|b| wanted(b, board, source)).collect();
+    let list: Vec<Value> = chosen
         .iter()
-        .filter(|b| board.map_or(true, |id| b.id == id))
         .map(|b| {
             let mut o = json!({
                 "id": b.id, "family": b.family, "source": b.source, "race": b.race, "laps": b.laps,
                 "low": b.low, "unit": b.unit, "players": b.players,
             });
-            if period != Some("week") {
+            if b.source == "ingame" {
+                o["label"] = json!(INGAME_LABEL);
+            }
+            if matches!(period, None | Some("all")) {
                 o["all"] = rows_json(&b.all, limit);
             }
-            if period != Some("all") {
+            if matches!(period, None | Some("week")) {
                 o["week"] = rows_json(&b.week, limit);
+            }
+            if b.source == "ingame" && matches!(period, None | Some("day")) {
+                o["day"] = rows_json(&b.day, limit);
             }
             o
         })
         .collect();
     let mut families: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    for b in boards {
+    for b in boards.iter().filter(|b| wanted(b, None, source)) {
         *families.entry((b.family.as_str(), b.source)).or_insert(0) += 1;
     }
     let families: Vec<Value> = families.into_iter().map(|((f, source), n)| json!({"family": f, "boards": n, "source": source})).collect();
-    json!({"version": 1, "made": made, "week": week, "rows": ["name", "value", "car", "when"], "families": families, "boards": list})
+    let mut v = json!({"version": 1, "made": made, "week": week, "rows": ["name", "value", "car", "when"], "families": families, "boards": list});
+    if chosen.iter().any(|b| b.source == "ingame") {
+        v["ingame"] = json!({"label": INGAME_LABEL, "rows": ["name", "value", "car", "when", "a", "b"], "day": made / 86_400});
+    }
+    v
 }
 
 /// When the boards were made (our clock, and seconds since 1970), their week, the boards, and
-/// the plain answer's text.
+/// the plain answer's text (of the race group, or of ?source=ingame).
 type Cached = (Instant, u64, u32, Vec<Board>, String);
 
-/// The answer, rebuilt at most every `every` seconds.
+/// The answer, rebuilt at most every `every` seconds: the race (and game) boards and the in-game
+/// boards apart, each only when asked for.
 pub struct Public {
     every: u64,
     game_boards: bool,
+    ingame_boards: bool,
     cached: Mutex<Option<Cached>>,
+    ingame: Mutex<Option<Cached>>,
     limits: Mutex<Limits>,
 }
 
@@ -414,11 +464,19 @@ impl Public {
     pub fn from_env() -> Public {
         let every = std::env::var("CARBON_LEADERBOARD_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60u64).clamp(1, 3600);
         let game_boards = std::env::var("CARBON_LEADERBOARD_GAME").is_ok_and(|v| v == "1");
-        Public::new(every, game_boards)
+        let mut p = Public::new(every, game_boards);
+        p.ingame_boards = !std::env::var("CARBON_LEADERBOARD_INGAME").is_ok_and(|v| v == "0");
+        p
     }
 
     pub fn new(every: u64, game_boards: bool) -> Public {
-        Public { every, game_boards, cached: Mutex::new(None), limits: Mutex::new(Limits::default()) }
+        Public { every, game_boards, ingame_boards: true, cached: Mutex::new(None), ingame: Mutex::new(None), limits: Mutex::new(Limits::default()) }
+    }
+
+    /// After an admin change: the next answer is made again.
+    fn clear(&self) {
+        *lock(&self.cached) = None;
+        *lock(&self.ingame) = None;
     }
 }
 
@@ -467,34 +525,66 @@ pub async fn handle(app: &App, conn: &mut Conn, req: &mut Request, url: &Url) ->
         return conn.reply(req, 429, &headers, br#"{"error":"busy"}"#).await;
     }
     let board = url.query("board").filter(|b| !b.is_empty() && b.len() <= 80);
-    let period = url.query("period").filter(|p| p == "week" || p == "all");
+    let period = url.query("period").filter(|p| p == "week" || p == "all" || p == "day");
     let limit = url.query("limit").and_then(|l| l.parse::<usize>().ok());
-    let body = public_json(app, board.as_deref(), period.as_deref(), limit);
+    let source = url.query("source").filter(|s| s == "ingame" || s == "all");
+    let body = public_json(app, board.as_deref(), period.as_deref(), limit, source.as_deref());
     let cache = format!("public, max-age={}", app.boards.every.min(60));
     headers.push(("cache-control", cache.as_str()));
     conn.reply(req, 200, &headers, body.as_bytes()).await
 }
 
-/// The public JSON: the cached text for the plain request, else made from the cached boards.
-pub fn public_json(app: &App, board: Option<&str>, period: Option<&str>, limit: Option<usize>) -> String {
-    let mut cached = lock(&app.boards.cached);
-    let fresh = cached.as_ref().is_some_and(|c| c.0.elapsed().as_secs() < app.boards.every);
-    if !fresh {
-        let now = unix_secs();
-        let game = app.boards.game_boards;
-        let boards = app.lan.with_stats(|s| {
-            let ids = lock(&app.identities);
-            s.public_boards(&|name: &str| ids.is_claimed(name), game, now)
+/// The public JSON: the cached text for the plain request (and for the plain ?source=ingame),
+/// else made from the cached boards.
+pub fn public_json(app: &App, board: Option<&str>, period: Option<&str>, limit: Option<usize>, source: Option<&str>) -> String {
+    let plain = board.is_none() && period.is_none() && limit.map_or(true, |l| l == DEFAULT_ROWS);
+    let limit = limit.unwrap_or(DEFAULT_ROWS);
+    let ingame_id = board.is_some_and(|b| b.starts_with("ingame:"));
+    let want_race = if board.is_some() { !ingame_id } else { source != Some("ingame") };
+    let want_ingame = if board.is_some() { ingame_id } else { matches!(source, Some("ingame" | "all")) };
+    // the race group's lock first, then the in-game one's (admin clears them one at a time)
+    let mut race = want_race.then(|| lock(&app.boards.cached));
+    let mut ingame = want_ingame.then(|| lock(&app.boards.ingame));
+    if let Some(c) = race.as_deref_mut() {
+        refresh(app, c, None, |now| {
+            let game = app.boards.game_boards;
+            app.lan.with_stats(|s| {
+                let ids = lock(&app.identities);
+                s.public_boards(&|name: &str| ids.is_claimed(name), game, now)
+            })
         });
-        let week = crate::stats::week_number(now);
-        let text = answer(&boards, now, week, None, None, DEFAULT_ROWS).to_string();
-        *cached = Some((Instant::now(), now, week, boards, text));
     }
-    let c = cached.as_ref().expect("just made");
-    if board.is_none() && period.is_none() && limit.map_or(true, |l| l == DEFAULT_ROWS) {
-        return c.4.clone();
+    if let Some(c) = ingame.as_deref_mut() {
+        refresh(app, c, Some("ingame"), |now| if app.boards.ingame_boards { app.lan.with_stats(|s| s.ingame_boards(now)) } else { Vec::new() });
     }
-    answer(&c.3, c.1, c.2, board, period, limit.unwrap_or(DEFAULT_ROWS)).to_string()
+    let (r, i) = (race.as_deref().and_then(Option::as_ref), ingame.as_deref().and_then(Option::as_ref));
+    match (r, i) {
+        (Some(c), None) if plain && source.is_none() => c.4.clone(),
+        (None, Some(c)) if plain && source == Some("ingame") => c.4.clone(),
+        (Some(c), None) | (None, Some(c)) => answer(&c.3, c.1, c.2, board, period, limit, source).to_string(),
+        (Some(r), Some(i)) => {
+            // ?source=all: both groups (made apart, so up to CARBON_LEADERBOARD_SECS apart)
+            let all: Vec<Board> = r.3.iter().chain(i.3.iter()).cloned().collect();
+            answer(&all, r.1.min(i.1), r.2, board, period, limit, source).to_string()
+        }
+        (None, None) => {
+            let now = unix_secs();
+            answer(&[], now, crate::stats::week_number(now), board, period, limit, source).to_string()
+        }
+    }
+}
+
+/// Makes one cache again when it is older than CARBON_LEADERBOARD_SECS (or empty), with the
+/// plain answer's text for `source`.
+fn refresh(app: &App, cached: &mut Option<Cached>, source: Option<&str>, make: impl FnOnce(u64) -> Vec<Board>) {
+    if cached.as_ref().is_some_and(|c| c.0.elapsed().as_secs() < app.boards.every) {
+        return;
+    }
+    let now = unix_secs();
+    let boards = make(now);
+    let week = crate::stats::week_number(now);
+    let text = answer(&boards, now, week, None, None, DEFAULT_ROWS, source).to_string();
+    *cached = Some((Instant::now(), now, week, boards, text));
 }
 
 fn bearer(req: &Request) -> Option<&str> {
@@ -558,7 +648,7 @@ async fn admin(app: &App, conn: &mut Conn, req: &mut Request, url: &Url, mut hea
         }
         let result = app.lan.with_stats(|s| s.admin(&op, &actor, &args, unix_secs()));
         if !read_only {
-            *lock(&app.boards.cached) = None; // the next public answer shows the change
+            app.boards.clear(); // the next public answer shows the change
         }
         match result {
             Ok(v) => reply(200, json!({"ok": true, "op": op, "data": v})),
@@ -650,16 +740,57 @@ mod tests {
             low: true,
             unit: "time",
             players: 2,
-            all: vec![Row { name: "Metin".into(), value: 103.050_003, car: "0x8774322c".into(), when: 1_793_000_000 }, Row { name: "Jan".into(), value: 104.76, car: String::new(), when: 0 }],
+            all: vec![Row { name: "Metin".into(), value: 103.050_003, car: "0x8774322c".into(), when: 1_793_000_000, numbers: None }, Row { name: "Jan".into(), value: 104.76, car: String::new(), when: 0, numbers: None }],
             week: vec![],
+            day: vec![],
         };
-        let v = answer(&[b.clone()], 1, 2966, None, None, 20);
+        let v = answer(&[b.clone()], 1, 2966, None, None, 20, None);
         assert_eq!(v["boards"][0]["all"][0], json!(["Metin", 103.05, "0x8774322c", 1_793_000_000u64]));
         assert_eq!(v["boards"][0]["all"][1][3], Value::Null);
         assert_eq!(v["families"][0], json!({"family": "Evt_Bst", "boards": 1, "source": "race"}));
-        let one = answer(&[b], 1, 2966, Some("Evt_Bst:30F07253"), Some("week"), 1);
+        let one = answer(&[b], 1, 2966, Some("Evt_Bst:30F07253"), Some("week"), 1, None);
         assert!(one["boards"][0].get("all").is_none());
         assert_eq!(one["boards"][0]["week"], json!([]));
-        assert_eq!(answer(&[], 1, 2966, Some("nope"), None, 5)["boards"], json!([]));
+        assert_eq!(answer(&[], 1, 2966, Some("nope"), None, 5, None)["boards"], json!([]));
+    }
+
+    #[test]
+    fn the_in_game_group_comes_only_when_asked_for() {
+        let row = |n: &str, v: f64, numbers| Row { name: n.into(), value: v, car: String::new(), when: 0, numbers };
+        let race = Board { id: "Evt_Bst:30F07253:2".into(), family: "Evt_Bst".into(), source: "race", race: Some("30F07253".into()), laps: Some(2), low: true, unit: "time", players: 1, all: vec![row("Metin", 210.0, None)], week: vec![], day: vec![] };
+        let ingame = Board {
+            id: "ingame:Evt_Bst:30F07253".into(),
+            family: "Evt_Bst".into(),
+            source: "ingame",
+            race: Some("30F07253".into()),
+            laps: None,
+            low: true,
+            unit: "time",
+            players: 2,
+            all: vec![row("Jan", 99.25, Some((51.5, 72.912_34))), row("Metin", 103.0, None)],
+            week: vec![row("Jan", 99.25, Some((51.5, 72.9)))],
+            day: vec![row("Jan", 99.25, Some((51.5, 72.9)))],
+        };
+        let boards = [race.clone(), ingame];
+        // the plain answer is as before: race boards only, no "day", no in-game header
+        let plain = answer(&boards, 86_400 * 3, 2966, None, None, 20, None);
+        assert_eq!(plain["boards"].as_array().unwrap().len(), 1);
+        assert_eq!(plain, answer(&[race], 86_400 * 3, 2966, None, None, 20, None));
+        assert!(plain["boards"][0].get("day").is_none() && plain.get("ingame").is_none());
+        // ?source=ingame: the in-game boards, labelled, with today and the game's two numbers
+        let v = answer(&boards, 86_400 * 3, 2966, None, None, 20, Some("ingame"));
+        let b = &v["boards"][0];
+        assert_eq!((v["boards"].as_array().unwrap().len(), b["source"].as_str(), b["label"].as_str()), (1, Some("ingame"), Some(INGAME_LABEL)));
+        assert_eq!(b["all"][0], json!(["Jan", 99.25, "", null, 51.5, 72.912]));
+        assert_eq!(b["all"][1], json!(["Metin", 103.0, "", null]));
+        assert_eq!(b["day"].as_array().unwrap().len(), 1);
+        assert_eq!(v["ingame"]["day"], json!(3));
+        assert_eq!(v["families"], json!([{"family": "Evt_Bst", "boards": 1, "source": "ingame"}]));
+        // ?source=all has both; one board by id from either group; ?period=day
+        assert_eq!(answer(&boards, 1, 2966, None, None, 20, Some("all"))["boards"].as_array().unwrap().len(), 2);
+        let one = answer(&boards, 1, 2966, Some("ingame:Evt_Bst:30F07253"), Some("day"), 100, None);
+        assert_eq!(one["boards"].as_array().unwrap().len(), 1);
+        assert!(one["boards"][0].get("all").is_none() && one["boards"][0].get("week").is_none());
+        assert_eq!(one["boards"][0]["day"][0][0], json!("Jan"));
     }
 }

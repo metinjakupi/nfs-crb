@@ -109,6 +109,7 @@
   .cs-state.ready .cs-dot { background: var(--cyan); color: var(--cyan); }
   .cs-state.bad .cs-dot { background: #ff5d7a; color: #ff5d7a; }
   .cs-note { color: var(--dim); font-size: 13px; }
+  .cs-play-status:empty { display: none; }
   .cs-mode { color: var(--ink); font-size: 14px; }
   .cs-mode b { color: var(--cyan); font-weight: 600; }
   .cs-btn { font: italic 800 15px/1 "Avenir Next Condensed", "DIN Condensed", "Bahnschrift", sans-serif; letter-spacing: .14em;
@@ -252,6 +253,7 @@
           <div class="cs-state"><span class="cs-dot"></span><span class="cs-state-text">Checking your game files…</span></div>
           <div class="cs-actions"><button class="cs-btn big cs-go" disabled><span>Play<span class="cs-key">Enter</span></span></button><button class="cs-btn cs-local"><span>Use local game folder</span></button></div>
           <div class="cs-note cs-local-status" role="status"></div>
+          <div class="cs-note cs-play-status" role="status" aria-live="polite"></div>
           <div class="cs-mode"></div>
           <div class="cs-note cs-slot"></div>
         </section>
@@ -261,6 +263,7 @@
           <div class="cs-actions" style="margin-top:12px">
             <a class="cs-btn cs-manage" href="${game.streamAssets ? "../manage.html" : "../"}"><span>${game.downloadManifest ? "Manage game files" : "Import or manage"}</span></a>
           </div>
+          <div class="cs-ext" data-for="language"></div>
         </section>
         <div class="cs-ext" data-for="saves"></div>
         <section class="cs-panel">
@@ -442,6 +445,90 @@
     serversReady.then(count);
   });
 
+  // A game that ends without a clean exit (the browser killed the tab: out of memory, a renderer
+  // crash) leaves its "running" mark in localStorage; the next start page in the same save slot
+  // offers once to send report.js's saved tail of that session's log. A tab that was hidden when
+  // it went (a phone that closed it in the background) is not asked about. A reload that resumes
+  // the game at once (resume.js; Chrome's "Aw, Snap!" Reload) shows the same line as a small note
+  // in a corner for half a minute, since the start page is gone by then.
+  const sessionKey = () => `${game.id}.session.v1.${slot}`;
+  let session = null;
+  // report.js keeps the tail (key + ".tail"); a page that has not loaded it yet loads it here.
+  const reporter = () => (window.recompReport ? Promise.resolve(window.recompReport) : new Promise((resolve) => {
+    const script = document.createElement("script");
+    script.src = "report.js";
+    script.onload = () => resolve(window.recompReport || null);
+    script.onerror = () => { script.remove(); resolve(null); };
+    document.body.append(script);
+  }));
+  function markRunning() {
+    const key = sessionKey();
+    const save = () => { try { localStorage.setItem(key, JSON.stringify(session)); } catch {} };
+    const visible = () => (document.visibilityState === "hidden" ? "hidden" : "running");
+    session = { version: 1, state: visible(), started: new Date().toISOString(), at: Date.now(), online: on.checked };
+    save();
+    reporter().then((r) => { if (session) r?.watchSession?.(key); });
+    let quit = false;
+    const end = () => {
+      if (!session) return;
+      session = null;
+      try { localStorage.removeItem(key); } catch {}
+      window.recompReport?.endSession?.();
+    };
+    addEventListener("pagehide", end); // closing, reloading or leaving the page is a clean exit
+    addEventListener("recomp-quit", () => { quit = true; end(); });
+    addEventListener("pageshow", (e) => { // back from the back/forward cache: running again
+      if (!e.persisted || session || quit) return;
+      session = { version: 1, state: visible(), started: new Date().toISOString(), at: Date.now(), online: on.checked };
+      save();
+      reporter().then((r) => { if (session) r?.watchSession?.(key); });
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!session) return;
+      session.state = visible();
+      session.at = Date.now();
+      save();
+    });
+  }
+  async function offerLastSession(restoring) {
+    const key = sessionKey();
+    let mark = null;
+    try { mark = JSON.parse(localStorage.getItem(key)); localStorage.removeItem(key); } catch {}
+    if (mark?.version !== 1 || mark.state !== "running" || !(Date.now() - mark.at < 7 * 24 * 3600 * 1000)) {
+      try { localStorage.removeItem(key + ".tail"); } catch {}
+      return;
+    }
+    const report = await reporter();
+    const tail = report?.takeSession?.(key) || null;
+    if (!report?.openDialog || session) return; // no reporter, or Play was pressed meanwhile
+    const line = document.createElement("div");
+    line.className = "cs-crashed";
+    line.setAttribute("role", "status");
+    line.style.marginTop = "8px";
+    const button = (text) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = text;
+      b.style.cssText = "background:none;border:0;padding:0 0 0 10px;color:inherit;font:inherit;text-decoration:underline;cursor:pointer";
+      return b;
+    };
+    const send = button("Send a report"), dismiss = button("No thanks");
+    line.append("The game closed unexpectedly last time. ", send, dismiss);
+    send.onclick = () => {
+      line.remove();
+      report.openDialog(tail || { version: 1, log: [], pageLines: [], crashes: [],
+        note: "the closed tab saved no log lines", started: mark.started, online: mark.online });
+    };
+    dismiss.onclick = () => line.remove();
+    // Inside the slot line: play-home.js moves that element (with this) into its own layout.
+    if (!restoring) { $(".cs-slot").append(line); return; }
+    line.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:30;max-width:calc(100% - 24px);margin:0;padding:8px 12px;" +
+      "background:rgba(6,12,22,.92);color:#e9f6ff;border:1px solid rgba(95,228,242,.3);font:13px/1.4 system-ui,sans-serif";
+    document.body.append(line);
+    setTimeout(() => line.remove(), 30000);
+  }
+  Promise.all([slotReady, recoveryReady]).then(() => { if (slot) offerLastSession(!!recovery?.pending); });
+
   on.addEventListener("change", () => { store.set("online", on.checked); reflect(); count(); scheduleIdentity(); });
   nameEl.addEventListener("input", () => { identityState = ""; showIdentity(); reflect(); scheduleIdentity(); });
   roomEl.addEventListener("input", reflect);
@@ -467,11 +554,14 @@
   // For the start page's add-ons (saves.js draws its panel into .cs-ext[data-for=saves]):
   // this window's save slot and the folder the player page will use for it.
   // After online.js, so server() already has the internet server's key.
-  Promise.all([slotReady, serversReady]).then(() => {
+  const languageReady = Promise.all([slotReady, serversReady]).then(() => {
     window.recompStartPage = {
       slot, store, panel: (id) => root.querySelector(`.cs-ext[data-for="${id}"]`),
       profileFolder: slot > 1 ? `profile-${slot}` : "profile", server: () => SERVERS[serverEl.value],
       gameFolder, entry,
+      playStarting: () => starting,
+      // saves.js sets restoring while it replaces the save.
+      restoring: false,
       async prepareProfile() {
         await (await navigator.storage.getDirectory()).getDirectoryHandle(game.id, { create: true });
         return profileFolder(game.id, slot > 1 ? String(slot) : null);
@@ -482,9 +572,18 @@
     saves.src = "saves.js";
     saves.onerror = () => saves.remove();
     document.body.append(saves);
+    const languageLoaded = new Promise(resolve => {
+      const language = document.createElement("script");
+      language.src = "language.js";
+      const timeout = setTimeout(resolve, 5000);
+      language.onload = () => { clearTimeout(timeout); resolve(); };
+      language.onerror = () => { clearTimeout(timeout); language.remove(); resolve(); };
+      document.body.append(language);
+    });
     const preferences = document.createElement("script");
     preferences.src = "home-settings.js";
     document.body.append(preferences);
+    return languageLoaded;
   });
 
   // A name can be claimed with this save slot's cloud keyphrase. saves.js exposes only the
@@ -1007,21 +1106,38 @@
   const reflectionsHalfOnce = (folder) =>
     settingOnce(folder, REFLECTION_DEFAULT_MARK, "g_CarEnvironmentMapEnable", (level) => (level > 2 ? 2 : undefined));
   let starting = false;
+  const playStatus = $(".cs-play-status");
+  function setStarting(value, message = "") {
+    starting = value;
+    playStatus.textContent = value ? "Getting the game ready…" : message;
+    dispatchEvent(new Event("recomp-play-state"));
+  }
   async function play(restoring = false) {
     if (!ready || starting || $(".cs-go").disabled || window.recompStartPage?.homeBusy) return;
-    await slotReady;
-    await serversReady;
-    if (!slot || starting) return;
-    try { await window.recompStartPage?.flushSettings?.(); } catch { return; }
-    const name = nameEl.value.trim();
-    if (on.checked && !name) { ask(); return; }
-    starting = true;
-    // Ask the browser to keep this site's storage (the imported game and the saves) under storage
-    // pressure: without it Chrome deletes the whole of it when the disk runs low (three test profiles,
-    // 2026-11-05). Not awaited: Firefox asks the player, and a refusal changes nothing else.
-    try { navigator.storage?.persist?.().catch(() => {}); } catch {}
-    const identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
-    if (!identity.ok) { starting = false; return; }
+    if (window.recompStartPage?.restoring) { playStatus.textContent = "Wait a moment: your save is being written."; return; }
+    // Set before the first wait, so a second click or Enter cannot start the game twice.
+    setStarting(true);
+    let identity, name, problem = "";
+    try {
+      await slotReady;
+      await serversReady;
+      if (!slot) return;
+      await languageReady;
+      try { await window.recompStartPage?.flushSettings?.(); }
+      catch { problem = "Your settings could not be saved. Reload the page to try again."; return; }
+      try { await window.recompStartPage?.prepareLanguage?.(); }
+      catch { problem = "The game language could not be saved. Reload the page to try again."; return; }
+      name = nameEl.value.trim();
+      if (on.checked && !name) { ask(); return; }
+      // Ask the browser to keep this site's storage (the imported game and the saves) under storage
+      // pressure: without it Chrome deletes the whole of it when the disk runs low (three test profiles,
+      // 2026-11-05). Not awaited: Firefox asks the player, and a refusal changes nothing else.
+      try { navigator.storage?.persist?.().catch(() => {}); } catch {}
+      identity = on.checked ? await identityForPlay(name) : { ok: true, claim: "", browser: "" };
+    } finally {
+      if (!identity?.ok) setStarting(false, problem);
+    }
+    if (!identity.ok) return;
     if (!restoring && fullEl.checked && document.documentElement.requestFullscreen)
       document.documentElement.requestFullscreen({ keyboardLock: "browser" }).catch(() => {});
     const server = SERVERS[serverEl.value];
@@ -1034,6 +1150,7 @@
     await reflectionsHalfOnce(slot > 1 ? `profile-${slot}` : "profile");
     await overlayOffOnce(slot > 1 ? `profile-${slot}` : "profile");
     capPhoneResolution();
+    markRunning();
     root.remove();
     // Online gives both: free roam with others (net.js, the relay room) and the game's own
     // Online mode (lan.js: the server's virtual LAN at /lan; the game signs in under the name).

@@ -264,6 +264,7 @@ async function reportStartupFailure(error) {
   const full = error?.name === "QuotaExceededError" || /quota|not enough storage|ran out of storage/i.test(String(error?.message || error));
   if (!full) return reportFailure("startup", error);
   if (!/does not have enough storage/i.test(String(error?.message || ""))) {
+    diagnostics.storageError = errorDetails(error);
     let free;
     try {
       const estimate = await navigator.storage.estimate();
@@ -452,6 +453,7 @@ async function prepareStream(game) {
       return await new Promise((resolve, reject) => {
         worker.onerror = () => reject(new Error("Could not prepare game files. Try Play again."));
         worker.onmessage = ({ data }) => {
+          if (data.diagnostic?.phase === "stream-cache") { diagnostics.streamCache = data.diagnostic; return; }
           if (data.diagnostic) { noteDownload(data.diagnostic); return; }
           if (data.progress) {
             const p = data.progress;
@@ -489,6 +491,30 @@ async function prepareStream(game) {
     } finally {
       worker.terminate();
     }
+  }
+}
+
+// The streamed-file cache is only a copy of downloadable bytes. When browser storage is
+// full at startup, delete it and try the step once more instead of stopping the game.
+function storageFullError(error) {
+  return error?.name === "QuotaExceededError" || /quota|not enough storage|ran out of storage|no space available/i.test(String(error?.message || error));
+}
+async function clearStreamCache() {
+  try {
+    if (!self.caches || !await caches.has("recomp-stream-v1")) return false;
+    const entries = (await (await caches.open("recomp-stream-v1")).keys()).length;
+    if (!entries || !await caches.delete("recomp-stream-v1")) return false;
+    diagnostics.streamCacheCleared = { entries, phase: startupPhase, at: new Date().toISOString() };
+    return true;
+  } catch { return false; }
+}
+async function withStreamCacheRetry(step) {
+  try { return await step(); }
+  catch (error) {
+    if (!storageFullError(error) || !await clearStreamCache()) throw error;
+    console.warn("[browser] browser storage was full: deleted the streamed-file cache, trying again");
+    status("Freeing browser storage…");
+    return await step();
   }
 }
 
@@ -687,7 +713,7 @@ async function start(options = {}) {
   if (!complete && game.streamAssets && game.downloadManifest) {
     startup("preparing game files");
     status("Loading game…");
-    stream = await prepareStream(game);
+    stream = await withStreamCacheRetry(() => prepareStream(game));
   } else if (!complete) throw new Error(`Import ${game.title} from the launcher before playing.`);
   window.carbonTestAssets = { NIS: !!stream };
   if (!stream) {
@@ -704,7 +730,7 @@ async function start(options = {}) {
       let installer;
       try { installer = await import(new URL("./custom-install.js", document.baseURI).href); }
       catch (error) { error.customizationOptional = !!stream; throw error; }
-      const result = await installer.prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"});
+      const result = await withStreamCacheRetry(() => installer.prepareCustomization(status, {stream: !!stream, streamBase: stream?.base, assetBase: ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "./custom-assets/" : "https://assets.nfscrb.xyz/customization/5911a37d9f9bc652b3fa457127273970b0d2a5e0e87c7081fb789a2c05439dbc/"}));
       if (result?.skipped?.length) {
         diagnostics.customizationSkipped = result.skipped;
         addonNotice(`Custom parts for ${result.skipped.map(unitName).join(", ")} could not be installed, so ${result.skipped.length > 1 ? "they use" : "it uses"} the original parts this time. Press Play again later to retry.`);

@@ -84,6 +84,14 @@ function decodeBinary(b) {
     return { t: "where", bin: true, bytes: b, p };
   }
   if (b[0] === 3) return { t: "cops", bin: true, bytes: b, id: b.readUInt32LE(2), n: b[1], ts: b.readUInt32LE(6) };
+  if (b[0] === 4) { // Where, version 2: u32 id, i16 x, i16 z, u16 heading | state << 9
+    const p = [];
+    for (let at = 1; at < b.length; at += 10) {
+      const hs = b.readUInt16LE(at + 8);
+      p.push([b.readUInt32LE(at), b.readInt16LE(at + 4), b.readInt16LE(at + 6), hs & 0x1ff, hs >> 9]);
+    }
+    return { t: "where", bin: true, v: 2, bytes: b, p };
+  }
   return { t: "binary", bin: true, bytes: b };
 }
 
@@ -136,7 +144,7 @@ async function connect(t, relay, room = "lobby", name, physics = false, bin = fa
 const MP_MORE = 0x18f0, MP_MORE_SLOT0 = 0x1940, MP_MORE_LABELS = 0x2540;
 const mpSlotAt = (i) => (i < 8 ? 0x60 + i * 0x100 : MP_MORE_SLOT0 + (i - 8) * 0x100);
 const mpLabelAt = (i) => (i < 8 ? 0x860 + i * 16 : MP_MORE_LABELS + (i - 8) * 16);
-async function gameLink(t, relay, name, crew = "", { more = false } = {}) {
+async function gameLink(t, relay, name, crew = "", { more = false, script } = {}) {
   let blob;
   const captured = new Error("worker captured");
   const page = vm.createContext({
@@ -145,7 +153,7 @@ async function gameLink(t, relay, name, crew = "", { more = false } = {}) {
     URL: { createObjectURL: (value) => value },
     Worker: class { constructor(value) { blob = value; throw captured; } },
   });
-  const clientScript = process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
+  const clientScript = script || process.env.CARBON_NET_SCRIPT || new URL("../../source/web/net.js", import.meta.url);
   assert.throws(() => vm.runInContext(fs.readFileSync(clientScript, "utf8"), page), (e) => e === captured);
   const timers = [], timeouts = [], sockets = [], posted = [];
   let now = 1000, holdModels = false;
@@ -1077,6 +1085,37 @@ test("interest: each player gets its K nearest cars, sets do not flap, and a car
   assert.equal(a.messages.some((m) => m.t === "look" || m.t === "pose"), false);
 });
 
+test("interest: a picked player in a menu keeps its place while it sends; past KEEP_RANGE the hold ends", async (t) => {
+  // logs/no-vanish-20261106: the game keeps a paused friend's car standing; the relay must not drop it then.
+  const relay = await start(t, { CARBON_INTEREST_K: "1" });
+  const r = await join(t, relay, "R"), a = await join(t, relay, "A"), b = await join(t, relay, "B");
+  r.send(still(0)); a.send(still(100)); b.send(still(400));
+  await interestTick();
+  // A goes into a menu (m 0, still sending); B drives nearer than A, but not clearly nearer (60 m against 100 m).
+  a.send(still(100, 0, { m: 0, ts: 2000 })); b.send(still(60, 0, { ts: 2000 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x, m] of [[a, 100, 0], [b, 60, 1]]) { p.send(still(x, 0, { m, ts: 2100 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "A in its menu keeps its place");
+  // B right beside R (20 m, clearly nearer than A's 100 m): it takes the place.
+  b.send(still(20, 0, { ts: 2200 }));
+  await until(() => posesFrom(r, b).length, "B picked");
+  // A stops sending altogether: after ACTIVE_MS it would come last anyway (not tested here: 5 s).
+  // KEEP_RANGE: B (picked) drives off to 1100 m; A drives again at 700 m. At half B's distance B would stay;
+  // past 1000 m it counts whole, so A (700 m) takes the place.
+  b.send(still(1100, 0, { ts: 2300 })); a.send(still(700, 0, { ts: 2300 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x] of [[a, 700], [b, 1100]]) { p.send(still(x, 0, { ts: 2400 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "past KEEP_RANGE the nearer player");
+  // Within KEEP_RANGE the hold stands: A (picked, 900 m) stays against B at 600 m.
+  a.send(still(900, 0, { ts: 2500 })); b.send(still(600, 0, { ts: 2500 }));
+  await interestTick();
+  r.messages.length = 0;
+  for (const [p, x] of [[a, 900], [b, 600]]) { p.send(still(x, 0, { ts: 2600 })); await sync(p, r); }
+  assert.deepEqual([posesFrom(r, a).length, posesFrom(r, b).length], [1, 0], "within KEEP_RANGE the pick holds");
+});
+
 test("interest: crew-mates within 1000 m come first, followed players before everyone", async (t) => {
   const relay = await start(t, { CARBON_INTEREST_K: "1" });
   const r = await join(t, relay, "R", "Night Owls");
@@ -1161,6 +1200,136 @@ test("the map feed: everyone driving, once a second, in whole metres and degrees
   watcher.messages.length = 0;
   const next = await until(() => watcher.messages.find((m) => m.t === "where"), "the next feed");
   assert.deepEqual(next, { t: "where", p: expected });
+});
+
+// ---- Where, version 2 (the relay header's "Where, version 2") ----
+const presence = (a, s = 0) => ({ t: "race", k: "presence", v: 1, a, s, ts: 100 });
+const byId = (list) => [...list].sort((a, b) => a[0] - b[0]);
+
+test("the map feed, version 2: everyone in free roam with a state; pages from before get the drivers as before", async (t) => {
+  const relay = await start(t, { CARBON_INTEREST_K: "1" });
+  const oldJson = await join(t, relay, "Old JSON");
+  const oldBin = await connect(t, relay, "lobby", "Old binary", false, true);
+  const v2Json = await connect(t, relay, "lobby", "New JSON", false, false, { where: 2 });
+  const v2Bin = await connect(t, relay, "lobby", "New binary", false, true, { where: 2 });
+  assert.equal(oldJson.welcome.where, undefined, "a page that does not ask gets the old feed");
+  assert.equal(v2Json.welcome.where, 2);
+  assert.equal(v2Bin.welcome.where, 2);
+  const driver = await join(t, relay, "Driver"), paused = await join(t, relay, "Paused"), hidden = await join(t, relay, "Hidden");
+  const menu = await join(t, relay, "Menu"), racer = await join(t, relay, "Racer"), away = await join(t, relay, "Away");
+  const quarter = Math.SQRT1_2;
+  menu.send(still(1, 1, { m: 0 }));                                   // never drove in free roam: not listed
+  hidden.send(still(400.4, -400.6, { ts: 7000 }));
+  await sync(hidden, v2Json);
+  hidden.send(still(999, 999, { m: 0, ts: 7001 }));                   // the tab hidden: m 0, the place stays
+  racer.send(still(10, 10, { ts: 100 }));
+  racer.send(presence("race", 5));                                    // racing: left out of version 2
+  away.send(presence("away"));                                        // presence away (front end, loading)
+  for (let i = 0; i < 9; i++) {                                       // 3.6 s: the paused clock stands still
+    driver.send(still(100, 200, { ts: 1000 + 400 * i }));
+    paused.send(still(-300, 50, { ts: 5000 }, [0, quarter, 0, quarter]));
+    racer.send(still(3000, 3000, { ts: 200 + 400 * i }));
+    away.send(still(20, 20, { ts: 300 + 400 * i }));
+    await delay(400);
+  }
+  for (const c of [oldJson, oldBin, v2Json, v2Bin]) c.messages.length = 0;
+  const id = (c) => c.welcome.id;
+  const want2 = byId([[id(driver), 100, 200, 0, 1], [id(paused), -300, 50, 90, 2], [id(hidden), 400, -401, 0, 3], [id(away), 20, 20, 0, 3]]);
+  const got2 = await until(() => v2Json.messages.find((m) => m.t === "where"), "the version-2 JSON feed");
+  assert.deepEqual(byId(got2.p), want2, "driving 1, paused 2, hidden 3, presence away 3; no racer, no menu player");
+  const bin2 = await until(() => v2Bin.messages.find((m) => m.t === "where"), "the version-2 binary feed");
+  assert.equal(bin2.v, 2, "type 4");
+  assert.equal(bin2.bytes.length, 1 + 10 * want2.length);
+  assert.deepEqual(bin2.p, got2.p, "binary and JSON: the same players, places, headings and states, in the same order");
+  // The pages from before: as before, the players driving now (racer and presence-away ones too), 4 numbers each.
+  const want1 = byId([[id(driver), 100, 200, 0], [id(paused), -300, 50, 90], [id(racer), 3000, 3000, 0], [id(away), 20, 20, 0]]);
+  const got1 = await until(() => oldJson.messages.find((m) => m.t === "where"), "the old JSON feed");
+  assert.deepEqual(byId(got1.p), want1);
+  const bin1 = await until(() => oldBin.messages.find((m) => m.t === "where"), "the old binary feed");
+  assert.equal(bin1.v, undefined, "type 2");
+  assert.equal(bin1.bytes.length, 1 + 14 * want1.length);
+  assert.deepEqual(bin1.p, got1.p);
+  // Back from the race: free-roam poses put the racer on the version-2 map again, driving.
+  racer.send(presence("roam"));
+  racer.send(still(-50, -60, { ts: 9000 }));
+  await sync(racer, v2Json);
+  v2Json.messages.length = 0;
+  const back = await until(() => v2Json.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === id(racer))), "the racer back");
+  assert.deepEqual(back.p.find((e) => e[0] === id(racer)), [id(racer), -50, -60, 0, 1]);
+});
+
+test("the map feed, version 2: a place older than CARBON_WHERE_KEEP drops off; driving again brings it back", async (t) => {
+  const relay = await start(t, { CARBON_WHERE_KEEP: "1" });
+  const watcher = await connect(t, relay, "lobby", "Watcher", false, true, { where: 2 });
+  const a = await join(t, relay, "A"), b = await join(t, relay, "B");
+  a.send(still(10, 20, { ts: 100 }));
+  b.send(still(30, 40, { ts: 100 }));
+  await sync(a, watcher); await sync(b, watcher);
+  a.send(still(10, 20, { m: 0, ts: 101 }));                           // into the menus
+  await sync(a, watcher);
+  watcher.messages.length = 0;
+  const first = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.length === 2), "both listed");
+  assert.equal(first.p.find((e) => e[0] === a.welcome.id)[4], 3, "A away");
+  // 2.8 s on: A's last free-roam place is too old; B keeps sending its pose, its clock standing still.
+  for (let i = 0; i < 7; i++) { b.send(still(30, 40, { ts: 100 })); await delay(400); }
+  await sync(b, watcher);
+  watcher.messages.length = 0;
+  const later = await until(() => watcher.messages.find((m) => m.t === "where"), "the next feed");
+  assert.deepEqual(later.p.map((e) => e[0]), [b.welcome.id], "A dropped; B stays (its place is refreshed by each m 1 pose)");
+  assert.equal(later.p[0][4], 2, "B's clock stood still past 2.5 s: paused");
+  a.send(still(11, 21, { ts: 200 }));
+  await sync(a, watcher);
+  watcher.messages.length = 0;
+  const again = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === a.welcome.id)), "A back");
+  assert.deepEqual(again.p.find((e) => e[0] === a.welcome.id), [a.welcome.id, 11, 21, 0, 1]);
+});
+
+test("game workers read the version-2 feed (JSON and binary) and pass non-driving players on; a hidden tab reports away", async (t) => {
+  for (const bin of [1, 0]) {
+    const relay = await start(t, { CARBON_RELAY_BIN: String(bin) });
+    const g = await gameLink(t, relay, "G");
+    const watcher = await connect(t, relay, "lobby", "Watcher", false, true, { where: 2 });
+    const driver = await join(t, relay, "Driver"), parked = await join(t, relay, "Parked");
+    driver.send(still(100, 200, { ts: 2000 }));
+    parked.send(still(-30, 40, { ts: 2000 }));
+    await sync(parked, driver);
+    parked.send(still(-30, 40, { m: 0, ts: 2001 }));                   // out of the car
+    g.publish(1500); g.tick();                                          // G drives, then its tab is hidden
+    await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === g.id && e[4] === 1)), "G driving");
+    g.post({ t: "visibility", hidden: true });
+    g.tick(40);
+    const seen = await until(() => watcher.messages.find((m) => m.t === "where" && m.p.some((e) => e[0] === g.id && e[4] === 3)), "G away");
+    assert.deepEqual(seen.p.find((e) => e[0] === g.id), [g.id, 12, -40, 0, 3], `hidden tab: away at its last place (bin ${bin})`);
+    driver.send(still(100, 200, { ts: 2400 }));
+    g.posted.length = 0;
+    const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length === 2), "the worker's map list");
+    assert.deepEqual(byId(Array.from(where.p, (e) => Array.from(e))),
+      byId([[driver.welcome.id, 100, 200, 0, 1], [parked.welcome.id, -30, 40, 0, 3]]), `the worker keeps the parked player, marked (bin ${bin})`);
+  }
+});
+
+test("a page from before (net.js of 2026-11-06 ee13152) still gets its 4-number feed of drivers from this relay", async (t) => {
+  let old;
+  try {
+    old = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "where-old-")), "net.js");
+    fs.writeFileSync(old, (await import("node:child_process")).execFileSync("git", ["show", "ee13152:source/web/net.js"],
+      { cwd: fileURLToPath(new URL("../..", import.meta.url)) }));
+  } catch { t.skip("git or commit ee13152 not available"); return; }
+  for (const bin of [1, 0]) {
+    const relay = await start(t, { CARBON_RELAY_BIN: String(bin) });
+    const g = await gameLink(t, relay, "Old G", "", { script: old });
+    const driver = await join(t, relay, "Driver"), parked = await join(t, relay, "Parked");
+    // Someone else asks for version 2 in the same room: the old page's feed must not change.
+    await connect(t, relay, "lobby", "New", false, true, { where: 2 });
+    driver.send(still(100, 200, { ts: 2000 }));
+    parked.send(still(-30, 40, { ts: 2000 }));
+    await sync(parked, driver);
+    parked.send(still(-30, 40, { m: 0, ts: 2001 }));
+    await sync(parked, driver);
+    g.posted.length = 0;
+    const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length >= 1), "the old worker's list");
+    assert.deepEqual(Array.from(where.p, (e) => Array.from(e)), [[driver.welcome.id, 100, 200, 0]], `drivers only, 4 numbers (bin ${bin})`);
+  }
 });
 
 test("chat reaches the whole room without driving; the horn stays nearby or crew", async (t) => {
@@ -1259,7 +1428,8 @@ test("game workers prioritize nearest players and racers, ignore legacy crew tag
   // The where feed reaches the page, without this player.
   const where = await until(() => g.posted.find((x) => x.t === "where" && x.p.length === bots.size), "the where feed");
   assert.equal(where.p.some((e) => e[0] === g.id), false);
-  assert.deepEqual(Array.from(where.p.find((e) => e[0] === bots.get(10).welcome.id)), [bots.get(10).welcome.id, 22, -40, 0]);
+  // This page asks for the version-2 feed: a state follows, 1 = driving.
+  assert.deepEqual(Array.from(where.p.find((e) => e[0] === bots.get(10).welcome.id)), [bots.get(10).welcome.id, 22, -40, 0, 1]);
 });
 
 test("a game with 20 car slots (MpMore) fills all of them, looks too, and hears who left the room", async (t) => {
@@ -1336,7 +1506,7 @@ test("the world map shows 10 players: crew-mates first, then the nearest, at the
   const people = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i >= 10 ? "OWLS" : "", crewId: i >= 10 ? "verified-owls" : null }));
   const feed = (moves = {}) => people.map((p) => [p.id, moves[p.id] ?? 100 * p.id, 0, 90]);
   const page = vm.createContext({
-    performance: { now: () => clock }, setInterval() {}, Atomics,
+    performance: { now: () => clock }, setInterval() {}, requestAnimationFrame() {}, Atomics,
     addEventListener: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
     carbonWorldMapBlock: { memory: { buffer }, ptr: 0 },
     recompOnlineState: { open: true, crew: "Owls", crewId: "verified-owls", people, slotIds: [3, 4, 0, 0, 0, 0, 0, 0] },
@@ -1374,6 +1544,35 @@ test("the world map shows 10 players: crew-mates first, then the nearest, at the
   fire("carbon-worldmap");
   assert.deepEqual(Array.from({ length: 8 }, (_, i) => u32[(0x10 + i * 0x20) / 4]), [1, 2, 3, 4, 5, 6, 7, 8]);
   assert.equal(page.recompWorldMap().shown, u32[0x110 / 4]);
+});
+
+test("the world map prefers drivers for its 10 arrows; with the page's markers (version 3) they are for drivers only", () => {
+  const clock = 1000;
+  const listeners = new Map();
+  const buffer = new SharedArrayBuffer(0x400), u32 = new Uint32Array(buffer);
+  u32[0] = 0x32504d57; u32[1] = 2;
+  const people = Array.from({ length: 14 }, (_, i) => ({ id: i + 1, name: `P${i + 1}`, crew: i === 13 ? "OWLS" : "", crewId: i === 13 ? "verified-owls" : null }));
+  // 1-6 driving (5 numbers, state 1, and 4 without: a relay from before), 7-13 paused or away and nearer, 14 a paused crew-mate.
+  const feed = people.map((p) => p.id <= 3 ? [p.id, 1000 * p.id, 0, 0, 1] : p.id <= 6 ? [p.id, 1000 * p.id, 0, 0] : [p.id, 10 * p.id, 0, 0, p.id % 2 ? 2 : 3]);
+  const page = vm.createContext({
+    performance: { now: () => clock }, setInterval() {}, requestAnimationFrame() {}, Atomics,
+    addEventListener: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
+    carbonWorldMapBlock: { memory: { buffer }, ptr: 0 },
+    recompOnlineState: { open: true, crew: "Owls", crewId: "verified-owls", people, slotIds: [7, 0, 0, 0, 0, 0, 0, 0] },
+    recompCrewKey: (c) => String(c || "").toLowerCase().replace(/\s+/g, ""),
+    recompCrewColor: (c) => (c ? "#ff66cc" : ""),
+    recompOnlineSelf: () => [0, 3, 0],
+    recompOnlineWhere: { at: clock, p: feed },
+  });
+  page.window = page;
+  vm.runInContext(fs.readFileSync(new URL("../../source/web/worldmap.js", import.meta.url), "utf8"), page);
+  const fire = (type) => { for (const fn of listeners.get(type) || []) fn({}); };
+  const ids = () => Array.from({ length: 10 }, (_, i) => u32[(0x10 + i * 0x30) / 4]);
+  fire("recomp-online");
+  assert.deepEqual(ids(), [1, 2, 3, 4, 5, 6, 14, 7, 8, 9], "a version-2 game (arrows only): the drivers, then the others (crew first, then nearest)");
+  u32[1] = 3; // the page draws markers for everyone without an arrow
+  fire("carbon-worldmap");
+  assert.deepEqual(ids(), [1, 2, 3, 4, 5, 6, 0, 0, 0, 0], "version 3: drivers only (7 in a slot but paused: a marker too)");
 });
 
 // ---- Compact poses: binary frames for pages that ask in their hi (see the relay header) ----
@@ -1617,6 +1816,25 @@ async function copsJoin(t, relay, name, hi) {
   return client;
 }
 
+test("player vehicles: blocked JSON and binary models disconnect while normal road cars remain usable", async (t) => {
+  const relay = await start(t);
+  const observer = await connect(t, relay, "vehicle-policy", "Observer", false, true);
+  const cases = [
+    ["fire truck", 0xacd9eea7], ["police", 0xbb9b2938],
+    ["traffic van", 0xdbb93c72], ["demo Gallardo", 0xc1b2de36],
+  ];
+  for (const binary of [false, true]) for (const [name, k] of cases) {
+    const actor = await connect(t, relay, "vehicle-policy", `${name}${binary ? "B" : "J"}`, false, binary);
+    actor.send({ ...pose, k: 0x4e085fb3 }); // legitimate bonus BMW M3 GTR
+    assert.equal((await observer.read("pose", actor.welcome.id)).k, 0x4e085fb3);
+    if (binary) actor.ws.send(binaryPose({ k, n: [0, 0, 0, 32767, 12000, 3000, -40000, 500, 0, 0, 0, 0, 0] }));
+    else actor.send({ ...pose, k });
+    await until(() => actor.ws.readyState === WebSocket.CLOSED, `blocked ${name} (${binary ? "binary" : "JSON"})`);
+    await observer.read("left", actor.welcome.id);
+    assert.equal(observer.messages.some(m => m.t === "pose" && m.k === k), false, "blocked car was never forwarded");
+  }
+});
+
 test("police chases: cops frames reach nearby players who asked, checked and rate-limited; old pages get none", async (t) => {
   const relay = await start(t);
   const ana = await copsJoin(t, relay, "Ana", { bin: 1, cops: 1 });
@@ -1630,7 +1848,7 @@ test("police chases: cops frames reach nearby players who asked, checked and rat
   assert.equal(json.welcome.cops, undefined);
   for (const c of [ana, ben, old, json]) c.send(still(10));
   await sync(ana, ben);
-  const frame = copsFrame([{ c: 1 }, { c: 7, f: 0x21, k: 0xdeadbeef, p: [20, 3, -45] }]);
+  const frame = copsFrame([{ c: 1 }, { c: 7, f: 0x21, k: 0xbb9b2938, p: [20, 3, -45] }]);
   ana.ws.send(frame);
   const got = await ben.read("cops");
   assert.equal(got.id, ana.welcome.id);

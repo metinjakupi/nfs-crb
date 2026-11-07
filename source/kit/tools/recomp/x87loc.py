@@ -265,7 +265,11 @@ def rewrite_function(name, lines):
     flush()
     return outl
 
-fn_re = re.compile(r'^((?:static )?(?:RECOMP_\w+ )*(?:void|uint32_t) (?:fn|body)_[0-9a-f]{8}\(X86 \*c[^)]*\) \{)$')
+# fn_XXXXXXXX(X86 *c) and the shared bodies of multi-entry functions, whose signature translate.py
+# spells as the RECOMP_BODY_ARGS macro (X86 *c, or X86 *c, uint32_t entry_). The macro form was
+# missed until 2026-11-06: 2,959 bodies holding a third of the image's x87 stack operations.
+fn_re = re.compile(r'^((?:static )?(?:RECOMP_\w+ )*(?:void|uint32_t) (?:fn|body)_[0-9a-f]{8}'
+                   r'\((?:X86 \*c[^)]*|RECOMP_BODY_ARGS)\) \{)$')
 out.mkdir(parents=True, exist_ok=True)
 for f in sorted(gen.glob('chunk_*.c')):
     lines = f.read_text().split('\n')

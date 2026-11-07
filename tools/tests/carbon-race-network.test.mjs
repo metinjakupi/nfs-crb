@@ -10,12 +10,19 @@ const source = await readFile(process.env.CARBON_RACE_SOURCE || new URL("../../s
 const PHASE = { idle: 0, holding: 3, racing: 4, done: 5 };
 
 class El {
-  constructor() { this.kids = []; this.className = ""; this.hidden = false; this.textContent = ""; this.style = {}; }
-  append(...k) { this.kids.push(...k); }
+  constructor() {
+    this.kids = []; this.className = ""; this.hidden = false; this.textContent = ""; this.innerHTML = ""; this.attrs = {};
+    this.style = { setProperty: (k, v) => { this.style[k] = v; } };
+    this.classList = { toggle: (c, on) => { const l = this.className.split(" ").filter((x) => x && x !== c); if (on) l.push(c); this.className = l.join(" "); } };
+  }
+  append(...k) { this.kids.push(...k.map((x) => (typeof x === "string" ? Object.assign(new El(), { textContent: x }) : x))); }
   replaceChildren(...k) { this.kids = k; }
+  get children() { return this.kids; }
   get childElementCount() { return this.kids.length; }
-  setAttribute() {}
+  setAttribute(k, v) { this.attrs[k] = v; }
   addEventListener(n, f) { this[`on${n}`] = f; }
+  // The first descendant with this class (".x") or text.
+  querySelector(sel) { for (const k of this.kids) { if (sel.startsWith(".") && k.className.split(" ").includes(sel.slice(1).split(" ").pop())) return k; const f = k.querySelector?.(sel); if (f) return f; } return null; }
   find(text) { for (const k of this.kids) { if (k.kids?.some((c) => c.textContent === text)) return k; const f = k.find?.(text); if (f) return f; } return null; }
 }
 
@@ -265,19 +272,134 @@ test("invites show in the menus after a race, while the game's racing flag is st
   assert.equal(g.state().invites.length, 1);
 });
 
-test("the host can start without a slow player after 15 s", () => {
-  const g = inRace(1, "loaded");
+test("race start: the timer starts with the first player loaded, and when it runs out the slow one starts late", () => {
+  const g = inRace(1, "loaded"); // the host's game is loaded; the guest's is not
   g.say({ k: "ready", id: 1, race: 50 });
   g.run(100);
-  assert.equal(g.body.find("Start without Guest"), null, "not at once");
-  for (let i = 0; i < 160; i++) g.run(100);
-  const b = g.body.find("Start without Guest");
-  assert.ok(b, "offered after 15 s");
-  b.onclick({ preventDefault() {} });
-  assert.deepEqual([...g.sent.findLast((m) => m.k === "go").without], [2]);
-  g.say({ k: "go", id: 1, race: 50, without: [2] });
+  let v = g.state() && g.ctx.recompRace.startView();
+  assert.match(v.timer.head, /^Race starts in 1[45]$/);
+  assert.equal(v.timer.sub, "Waiting for 1 player to load");
+  for (let i = 0; i < 140; i++) g.run(100); // 14.1 s
+  assert.equal(g.count("go"), 0, "not before the timer ends");
+  assert.equal(g.body.find("Start without Guest"), null, "no button: the timer starts it");
+  for (let i = 0; i < 10; i++) g.run(100);
+  const go = g.sent.findLast((m) => m.k === "go");
+  assert.ok(go, "the go at 15 s");
+  assert.deepEqual([...go.late], [2], "the guest starts late");
+  assert.deepEqual([...go.without], [2], "and is in without, for older pages");
+  g.say({ ...go, id: 1 });
   assert.equal(g.state().race.went, true);
-  assert.equal(g.state().standings.find(([id]) => id === 2)[1].done, true, "the one left out is out of the results");
+  const s2 = g.state().standings.find(([id]) => id === 2)[1];
+  assert.equal(s2.done, false, "a late player is not given up on");
+  assert.equal(s2.left, undefined, "nor grey");
+  for (let i = 0; i < 20; i++) g.run(100);
+  assert.deepEqual([...g.sent.findLast((m) => m.k === "go").late], [2], "the repeats carry late too");
+});
+
+test("race start: the timer is the host's (wait in the start), and ends early when everyone is loaded", () => {
+  const g = game(1);
+  g.say({ ...start, wait: 30 });
+  g.phase(PHASE.holding, 50);
+  g.run(100);
+  g.say({ k: "ready", id: 1, race: 50 });
+  for (let i = 0; i < 200; i++) g.run(100);
+  assert.equal(g.count("go"), 0, "20 s of a 30 s timer");
+  assert.match(g.ctx.recompRace.startView().timer.head, /^Race starts in 1[01]$/);
+  g.say({ k: "ready", id: 2, race: 50 });
+  g.run(100);
+  const go = g.sent.findLast((m) => m.k === "go");
+  assert.ok(go && !go.late, "everyone is loaded: the usual go, at once");
+});
+
+test("race start: a Canyon Duel has no timer", () => {
+  const g = game(1);
+  g.say({ ...start, type: 13 });
+  g.phase(PHASE.holding, 50);
+  g.run(100);
+  g.say({ k: "ready", id: 1, race: 50 });
+  for (let i = 0; i < 300; i++) g.run(100);
+  assert.equal(g.count("go"), 0);
+  assert.equal(g.ctx.recompRace.startView().timer.head, "Waiting for Guest");
+});
+
+test("race start: a late player's game starts late, behind the grid, not left out", () => {
+  const g = game(2);
+  g.say(start);
+  g.phase(1, 50); // still loading the track
+  g.run(100);
+  assert.deepEqual({ ...g.sent.findLast((m) => m.k === "load") }, { race: 50, p: 1, t: "race", k: "load" }, "says how far it has got");
+  g.say({ k: "go", id: 1, race: 50, without: [2], late: [2] });
+  g.run(100);
+  assert.equal(g.state().race.cancelled, undefined, "not left out");
+  assert.equal(g.state().race.went, true);
+  assert.ok(g.u32[(0x0c + 0x04) >> 2] & 0x10, "the game is told it starts late");
+  assert.equal(g.u32[(0x0c + 0x0c) >> 2], 3, "behind the grid: two slots past the last");
+  assert.equal(g.u32[(0x0c + 0x14) >> 2], 50, "go: its game lets go as soon as it has loaded");
+  let v = g.ctx.recompRace.startView();
+  assert.equal(v.timer.head, "The race has started");
+  assert.equal(v.rows.find((r) => r.me).text, "loading…");
+  g.phase(PHASE.racing, 50);
+  g.run(100);
+  assert.equal(g.count("ready"), 1, "its ready, for the others");
+  g.u32[0x2b4 >> 2] = 1; g.u32[0x2d0 >> 2] = 0; g.u32[(0x2d0 + 24) >> 2] = 1; g.u32[(0x2d0 + 28) >> 2] = 1; // its own row, passing through
+  g.run(100);
+  assert.equal(g.ctx.recompRace.startView().rows.find((r) => r.me).text, "late 👻");
+  g.u32[(0x2d0 + 28) >> 2] = 0; // clear of the others
+  g.run(100);
+  assert.equal(g.ctx.recompRace.startView(), null, "nothing left to show");
+});
+
+test("race start: the others keep a late player's car off the road until they have loaded, then it passes through", () => {
+  const g = inRace(1, "loaded");
+  g.say({ k: "ready", id: 1, race: 50 });
+  for (let i = 0; i < 160; i++) g.run(100);
+  g.say({ ...g.sent.findLast((m) => m.k === "go"), id: 1 });
+  g.phase(PHASE.racing, 50);
+  g.run(100);
+  assert.equal(g.u32[PEER0_DONE >> 2], 4 | 8, "off the road while loading");
+  let row = g.ctx.recompRace.startView().rows.find((r) => r.name === "Guest");
+  assert.deepEqual([row.k, row.text, row.dim].map(String), ["loading", "loading…", "true"], "dim, loading");
+  // Their ready (sent once after the go) is lost; their first progress says they are in.
+  g.say({ k: "progress", id: 2, race: 50, place: 2, lap: 0, pct: 0.1, ms: 5 });
+  g.run(100);
+  assert.equal(g.u32[PEER0_DONE >> 2], 8, "on the road, passing through");
+  g.u32[0x2b4 >> 2] = 1; g.u32[0x2d0 >> 2] = 2; g.u32[(0x2d0 + 28) >> 2] = 1;
+  g.run(100);
+  row = g.ctx.recompRace.startView().rows.find((r) => r.name === "Guest");
+  assert.deepEqual([row.k, row.text].map(String), ["late", "late 👻"]);
+  assert.equal(g.ctx.recompRaceTagNote(2), "LATE 👻", "its name tag says so");
+  g.u32[(0x2d0 + 28) >> 2] = 0;
+  g.run(100);
+  assert.equal(g.ctx.recompRace.startView().rows, null, "solid: a normal racer, no list");
+  for (let i = 0; i < 40; i++) g.run(100);
+  assert.equal(g.ctx.recompRace.startView(), null, "and the start line goes after 4 s");
+  assert.equal(g.ctx.recompRaceTagNote(2), "");
+});
+
+test("race start: before the go a loaded player's car is shown on its grid slot, and the game's tags are read", () => {
+  const g = inRace(1, "loaded");
+  assert.equal(g.u32[PEER0_DONE >> 2], 0, "the guest is loading: no car on the grid");
+  g.say({ k: "ready", id: 2, race: 50 });
+  g.run(100);
+  assert.equal(g.u32[PEER0_DONE >> 2], 16, "loaded: its car on its grid slot");
+  g.u32[0x458 >> 2] = 0x53474154; g.f32[0x45c >> 2] = 0.25; g.f32[0x460 >> 2] = 0.5; g.f32[0x464 >> 2] = 12;
+  assert.deepEqual({ ...g.state().game.tags[0] }, { x: 0.25, y: 0.5, depth: 12 });
+  g.say({ k: "ready", id: 1, race: 50 });
+  g.run(100);
+  g.say({ k: "go", id: 1, race: 50 });
+  g.run(100);
+  assert.equal(g.u32[PEER0_DONE >> 2], 0, "after the go the bit goes: race.h's go shows every car");
+});
+
+test("race start: the list says ready, the loading step, or left; only a player who left is grey", () => {
+  const g = loading3(1);
+  g.say({ k: "ready", id: 1, race: 50 });
+  g.say({ k: "load", id: 2, race: 50, p: 2 });
+  g.people([1, 2]); // the third leaves while loading
+  g.run(100);
+  const rows = JSON.parse(JSON.stringify(g.ctx.recompRace.startView().rows.map((r) => [r.name, r.k, r.text])));
+  assert.deepEqual(rows, [["Host", "ready", "ready ✓"], ["Guest", "loading", "loading cars"], ["Third", "left", "left"]]);
+  assert.ok(g.ctx.recompRace.startView().rows[0].me, "your row");
 });
 
 test("the loading timeout starts the race for those ready, not cancels it for all", () => {
@@ -298,7 +420,9 @@ test("a go still on its way is not cancelled by the next tick", () => {
 test("a host that is not loaded either still cancels at the timeout", () => {
   const g = game(1);
   g.say(start);
-  for (let i = 0; i < 620; i++) g.run(100);
+  for (let i = 0; i < 1180; i++) g.run(100);
+  assert.equal(g.count("cancel"), 0, "not before 120 s: nobody loaded yet is not a reason (race start)");
+  for (let i = 0; i < 40; i++) g.run(100);
   assert.equal(g.count("go"), 0);
   assert.ok(g.count("cancel") >= 1);
   assert.equal(g.state().race.cancelled, true);
@@ -322,8 +446,9 @@ test("a player left out in the menus is offered Dismiss, not a reload", () => {
   assert.equal(g.state().race, null);
 });
 
-test("the card minimizes while waiting and opens again", () => {
-  const g = inRace(1, "loaded");
+test("the card minimizes while waiting for results and opens again", () => {
+  const g = inRace(1);
+  g.u32[0x2cc >> 2] = 6 | 0x100; // finished: waiting for the others' results
   g.run(100);
   const min = g.body.find("Minimize");
   assert.ok(min);
@@ -726,4 +851,150 @@ test("a card's Leave and Not now still work after the host's repeats (found in t
   g.say(open(1, 71)); g.run(100);               // the host's repeat without us
   same(g.ctx.recompRace.openRaces().rows.map((r) => [r.race, r.joined, r.hidden]), [[71, false, true]]);
   same(g.ctx.recompRace.corner(), { cards: [], chip: 0 });
+});
+
+// ---- Drift: points after the finish, and every racer once (2026-11-06, logs/drift-rows-20261106) ----
+const PEER = 0x60, PEER_SIZE = 0x40, SCORE = 0x450, DNF = 0x454;
+const peerAt = (g, i) => ({ id: g.u32[(PEER + i * PEER_SIZE) >> 2], done: g.u32[(PEER + i * PEER_SIZE + 12) >> 2],
+  points: g.u32[(PEER + i * PEER_SIZE + 32) >> 2], time: g.f32[(PEER + i * PEER_SIZE + 16) >> 2] });
+function inDrift(me, people = roster, type = 11) {
+  const g = game(me);
+  g.say({ ...start, id: people[0].id, type, roster: people });
+  g.phase(PHASE.holding, 50);
+  g.run(100);
+  for (const p of people) g.say({ k: "ready", id: p.id, race: 50 });
+  g.run(100);
+  g.say({ k: "go", id: people[0].id, race: 50 });
+  g.phase(PHASE.racing, 50);
+  g.run(100);
+  return g;
+}
+
+for (const type of [11, 12]) test(`${type === 11 ? "Drift" : "Canyon Drift"}: points a finisher banks after the finish still count`, () => {
+  const g = inDrift(2, roster, type);
+  g.say({ k: "progress", id: 1, race: 50, score: 3900, dnf: false, pct: 90, lp: 90, rt: 30, ms: 1000 });
+  g.say({ k: "finish", id: 1, race: 50, score: 4100, dnf: false, time: 35.2 });
+  g.run(100);
+  assert.deepEqual([peerAt(g, 0).points, peerAt(g, 0).done & 1], [4100, 1]);
+  // The drift running at the line is banked after the finish: the same finish again, with more points.
+  g.say({ k: "finish", id: 1, race: 50, score: 5200, dnf: false, time: 35.2 });
+  g.run(100);
+  const s = g.state().standings.find(([id]) => id === 1)[1];
+  assert.equal(s.score, 5200, "the later points count (they were dropped: 4100 stayed)");
+  assert.equal(peerAt(g, 0).points, 5200, "and reach the game");
+  assert.equal(s.time, 35.2, "the finish time stays the first one");
+  // Progress after the finish, from the same player, counts the same way.
+  g.say({ k: "progress", id: 1, race: 50, score: 5300, dnf: false, pct: 100, lp: 100, rt: 40, ms: 2000 });
+  g.run(100);
+  assert.equal(peerAt(g, 0).points, 5300);
+  assert.equal(g.state().standings.find(([id]) => id === 1)[1].done, true, "still finished");
+});
+
+test("a non-drift finish is not changed by a later report", () => {
+  const g = inRace(2);
+  g.say({ k: "finish", id: 1, race: 50, time: 61.5 });
+  g.say({ k: "finish", id: 1, race: 50, time: 70 });
+  g.run(100);
+  assert.equal(g.state().standings.find(([id]) => id === 1)[1].time, 61.5);
+});
+
+test("Drift: this player's finish is sent again when its points change after the finish", () => {
+  const g = inDrift(2);
+  g.u32[SCORE >> 2] = 4100; g.u32[0x2a8 >> 2] = 1; g.f32[0x2b0 >> 2] = 35.2; // done, with its time and points
+  g.run(100);
+  const first = g.sent.filter((m) => m.k === "finish");
+  assert.equal(first.length, 1);
+  assert.equal(first[0].score, 4100);
+  g.u32[SCORE >> 2] = 5200; // DriftFinalizeScore banked the last drift
+  g.run(100);
+  const all = g.sent.filter((m) => m.k === "finish");
+  assert.equal(all.at(-1).score, 5200, "sent at once with the new points");
+  assert.equal(all.at(-1).time, 35.2);
+  for (let i = 0; i < 30; i++) g.run(100);
+  const later = g.sent.filter((m) => m.k === "finish").slice(all.length);
+  assert.ok(later.length >= 2 && later.every((m) => m.score === 5200), "and repeated with them, as the first was");
+  g.u32[DNF >> 2] = 1; // a failure flag that comes after the finish is passed on too
+  g.run(100);
+  assert.equal(g.sent.findLast((m) => m.k === "finish").dnf, true);
+});
+
+test("Drift: the points of a finish the relay dropped come with the next repeat", () => {
+  const g = inDrift(1);
+  g.say({ k: "finish", id: 2, race: 50, score: 2500, dnf: false, time: 40 });
+  g.say({ k: "finish", id: 2, race: 50, score: 2500, dnf: false, time: 40 }); // a plain repeat
+  g.run(100);
+  assert.equal(peerAt(g, 0).points, 2500);
+  g.say({ k: "finish", id: 2, race: 50, score: -5, dnf: false, time: 40 }); // never a bad value
+  g.run(100);
+  assert.equal(peerAt(g, 0).points, 2500);
+});
+
+test("every other racer is in the game's list once, never this player, with points and DNF", () => {
+  const five = [{ id: 7, name: "Ana", car: 1, grid: 0 }, { id: 2, name: "Ben", car: 1, grid: 1 }, { id: 3, name: "Cy", car: 1, grid: 2 },
+                { id: 4, name: "Dee", car: 1, grid: 3 }, { id: 5, name: "Eve", car: 1, grid: 4 }];
+  const g = inDrift(7, five, 12);
+  g.say({ k: "progress", id: 3, race: 50, score: 2500, dnf: false, pct: 9, lp: 9, rt: 9, ms: 1000 });
+  g.say({ k: "progress", id: 4, race: 50, score: 2500, dnf: false, pct: 9, lp: 9, rt: 9, ms: 1000 });
+  g.say({ k: "finish", id: 5, race: 50, score: 1200, dnf: true, time: 25 });
+  g.run(100);
+  assert.equal(g.u32[(0x0c + 0x10) >> 2], 4, "four others");
+  const peers = [0, 1, 2, 3].map((i) => peerAt(g, i));
+  assert.deepEqual(peers.map((p) => p.id), [2, 3, 4, 5], "each other racer once, in roster order, never this player (7)");
+  assert.equal(g.u32[(0x0c + 0x08) >> 2], 7, "this player is the block's own id");
+  assert.deepEqual(peers.map((p) => p.points), [0, 2500, 2500, (1200 | 0x80000000) >>> 0], "points, DNF in the high bit");
+  for (let i = 4; i < 8; i++) assert.equal(peerAt(g, i).id, 0, `slot ${i} empty`);
+});
+
+// ---- Canyon Duel: the other player's end decides this one (2026-11-06, logs/duel-trucks-20261106) ----
+const DUEL = 13, LOST = 0x80000000, WON = 0x40000000;
+const inDuel = (me) => inDrift(me, roster, DUEL);
+
+test("Duel: the other's points reach the game, and their finish says how their duel ended", () => {
+  const g = inDuel(1);
+  g.say({ k: "progress", id: 2, race: 50, score: 1350, dnf: false, pct: 3, lp: 3, rt: 9, ms: 1000 });
+  g.run(100);
+  assert.equal(peerAt(g, 0).points, 1350, "their duel points, no end bits while racing");
+  g.say({ k: "finish", id: 2, race: 50, score: 1500, dnf: true, duel: "lost", time: 9.5 });
+  g.run(100);
+  assert.equal(peerAt(g, 0).points, (1500 | LOST) >>> 0, "lost: bit 31");
+  assert.equal(peerAt(g, 0).done & 1, 1, "and their end is passed at once, before this player's own");
+  const h = inDuel(1);
+  h.say({ k: "finish", id: 2, race: 50, score: 2000, dnf: false, duel: "won", time: 12 });
+  h.run(100);
+  assert.equal(peerAt(h, 0).points, (2000 | WON) >>> 0, "won: bit 30");
+});
+
+test("Duel: an older page's finish (no outcome) sets neither end bit", () => {
+  const g = inDuel(1);
+  g.say({ k: "finish", id: 2, race: 50, score: 0, dnf: false, time: 9.5 });
+  g.run(100);
+  assert.equal(peerAt(g, 0).points & (LOST | WON), 0);
+  assert.equal(peerAt(g, 0).done & 1, 1);
+});
+
+test("Duel: this player's finish carries the outcome, and is sent again if it changes", () => {
+  const g = inDuel(2);
+  g.u32[SCORE >> 2] = 4689; g.u32[DNF >> 2] = 2; g.u32[0x2a8 >> 2] = 1; g.f32[0x2b0 >> 2] = 12.9; // won, done
+  g.run(100);
+  const f = g.sent.filter((m) => m.k === "finish");
+  assert.equal(f.length, 1);
+  assert.equal(f[0].duel, "won"); assert.equal(f[0].score, 4689);
+  g.u32[DNF >> 2] = 1;
+  g.run(100);
+  assert.equal(g.sent.findLast((m) => m.k === "finish").duel, "lost", "a changed outcome goes at once");
+});
+
+test("Duel: the other player leaving after the go makes them leave the road at once, and this player is told it wins", () => {
+  const g = inDuel(1);
+  g.say({ k: "leave", id: 2, race: 50 });
+  g.run(100);
+  assert.equal(peerAt(g, 0).done & 2, 2, "left bit: race.h gives this player the win");
+  assert.match(g.body.kids.map(function text(k) { return (k.textContent || "") + (k.kids || []).map(text).join(""); }).join(""), /left the duel: you win/);
+});
+
+test("Duel: quitting a duel in the middle tells the other player (a leave), as a world race does", () => {
+  const g = inDuel(2);
+  g.u32[0x2cc >> 2] = 3; g.phase(PHASE.idle, 50); g.u32[0x2cc >> 2] = 3;
+  g.run(100);
+  assert.equal(g.sent.findLast((m) => m.k === "leave")?.race, 50);
 });

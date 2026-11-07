@@ -7,14 +7,15 @@
  */
 static int g_race_drift_ready,g_drift_releasing,g_drift_ui_pending,g_drift_enter_pending;
 static uint32_t g_drift_component,g_drift_buffer,g_drift_me,g_drift_values[RACE_PEERS];
-static uint32_t g_drift_hooks[8];
+static uint32_t g_drift_hooks[12];
 static int g_drift_hit_logs; /* log lines of other cars' hits this race (race_drift_hit) */
+static uint32_t g_drift_order[RACE_PEERS+1],g_drift_order_n; /* records by rank (race_drift_order) */
 static int race_is_drift(void) {
  return g_race_session&&!g_race_encounter&&(g_race_type==11||g_race_type==12);
 }
 static void race_drift_clear(void) {
  g_drift_component=g_drift_me=0;g_drift_ui_pending=g_drift_enter_pending=0;g_drift_hit_logs=0;
- memset(g_drift_values,0,sizeof g_drift_values);
+ memset(g_drift_values,0,sizeof g_drift_values);g_drift_order_n=0;
 }
 static uint32_t race_drift_score(void) {
  const uint32_t points=race_is_drift()&&g_drift_me?get_u32(g_drift_me+0xc):0;
@@ -54,28 +55,46 @@ static void race_drift_no_simulation(const PopModApi *api,pop_cpu_v1 *cpu,PopHoo
  if(race_is_drift()){api->hook_return(api,cpu,0,0);return;}
  api->call_original(api,cpu->target,cpu);
 }
+/* ONE ORDER FOR EVERY LIST (2026-11-06, logs/drift-rows-20261106). The drift HUD on the right and the
+ * results' Standings take each row's name and points from the native rank map (scorer +0xec, rank ->
+ * key, rebuilt by 006bd3e0 from points, ties by key), but "you" (row highlight, DAL 0x41a index 0) from
+ * the record's rank (+8), and every lookup by position (DAL 0x41a/0x425, 004ca220) from the first racer
+ * row whose place (GRacerInfo +0x34) is that position. This file used to write ranks that shared ties
+ * and put every DNF on count+1 into +8 and +0x34 only: the three disagreed, two rows could hold the
+ * same place and a place could have nobody (seen: "Ben, Cy, Dee, Eve, Eve" with this player missing
+ * and the highlight on the second Eve). Now one strict order (finished attempts before DNFs, then
+ * points, then relay id: the same in every game) goes into all three, after every native re-rank. */
+static void race_drift_order(void) {
+ if(!race_is_drift()||!g_drift_component||!g_drift_me)return;
+ struct {uint32_t rec,id,points,failed;} e[RACE_PEERS+1],t;uint32_t n=0;
+ e[n].rec=g_drift_me;e[n].id=g_race_page.me;e[n].points=get_u32(g_drift_me+0xc);e[n++].failed=(uint32_t)race_drift_failed();
+ for(uint32_t i=0;i<g_race_page.count&&i<RACE_PEERS;i++)if(g_drift_values[i]) {
+  e[n].rec=g_drift_values[i];e[n].id=g_race_page.peers[i].id;e[n].points=get_u32(g_drift_values[i]+0xc);
+  e[n++].failed=g_race_page.peers[i].cp>>31; /* drift: points + high-bit DNF */
+ }
+ for(uint32_t i=1;i<n;i++)for(uint32_t j=i;j>0;j--) {
+  const int later=e[j-1].failed!=e[j].failed?e[j-1].failed>e[j].failed:e[j-1].points!=e[j].points?e[j-1].points<e[j].points:e[j-1].id>e[j].id;
+  if(!later)break;
+  t=e[j];e[j]=e[j-1];e[j-1]=t;
+ }
+ const uint32_t rs=race_status(),player=mp_player();const int mine=rs&&player?race_row_of(rs,player+0x24):-1;
+ for(uint32_t r=0;r<n;r++) {
+  g_drift_order[r]=e[r].rec;
+  mp_put(e[r].rec+8,r);
+  mp_put(g_drift_buffer+0xf0,r);
+  const uint32_t arg=g_drift_buffer+0xf0,key=mp_call(0x006b50c0,g_drift_component+0xec,&arg,1); /* map::operator[] -> &key */
+  if(key)mp_put(key,get_u32(e[r].rec+4));
+  if(e[r].rec==g_drift_me){if(mine>=0)mp_put(race_row(rs,(uint32_t)mine)+0x34,r+1);}
+  else for(int k=0;rs&&k<g_race_cars_n;k++)if(g_race_cars[k].id==e[r].id)mp_put(race_row(rs,g_race_cars[k].row)+0x34,r+1);
+ }
+ g_drift_order_n=n;
+}
 static void race_drift_sync(uint32_t rs) {
  if(!race_is_drift()||!g_drift_component||!g_drift_me||!rs)return;
  for(uint32_t i=0;i<g_race_page.count&&i<RACE_PEERS;i++)
   if(g_drift_values[i])mp_put(g_drift_values[i]+0xc,g_race_page.peers[i].cp&0x7fffffffu); /* drift: points + high-bit DNF */
  mp_call(0x006bd3e0,g_drift_component,0,0);
- const uint32_t mine=race_drift_score();uint32_t place=1;
- for(uint32_t i=0;i<g_race_page.count&&i<RACE_PEERS;i++)
-  if(g_drift_values[i]&&!(g_race_page.peers[i].cp&0x80000000u)&&get_u32(g_drift_values[i]+0xc)>mine)place++;
- if(race_drift_failed())place=g_race_page.count+1;
- mp_put(g_drift_me+8,place-1);
- const uint32_t player=mp_player();const int row=player?race_row_of(rs,player+0x24):-1;
- if(row>=0)mp_put(race_row(rs,(uint32_t)row)+0x34,place);
- for(uint32_t i=0;i<g_race_page.count&&i<RACE_PEERS;i++) {
-  if(!g_drift_values[i])continue;
-  const uint32_t points=get_u32(g_drift_values[i]+0xc);uint32_t rank=!race_drift_failed()&&mine>points?2:1;
-  for(uint32_t j=0;j<g_race_page.count&&j<RACE_PEERS;j++)
-   if(i!=j&&g_drift_values[j]&&!(g_race_page.peers[j].cp&0x80000000u)&&get_u32(g_drift_values[j]+0xc)>points)rank++;
-  if(g_race_page.peers[i].cp&0x80000000u)rank=g_race_page.count+1;
-  mp_put(g_drift_values[i]+8,rank-1);
-  for(int k=0;k<g_race_cars_n;k++)if(g_race_cars[k].id==g_race_page.peers[i].id)
-   mp_put(race_row(rs,g_race_cars[k].row)+0x34,rank);
- }
+ race_drift_order(); /* also after 006bd3e0 (race_drift_reranked), here in case that call skipped its hooks */
 }
 static int race_drift_waiting(void) {return race_is_drift()&&g_drift_ui_pending;}
 static void race_drift_finish_local(uint32_t rs,uint32_t player) {
@@ -173,7 +192,9 @@ static void race_keep_racer(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocati
  (void)inv;(void)user;
  const uint32_t mode=get_u32(cpu->esp+4),simable=cpu->ecx-0xb8u+0x24u;
  const int deactivate=get_u32(cpu->esp)==RACE_DEACTIVATE_RET&&mode==0;
- const int early=mode!=0&&!g_race_cars_shown; /* the race setup activates every racer: not before go */
+ /* the race setup activates every racer: not before go; nor, after it, a car kept off the road; our own calls
+    (race start: a loaded player's car on its grid slot before go) pass */
+ const int early=mode!=0&&!g_race_switching&&(!g_race_cars_shown||race_kept_off(simable));
  if(mode!=0&&g_race_helper&&simable==g_race_helper){api->hook_return(api,cpu,0,4);return;} /* never */
  if((deactivate||early)&&!g_race_encounter)for(int i=0;i<g_race_cars_n;i++)
   if(g_race_cars[i].id&&g_race_cars[i].car.simable==simable) {
@@ -184,6 +205,41 @@ static void race_keep_racer(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocati
 static void race_at_go(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
  (void)api;(void)cpu;(void)inv;(void)user;
  race_drop_helper();
+}
+/* Every native re-rank (006bd3e0: resets, banked drifts, DriftFinalizeScore) is followed by our order. */
+static void race_drift_reranked(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
+ (void)api;(void)inv;(void)user;
+ if(race_is_drift()&&cpu->ecx==g_drift_component)race_drift_order();
+}
+/* MORE THAN FOUR. Offline drift has four drivers (this player and three simulated ones), so the
+ * game's by-rank lookups answer only DAL indexes 2..5 (ranks 0..3): the record 004a6890 (points,
+ * DAL 0x42f), the name 004cb1a0 (DAL 0x44f) and the position 004cafc0 (DAL 0x41a). For index 6 and up
+ * the name call answered "done" without writing, so the HUD row repeated the row above it, with
+ * 0 PTS, and the results' Standings showed an empty row with "---" (measured with five players,
+ * 2026-11-06). In a shared drift those indexes are answered from the same order. */
+#define DRIFT_RANKED(index) (race_is_drift()&&g_drift_component&&(index)>=6u&&(index)-2u<g_drift_order_n)
+static void race_drift_record_at(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
+ (void)inv;(void)user;
+ const uint32_t index=get_u32(cpu->esp+4);
+ if(DRIFT_RANKED(index)){api->hook_return(api,cpu,g_drift_order[index-2],4);return;} /* thiscall (index), RET 4 */
+ api->call_original(api,cpu->target,cpu);
+}
+static void race_drift_name_at(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
+ (void)inv;(void)user;
+ const uint32_t out=get_u32(cpu->esp+4),size=get_u32(cpu->esp+8),index=get_u32(cpu->esp+12);
+ if(DRIFT_RANKED(index)&&out&&size) { /* thiscall (char *out, size, index), RET 0xc */
+  const uint32_t name=g_drift_order[index-2]+0x38;uint32_t i=0;
+  for(;i+1<size&&i<31;i++){const uint8_t ch=race_u8(name+i);if(!ch)break;g_api->guest_write_u8(g_api,out+i,ch);}
+  g_api->guest_write_u8(g_api,out+i,0);
+  api->hook_return(api,cpu,1,12);return;
+ }
+ api->call_original(api,cpu->target,cpu);
+}
+static void race_drift_place_at(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *inv,void *user) {
+ (void)inv;(void)user;
+ const uint32_t out=get_u32(cpu->esp+4),index=get_u32(cpu->esp+8);
+ if(DRIFT_RANKED(index)&&out){mp_put(out,index-1);api->hook_return(api,cpu,1,8);return;} /* thiscall (int *out, index), RET 8 */
+ api->call_original(api,cpu->target,cpu);
 }
 static void race_drift_install(void) {
  if(g_api->guest_alloc(g_api,0x100,&g_drift_buffer)!=POP_OK)return;
@@ -199,5 +255,12 @@ static void race_drift_install(void) {
   race_log("core.nfsc: shared drift hook failed 006567b0");
  if(g_api->hook_install(g_api,0x006a2f00,race_drift_hit,POP_HOOK_REPLACE,0,g_drift_hooks+7)!=POP_OK)
   race_log("core.nfsc: shared drift hook failed 006a2f00");
+ /* One order everywhere, and rows past the fourth (see race_drift_order and DRIFT_RANKED). */
+ const uint32_t more[]={0x004a6890,0x004cb1a0,0x004cafc0};
+ PopHookFn morefn[]={race_drift_record_at,race_drift_name_at,race_drift_place_at};
+ if(g_api->hook_install(g_api,0x006bd3e0,race_drift_reranked,POP_HOOK_AFTER,0,g_drift_hooks+8)!=POP_OK)
+  race_log("core.nfsc: shared drift hook failed 006bd3e0");
+ for(unsigned i=0;i<3;i++)if(g_api->hook_install(g_api,more[i],morefn[i],POP_HOOK_REPLACE,0,g_drift_hooks+9+i)!=POP_OK)
+  race_log("core.nfsc: shared drift hook failed %08x",more[i]);
  g_race_drift_ready=1;
 }

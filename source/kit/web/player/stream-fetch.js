@@ -25,8 +25,84 @@ addToLibrary({
     let networkActive = 0, backgroundActive = 0, writesActive = 0, storageFailed = false;
     let chunksBase = '', pieceSize = 8 * blockSize;
     const stats = { networkBytes: 0, networkRequests: 0, memoryHits: 0, diskHits: 0,
-      reads: 0, slowReads: 0, maxReadMs: 0, cacheWritesSkipped: 0, cacheFailures: 0 };
+      reads: 0, slowReads: 0, maxReadMs: 0, cacheWritesSkipped: 0, cacheFailures: 0,
+      cacheEntries: -1, cacheEvicted: 0, cacheSkippedForSpace: 0, storageFree: null };
     const diagnostics = env('RECOMP_STREAM_STATS') === '1';
+    // The cache shares the site's storage quota with the game's own files and saves.
+    // It may never use the last cacheReserve bytes of the quota, nor more than cacheCap
+    // in total; the oldest entries (Cache Storage keeps insertion order) go first.
+    const megabytes = (name, fallback) => {
+      const value = Number(env(name));
+      return (Number.isFinite(value) && value >= 0 && env(name) !== '' ? value : fallback) * 1048576;
+    };
+    const cacheReserve = megabytes('RECOMP_STREAM_CACHE_RESERVE_MB', 512);
+    const cacheCapEntries = Math.floor(megabytes('RECOMP_STREAM_CACHE_CAP_MB', 2048) / blockSize);
+    const evictBatch = 32;
+    let cacheCount = -1, storageFree = null, estimatedAt = -Infinity, putsSinceEstimate = 0, spaceRetryAt = 0;
+    let maintenance = Promise.resolve();
+    const serial = fn => { const run = maintenance.then(fn); maintenance = run.catch(() => {}); return run; };
+    async function estimateFree() {
+      try {
+        const e = await globalThis.navigator?.storage?.estimate?.();
+        storageFree = Number.isFinite(e?.quota) && Number.isFinite(e?.usage) ? e.quota - e.usage : null;
+      } catch { storageFree = null; }
+      estimatedAt = performance.now(); putsSinceEstimate = 0; stats.storageFree = storageFree;
+    }
+    async function countCache() {
+      if (cacheCount >= 0) return;
+      try { cacheCount = cache.keys ? (await cache.keys()).length : 0; } catch { cacheCount = 0; }
+      stats.cacheEntries = cacheCount;
+    }
+    // Delete the oldest entries until at most `keep` remain.
+    async function evictTo(keep) {
+      if (!cache.keys || !cache.delete || cacheCount <= keep) return;
+      let keys;
+      try { keys = await cache.keys(); } catch { return; }
+      let left = keys.length;
+      for (const key of keys.slice(0, Math.max(0, keys.length - Math.max(0, keep)))) {
+        if (await cache.delete(key).catch(() => false)) { --left; ++stats.cacheEvicted; }
+      }
+      cacheCount = left; stats.cacheEntries = cacheCount;
+    }
+    // Serialized: may this block be stored without crossing the reserve or the cap?
+    async function makeRoom(bytes) {
+      await countCache();
+      if (performance.now() < spaceRetryAt) return false;
+      if (performance.now() - estimatedAt > 5000 || putsSinceEstimate >= evictBatch) await estimateFree();
+      const short = () => Math.max(cacheCount + 1 - cacheCapEntries,
+        storageFree === null ? 0 : Math.ceil((cacheReserve + bytes - storageFree) / blockSize));
+      if (short() > 0) {
+        await evictTo(cacheCount - short() - evictBatch);
+        await estimateFree();
+        if (short() > 0) {
+          // Not enough room even with the cache emptied as far as allowed: try again later.
+          ++stats.cacheSkippedForSpace;
+          spaceRetryAt = performance.now() + 5000;
+          return false;
+        }
+      }
+      ++cacheCount; ++putsSinceEstimate; stats.cacheEntries = cacheCount;
+      if (storageFree !== null) storageFree -= bytes;
+      return true;
+    }
+    // Give space back if something else (game saves, another tab) used the quota. `full`: a
+    // write was refused for space. Chrome's estimate() can report 10 GiB free while its real
+    // limit is reached, so then the reserve is freed whatever the estimate says.
+    const releaseSpace = (full = false) => serial(async () => {
+      await countCache();
+      if (cacheCount <= 0) return;
+      await estimateFree();
+      let excess = storageFree !== null && storageFree < cacheReserve
+        ? Math.ceil((cacheReserve - storageFree) / blockSize) + evictBatch : 0;
+      if (full) excess = Math.max(excess, Math.ceil(cacheReserve / blockSize));
+      if (excess > 0) {
+        await evictTo(cacheCount - excess);
+        await estimateFree();
+      }
+    });
+    cacheReady.then(() => {
+      if (cache && typeof setInterval === 'function') setInterval(() => { releaseSpace().catch(() => {}); }, 10000);
+    });
     // At most two background downloads; four slots remain available to game reads.
     function pumpNetwork() {
       while (networkActive < 6) {
@@ -64,16 +140,24 @@ addToLibrary({
       while (!storageFailed && writesActive < 2 && writes.length) {
         const item = writes.shift();
         ++writesActive;
-        cache.put(item.id, new Response(item.bytes)).catch(() => {
-          storageFailed = true;
-          ++stats.cacheFailures;
-          writes.length = 0;
-        }).finally(() => { --writesActive; pumpWrites(); pumpWarm(); });
+        serial(() => makeRoom(item.bytes.length)).then(room => {
+          if (!room) { ++stats.cacheWritesSkipped; return; }
+          return cache.put(item.id, new Response(item.bytes)).catch(error => {
+            storageFailed = true;
+            ++stats.cacheFailures;
+            writes.length = 0;
+            cacheCount = -1; // recount; the failed entry was not stored
+            return releaseSpace(error?.name === 'QuotaExceededError' || /quota|space/i.test(String(error?.message || error)));
+          });
+        }).catch(() => {}).finally(() => { --writesActive; pumpWrites(); pumpWarm(); });
       }
     }
     async function request(url, options, consume = response => response) {
       let error;
-      for (let attempt = 0; attempt < 5; ++attempt) {
+      // 8 tries (player reports 2026-11-06: 24 of 26 "A game file could not be loaded" were Failed to fetch or a
+      // timeout, and the 5 tries with 0.25-2 s between them gave up inside 4 s of a dropped connection). The waits
+      // grow to 6 s, and while the browser says it is offline the next try waits for it (30 s at most).
+      for (let attempt = 0; attempt < 8; ++attempt) {
         try {
           const response = await fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(20000) });
           if (!response.ok) {
@@ -86,8 +170,10 @@ addToLibrary({
         } catch (e) {
           error = e;
           const retryable = !e?.status || e.status === 408 || e.status === 425 || e.status === 429 || e.status >= 500;
-          if (!retryable || attempt === 4) break;
-          await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+          if (!retryable || attempt === 7) break;
+          await new Promise(resolve => setTimeout(resolve, Math.min(6000, 250 * 2 ** attempt)));
+          for (let waited = 0; typeof navigator !== 'undefined' && navigator.onLine === false && waited < 30000; waited += 500)
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
       throw error;

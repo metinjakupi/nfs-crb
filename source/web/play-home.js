@@ -350,6 +350,7 @@
   const settings = pages.get('settings');
   settings.innerHTML = '<h2>Settings</h2><p class="ph-sub">Changes start the next time you press Play.</p>';
   const full = $('.cs-full')?.closest('label'); if (full) { full.removeAttribute('style'); settings.append(full); }
+  const language = $('.cs-ext[data-for="language"]'); if (language) settings.append(language);
   settings.append($('.cs-ext[data-for="preferences"]'));
   const help = pages.get('help');
   help.innerHTML = '<h2>Help</h2><p class="ph-sub">How to play, your game files and the community.</p><div class="ph-section">How to play</div>';
@@ -379,7 +380,7 @@
   links.insertBefore(boards, chat);
   const go2 = el('div', 'cs-actions ph-go'); go2.append($('.cs-go'));
   const info = el('div', 'ph-info');
-  for (const s of ['.cs-mode', '.cs-slot']) { const e = $(s); if (e) info.append(e); }
+  for (const s of ['.cs-play-status', '.cs-mode', '.cs-slot']) { const e = $(s); if (e) info.append(e); }
   const state = $('.cs-state'); if (state) { state.hidden = false; hero.append(state); }
   hero.append(go2, info);
 

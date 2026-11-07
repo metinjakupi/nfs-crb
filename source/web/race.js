@@ -19,7 +19,8 @@
 //    loaded ("ready"); then the host says "go" and all leave it together.
 //    A player who leaves before the go (the room, the safehouse or a menu, or
 //    Leave) is dropped, as "Start without" drops a slow one: the others race on
-//    (a Canyon Duel, one against one, is cancelled). When that player is the
+//    (a Canyon Duel, one against one, is cancelled; after the go the player who
+//    stays wins it, logs/duel-trucks-20261106). When that player is the
 //    host, the first player of the race still in it hosts it from then on;
 //    every game keeps the same list, so all pick the same one. A host who
 //    leaves the lobby before Start hands it on the same way.
@@ -43,6 +44,17 @@
 // race is the session id the host made. net.js passes these to the relay and
 // back as "recomp-online-message" events.
 //
+// RACE START (2026-11-06, logs/race-start-mockup, logs/race-start-20261106). While the players load (every
+// game holds on its loading screen, race.h), the page shows a timer at the top ("Race starts in 15") and the
+// racers on the right: ready, loading (the step their game has reached: {k:"load", p} 0 menus, 1 track,
+// 2 cars; no game reports a percentage), or left. The timer starts when the first player is loaded and lasts
+// the host's wait (F9 → Start timer, 15 s by default, sent with the start). Everyone loaded ends it at once:
+// the usual go. When it runs out the host's go names the players still loading as late (late, and in without
+// for older pages): the others start together with the game's own 3-2-1, and each late player's game lets go
+// as soon as it has loaded, behind the grid, on its own 3-2-1 (its race time counts from there), passing
+// through the other cars until clear of them (race.h RACE_LATE / RACE_PEER_*). Its row says "late" (not grey);
+// only a player who left is grey. A Canyon Duel has no timer: it needs both players.
+//
 // THE GAME. race.h shares a block of guest memory (globalThis.carbonRaceBlock,
 // "carbon-race" event; layout RaceShared in race.h): the page's part from +0x0c
 // (session, flags, our id and grid slot, the other players, go, launch with the
@@ -64,7 +76,10 @@
     "Pursuit knockout", "Encounter"];
   const LOBBY_EVERY = 4000;  // the host repeats the lobby, so players who arrive later see it
   const PROGRESS_EVERY = 250;
-  const LOAD_TIMEOUT = 60000;
+  // Nobody loaded by then: the race is cancelled (once anyone has loaded, the race start's timer decides). 120 s, as
+  // race.h's own hold (RACE_HOLD_MAX): on a busy computer three games took 98-135 s to load a race (2026-11-06,
+  // logs/race-start-20261106 run h1), and 60 s cancelled a race all three would have run.
+  const LOAD_TIMEOUT = 120000;
   const FORGET = 15000;      // a lobby nobody repeats is gone
   // The relay can drop a race message (rate limit, a connection that is going), and start, ready,
   // go and finish each decide a whole race, so they repeat until they have done their work: every
@@ -73,7 +88,13 @@
   const RESEND_FOR = 15000;
   const GONE_GRACE = 6000;   // a player missing from the room this long has left a race that has begun
   const GONE_TIME = 5999;    // their finish time: after everyone who really finished
-  const SLOW_AFTER = 15000;  // the host may start without whoever is still loading
+  // RACE START: the timer (seconds after the first player has loaded), the host's choice; a late player's flag.
+  const WAITS = [10, 15, 20, 30, 45, 60], LATE = 0x10, LOAD_EVERY = 2000, NAMED_FOR = 4000;
+  let waitSecs = 15;
+  try {
+    const q = Number(new URLSearchParams(location.search).get("raceWait")), v = q || Number(localStorage.getItem("nfsc.raceWait"));
+    if (Number.isInteger(v) && v >= 5 && v <= 120) waitSecs = v;
+  } catch {}
   const MENU_AFTER = 3000;   // a car stopped this long in a menu: its driver is told about, a short pause is not
   const TOAST_FOR = 6000;
   const SILENT_LIMIT = 20000; // once this player has finished: a hung tab stays in the room but says nothing
@@ -91,6 +112,9 @@
   const isDrift = type => type === 11 || type === 12;
   const needsNativeMatch = type => type === 14;
   const CANYON_DUEL = 13;    // one against one: alone it is won at once
+  // Races whose finish carries points (and how it ended) that can still change after it: drift's banked points, and a
+  // Canyon Duel's points and outcome (logs/duel-trucks-20261106).
+  const scored = type => isDrift(type) || type === CANYON_DUEL;
   const placesOf = type => type === CANYON_DUEL ? 2 : MAX_PEERS + 1; // the host takes no more (heard, "join")
   const worldType = type => [0, 1, 5, 11, 12, 13].includes(type);
   function nativeModeNotice() {
@@ -127,17 +151,23 @@
     const text = (o, n) => { let s = ""; for (let i = 0; i < n && u8[p + o + i]; i++) s += String.fromCharCode(u8[p + o + i]); return s; };
     const out = {
       worldReady: u32[at(4)] >= 2, driftReady: u32[at(4)] >= 3,
-      score: u32[at(4)] >= 3 ? u32[at(0x450)] : 0, dnf: u32[at(4)] >= 3 && !!u32[at(0x454)], roam: !!(u32[at(0x2cc)] & 0x800), racing: !!(u32[at(0x2cc)] & 0x200),
+      score: u32[at(4)] >= 3 ? u32[at(0x450)] : 0, dnf: u32[at(4)] >= 3 && u32[at(0x454)] === 1, // drift: overboard / too slow; duel: lost (2 = won)
+      // Canyon Duel (race.h race_duel_report): score = this player's duel points; 1 lost, 2 won once it is over.
+      duelEnd: u32[at(4)] >= 3 ? u32[at(0x454)] : 0, roam: !!(u32[at(0x2cc)] & 0x800), racing: !!(u32[at(0x2cc)] & 0x200),
       phase: u32[at(0x264)], car: u32[at(0x268)], caught: u32[at(0x26c)], caughtKey: u32[at(0x270)],
       caughtType: u32[at(0x274)], caughtOpts: Array.from(u8.subarray(p + 0x278, p + 0x2a0)),
       place: u32[at(0x2a0)], laps: u32[at(0x2a4)], done: u32[at(0x2a8)], pct: f32[at(0x2ac)], time: f32[at(0x2b0)],
       loaded: u32[at(0x2b8)], session: u32[at(0x2bc)], lapPct: f32[at(0x2c0)], cp: u32[at(0x2c4)], ms: u32[at(0x2c8)],
-      flow: u32[at(0x2cc)] & 255, waitingResult: !!(u32[at(0x2cc)] & 256), rows: [],
+      flow: u32[at(0x2cc)] & 255, waitingResult: !!(u32[at(0x2cc)] & 256), rows: [], tags: [],
     };
+    // Race start: before go, where each other player's name tag goes on the grid (race.h race_tags), page peers order.
+    if (u32[at(0x458)] === 0x53474154)
+      for (let k = 0; k < MAX_PEERS; k++) out.tags.push({ x: f32[at(0x45c + k * 12)], y: f32[at(0x460 + k * 12)], depth: f32[at(0x464 + k * 12)] });
     for (let i = 0; i < Math.min(u32[at(0x2b4)], MAX_ROWS); i++) {
       const o = ROW0 + i * ROW;
       out.rows.push({ id: u32[at(o)], place: u32[at(o + 4)], laps: u32[at(o + 8)], done: u32[at(o + 12)],
-        pct: f32[at(o + 16)], time: f32[at(o + 20)], me: u32[at(o + 24)] === 1, name: text(o + 32, 16) });
+        pct: f32[at(o + 16)], time: f32[at(o + 20)], me: u32[at(o + 24)] === 1, name: text(o + 32, 16),
+        ghost: !!(u32[at(o + 28)] & 1), off: !!(u32[at(o + 28)] & 2) }); // race start: passes through, off the road
     }
     return Atomics.load(i32, seq) === before ? out : null;
   }
@@ -169,9 +199,11 @@
       const others = race ? race.roster.filter((r) => r.id !== me) : [];
       const mine = race?.roster.find((r) => r.id === me);
       w.u32(0x00, race ? race.race : 0);
-      w.u32(0x04, (hosting && !race && !lobby ? CATCH : 0) | (race?.ai ? KEEP_AI : 0) | (race?.world || lobby?.world || worldHosting ? WORLD : 0) | (race?.cancelled ? CANCEL : 0));
+      w.u32(0x04, (hosting && !race && !lobby ? CATCH : 0) | (race?.ai ? KEEP_AI : 0) | (race?.world || lobby?.world || worldHosting ? WORLD : 0) | (race?.cancelled ? CANCEL : 0) |
+                  (race?.went && race.lateMe ? LATE : 0));
       w.u32(0x08, me);
-      w.u32(0x0c, mine ? mine.grid : 0);
+      // A late start waits behind the grid: two slots past the last player's, a whole row behind them.
+      w.u32(0x0c, mine ? race.went && race.lateMe ? Math.max(...race.roster.map((r) => r.grid)) + 2 : mine.grid : 0);
       w.u32(0x10, others.length);
       w.u32(0x14, race?.went || race?.cancelled ? race.race : 0);
       w.u32(0x18, race && !race.cancelled ? race.race : 0);
@@ -186,14 +218,23 @@
         // A player given up on counts as finished (last, GONE_TIME) only once this player has finished:
         // the game ranks a finished racer above everyone still racing, so they showed as 1st.
         const done = s?.done && (!s.gone || finishSent === race?.race);
-        w.u32(o + 12, (done ? 1 : 0) | (s?.left ? 2 : 0)); // bit 1: race.h takes their car off the road
+        // Bit 1: race.h takes their car off the road. Race start: a late player's car stays off it while they load
+        // (4), then comes on passing through the others until clear (8).
+        const late = !!(race?.went && race.late?.has(r?.id));
+        // Before the go, 16: they have loaded, so race.h shows their car parked on its grid slot.
+        w.u32(o + 12, (done ? 1 : 0) | (s?.left ? 2 : 0) | (late && !race.ready.has(r.id) ? 4 : 0) | (late ? 8 : 0) |
+                      (race && !race.went && race.ready.has(r?.id) ? 16 : 0));
         w.f32(o + 16, done ? s.time : 0);
         // Their progress as their game works it out, at their physics clock: race.h
         // carries it on to the moment their car is drawn at.
         w.f32(o + 20, s ? s.pct : 0);
         w.f32(o + 24, s ? s.lapPct : 0);
         w.u32(o + 28, s ? s.lap : 0);
-        w.u32(o + 32, s ? isDrift(race.type) ? ((s.score || 0) | (s.dnf ? 0x80000000 : 0)) >>> 0 : s.cp : 0);
+        w.u32(o + 32, s ? isDrift(race.type) ? ((s.score || 0) | (s.dnf ? 0x80000000 : 0)) >>> 0
+          // Canyon Duel: their points, and how their duel ended once it has (bit 31 lost, bit 30 won; neither: an
+          // older game that does not say). race.h decides this player's duel from it (race_duel_frame).
+          : race.type === CANYON_DUEL ? (((s.score || 0) & 0x3fffffff) | (s.done && s.duel === "lost" ? 0x80000000 : 0) |
+                                        (s.done && s.duel === "won" ? 0x40000000 : 0)) >>> 0 : s.cp : 0);
         w.u32(o + 36, s ? s.ms : 0);
         w.f32(o + 40, s ? s.rate : 0);
         w.f32(o + 44, s ? s.lapRate : 0);
@@ -466,7 +507,12 @@
       if (!lobby || lobby.race !== m.race) {
         if (m.k === "leave" && race && race.race === m.race && !race.cancelled && from !== me) {
           if (!race.went) drop(from, m.reason === "menu" ? "is in the safehouse or a menu" : "left");
-          else { const s = standings.get(from); if (s && !s.done) s.goneAt = performance.now() - GONE_GRACE; }
+          else {
+            const s = standings.get(from);
+            if (s && !s.done) s.goneAt = performance.now() - GONE_GRACE;
+            // After the start a duel is not cancelled: the player who stays wins (race.h race_duel_frame).
+            if (s && race.type === CANYON_DUEL && !s.duel && finishSent !== race.race) toast(`${s.name} left the duel: you win.`);
+          }
         } else if (m.k === "join") draw();
         return;
       }
@@ -508,7 +554,10 @@
       if (needsNativeMatch(m.type | 0)) { nativeModeNotice(m.type | 0); return; }
       modeNotice = "";
       race = { race: m.race, host: from, key: m.key, type: m.type | 0, laps: m.laps | 0, opts, ai: !isDrift(m.type | 0) && m.world !== true && m.ai === true, world: m.world === true, roster: r,
-               ready: new Set(), gone: new Set(), startedAt: performance.now(), went: false, launched: false };
+               ready: new Set(), gone: new Set(), startedAt: performance.now(), went: false, launched: false,
+               // Race start: the host's timer, when the first player was loaded, each player's loading step, who starts late.
+               wait: (Number.isInteger(m.wait) && m.wait >= 5 && m.wait <= 120 ? m.wait : 15) * 1000, firstReadyAt: 0,
+               load: new Map(), late: new Set(), lateMe: false };
       standings = new Map(r.map((x) => [x.id, { name: x.name, score: 0, place: 0, lap: 0, cp: 0, pct: 0, lapPct: 0, ms: 0, rate: 0,
                                                  lapRate: 0, t: 0, done: false, time: 0, at: 0 }]));
       finishSent = 0;
@@ -517,15 +566,27 @@
       draw();
     } else if (m.k === "ready") {
       if (race && !race.cancelled && race.race === m.race && race.roster.some((r) => r.id === from)) {
+        const fresh = !race.ready.has(from);
         race.ready.add(from);
+        race.firstReadyAt ||= performance.now(); // the timer starts with the first player loaded
+        if (fresh) tellGame(); // their car comes: on its grid slot before the go, on the road after it (a late player)
         maybeGo();
         draw();
       }
+    } else if (m.k === "load") {
+      // Race start: how far a player's game has got (0 in the menus, 1 the track, 2 the cars); older pages ignore it.
+      if (race && !race.cancelled && race.race === m.race && race.roster.some((r) => r.id === from) &&
+          Number.isInteger(m.p) && m.p >= 0 && m.p <= 2) race.load.set(from, m.p);
     } else if (m.k === "go") {
       if (race && !race.cancelled && race.race === m.race && from === race.host && !race.went) {
-        const without = Array.isArray(m.without) ? m.without.filter(uint) : [];
+        // Race start: late players are in without too, for older pages, which leave them out as before.
+        const late = Array.isArray(m.late) ? m.late.filter(uint) : [];
+        const without = (Array.isArray(m.without) ? m.without.filter(uint) : []).filter((id) => !late.includes(id));
         if (without.includes(me)) { race.leftOut = true; cancelLoading(); return; }
         race.went = true;
+        race.wentAt = performance.now();
+        race.late = new Set(late);
+        race.lateMe = late.includes(me) && !race.ready.has(me) && !race.readySent;
         // Left out at the start: their car was built for the grid but will never move, so it goes off
         // the road at once (it stood among the others' cars, 2026-11-05), as a player who quits does.
         for (const id of without) { giveUp(id); const s = standings.get(id); if (s) s.left = true; }
@@ -535,9 +596,28 @@
     } else if (m.k === "progress" || m.k === "finish") {
       if (!race || race.cancelled || !race.went || race.race !== m.race || !standings.has(from)) return;
       const s = standings.get(from);
+      // A late player racing has loaded, even if their ready was lost (it is sent once after the go).
+      if (race.late.has(from) && !race.ready.has(from)) { race.ready.add(from); tellGame(); }
       if (isDrift(race.type) && (!Number.isInteger(m.score) || m.score < 0 || m.score > 0x7fffffff)) return;
-      if (s.done && !s.gone) return; // a player given up on can still report a real finish
+      // A Canyon Duel's points (an older page sends 0) and, with a finish, how the duel ended.
+      const duelPts = race.type === CANYON_DUEL && Number.isInteger(m.score) && m.score >= 0 ? Math.min(m.score, 0x3fffffff) : null;
+      const duelEnd = race.type === CANYON_DUEL && m.k === "finish" && (m.duel === "won" || m.duel === "lost") ? m.duel : null;
+      // A drift's points can still change after its finish: the game banks the drift running at the line
+      // (DriftFinalizeScore) after the finish itself, so the first finish could carry fewer points. Its
+      // owner's later reports (a new finish, or progress) keep counting; the finish time stays the first.
+      // (2026-11-06: a score sent after a finish was dropped, logs/drift-rows-20261106.)
+      if (s.done && !s.gone) {
+        if (isDrift(race.type) && !self && (s.score !== m.score || s.dnf !== (m.dnf === true))) {
+          s.score = m.score; s.dnf = m.dnf === true; tellGame();
+        }
+        if (duelPts !== null && !self && (s.score !== duelPts || duelEnd && s.duel !== duelEnd)) {
+          s.score = duelPts; if (duelEnd) s.duel = duelEnd; tellGame();
+        }
+        return;
+      }
       if (isDrift(race.type)) {s.score = m.score;s.dnf = m.dnf === true;}
+      if (duelPts !== null) s.score = duelPts;
+      if (duelEnd) { s.duel = duelEnd; s.dnf = duelEnd === "lost"; }
       if (m.k === "progress") {
         for (const k of ["place", "lap", "cp"]) if (Number.isInteger(m[k]) && m[k] >= 0 && m[k] < 100) s[k] = m[k];
         const pct = Number.isFinite(m.pct) ? Math.max(0, Math.min(100, m.pct)) : s.pct;
@@ -580,6 +660,17 @@
     race.without = [...race.gone, ...stillLoading().map((r) => r.id)];
     race.wentSent = performance.now();
     send("go", { race: race.race, without: race.without });
+    return true;
+  }
+  // Race start: the timer ran out. Everyone loaded starts now; those still loading start late, each as soon as
+  // their game has loaded (see the header). The host need not be loaded itself: then it starts late too.
+  const timerLeft = (now = performance.now()) => race && race.firstReadyAt ? race.wait - (now - race.firstReadyAt) : null;
+  function startLate() {
+    if (!race || race.cancelled || race.went || race.host !== me || race.wentSent || race.type === CANYON_DUEL) return false;
+    race.lateIds = stillLoading().map((r) => r.id);
+    race.without = [...race.gone, ...race.lateIds];
+    race.wentSent = performance.now();
+    send("go", { race: race.race, without: race.without, late: race.lateIds });
     return true;
   }
   // A player who left before the go is dropped: left out of the go, as a slow one is (see the
@@ -659,7 +750,7 @@
   function startLobby() {
     if (!lobby || lobby.type === CANYON_DUEL && lobby.roster.length !== 2) return;
     const l = lobby;
-    const fields = { ...lobbyFields(l), roster: l.roster.map((r, grid) => ({ id: r.id, name: r.name, car: r.car, grid })) };
+    const fields = { ...lobbyFields(l), wait: waitSecs, roster: l.roster.map((r, grid) => ({ id: r.id, name: r.name, car: r.car, grid })) };
     send("start", fields);
     pendingStart = { race: l.race, fields, first: performance.now(), at: performance.now() };
   }
@@ -716,7 +807,7 @@
     }
     if (race.host === me && race.wentSent && now - race.wentSent < RESEND_FOR && now - (race.goAt || race.wentSent) >= RESEND_EVERY) {
       race.goAt = now;
-      send("go", { race: race.race, without: race.without });
+      send("go", race.lateIds?.length ? { race: race.race, without: race.without, late: race.lateIds } : { race: race.race, without: race.without });
     }
     if (race.finish && now - race.finish.first < RESEND_FOR && now - race.finish.at >= RESEND_EVERY) {
       race.finish.at = now;
@@ -755,6 +846,9 @@
         cancelLoading();
       }
     }
+    // Race start: the host's timer ran out (it starts with the first player loaded; a duel waits for both).
+    if (race && race.host === me && !race.went && !race.wentSent && !race.cancelled && race.firstReadyAt &&
+        timerLeft(now) <= 0) startLate();
     resend(now);
     watchMenus(now);
     if (!g) return;
@@ -789,7 +883,16 @@
       if (!race.launched && g.session === race.race && g.phase >= PHASE.launched) race.launched = true;
       if (!race.cancelled && g.phase >= PHASE.holding && !race.readySent && g.session === race.race) {
         race.readySent = now;
+        race.firstReadyAt ||= now;
         send("ready", { race: race.race });
+      }
+      // Race start: until loaded, how far this game has got, for the others' lists (on a change, and every 2 s).
+      if (!race.cancelled && !race.readySent) {
+        const p = g.session === race.race ? Math.min(Math.max(g.phase, 0), 2) : 0;
+        if (p !== race.loadSent || now - (race.loadAt || 0) >= LOAD_EVERY) {
+          race.loadSent = p; race.loadAt = now;
+          send("load", { race: race.race, p });
+        }
       }
       if (race.host === me) maybeGo();
       const current = !race.cancelled && race.went && g.session === race.race && g.phase >= PHASE.racing;
@@ -801,25 +904,36 @@
       if (current && g.done && g.time > 0 && finishSent !== race.race) {
         finishSent = race.race;
         const fields = { race: race.race, score: g.score, dnf: g.dnf, time: Math.round(g.time * 1000) / 1000 };
+        if (race.type === CANYON_DUEL && g.duelEnd) fields.duel = g.duelEnd === 2 ? "won" : "lost";
         send("finish", fields);
         race.finish = { fields, first: now, at: now };
         tellGame(); // the players given up on count as finished now (see tellGame)
+      } else if (current && finishSent === race.race && race.finish && scored(race.type) &&
+                 (g.score !== race.finish.fields.score || g.dnf !== race.finish.fields.dnf ||
+                  race.type === CANYON_DUEL && g.duelEnd && race.finish.fields.duel !== (g.duelEnd === 2 ? "won" : "lost"))) {
+        // Points banked after the finish (see heard), or a duel's outcome: the finish again, repeated as the first was.
+        race.finish.fields = { ...race.finish.fields, score: g.score, dnf: g.dnf };
+        if (race.type === CANYON_DUEL && g.duelEnd) race.finish.fields.duel = g.duelEnd === 2 ? "won" : "lost";
+        Object.assign(race.finish, { first: now, at: now });
+        send("finish", race.finish.fields);
       }
       // Back in the menus after the race: it is over.
       if (race.launched && g.phase === PHASE.idle && lastPhase !== PHASE.idle) {
         // An unexpected native exit must not leave the other games waiting.
         const complete = allFinished();
-        if (race.world && !race.cancelled && !complete)
+        // A Canyon Duel too (logs/duel-trucks-20261106): the other player then wins at once, and this car leaves their road.
+        if ((race.world || race.type === CANYON_DUEL) && !race.cancelled && !complete)
           send("leave", { race: race.race });
         race.over = now;
       }
       if (race.over) { race = null; tellGame(); }
       checkList(g);
     }
-    const cardState = `${g.flow}:${g.car}:${g.waitingResult}:${canStartWithout()}`;
+    const cardState = `${g.flow}:${g.car}:${g.waitingResult}`;
     if (cardState !== lastCardState) { lastCardState = cardState; draw(); }
     lastPhase = g.phase;
     syncLocalStanding(g);
+    drawStart(g, now);
   }
 
   // The game's list against what the players say: a mismatch goes to the console.
@@ -899,8 +1013,54 @@
   @media(max-width:600px) { .crc-stack { right:max(12px,env(safe-area-inset-right)); top:max(48px,calc(env(safe-area-inset-top) + 40px)); } .crc-card { width:min(280px,calc(100vw - 24px)); } }
   @media(max-height:500px) { .crc-stack { top:max(40px,calc(env(safe-area-inset-top) + 32px)); max-height:calc(100dvh - 56px); } .crc-who { max-height:calc(23px * 4 + 6px); } }
   @media(prefers-reduced-motion:reduce) { .crc-btn,.crc-chip { transition:none; } }
+  /* Race start (logs/race-start-mockup): the timer at the top, the racers on the right, a line at the bottom. */
+  .crs,.crs-tag { --ready:#2ee88a; --load:#ffcf3f; --late:#b48bff; --left:#7d8a93; --panel:rgba(5,12,18,.86); pointer-events:none; }
+  .crs [hidden] { display:none !important; }
+  .crs-timer { position:fixed; left:50%; top:max(4vh,calc(env(safe-area-inset-top) + 8px)); transform:translateX(-50%); z-index:8; display:flex; align-items:center; gap:14px;
+    max-width:calc(100vw - 32px); background:var(--panel); border:1px solid var(--line); padding:10px 22px 10px 14px; clip-path:polygon(4% 0,100% 0,96% 100%,0 100%); }
+  .crs-ring { width:58px; height:58px; flex:none; position:relative; }
+  .crs-ring svg { width:100%; height:100%; transform:rotate(-90deg); }
+  .crs-ring circle { fill:none; stroke-width:5; }
+  .crs-ring .bg { stroke:rgba(255,255,255,.12); }
+  .crs-ring .fg { stroke:var(--teal); stroke-linecap:round; transition:stroke-dashoffset .25s linear; }
+  .crs-ring span { position:absolute; inset:0; display:grid; place-items:center; font:italic 900 24px/1 var(--cond); }
+  .crs-text { min-width:0; }
+  .crs-text small { display:block; font:700 11px/1.3 var(--cond); letter-spacing:.24em; color:var(--teal); text-transform:uppercase; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crs-text b { display:block; font:italic 900 clamp(18px,2.4vw,28px)/1.05 var(--cond); text-transform:uppercase; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crs-text em { display:block; font-style:normal; color:var(--dim); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* Before the go it covers the game's own list (top right, names only then). */
+  .crs-list { position:fixed; right:2%; top:15%; width:min(300px,30vw); z-index:8; display:flex; flex-direction:column; gap:3px; }
+  /* In the race the game's own list is at the top right: ours (only while someone loads or passes through) goes under it. */
+  .crs-list:not(.inrace) .crs-row { background:rgba(5,12,18,.95); }
+  .crs-list.inrace { top:auto; bottom:max(34%,calc(env(safe-area-inset-bottom) + 220px)); width:min(260px,28vw); }
+  .crs-list.inrace .crs-row { padding:4px 9px; }
+  .crs-row { display:grid; grid-template-columns:22px minmax(0,1fr) auto; align-items:center; gap:8px; background:var(--panel); padding:6px 10px; border-left:3px solid var(--c); }
+  .crs-row .n { font:italic 800 14px/1 var(--cond); color:var(--dim); }
+  .crs-row .name { font:italic 800 16px/1.15 var(--cond); text-transform:uppercase; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .crs-row .st { font:700 11px/1 var(--cond); letter-spacing:.12em; color:var(--c); text-transform:uppercase; white-space:nowrap; }
+  .crs-row .bar { grid-column:2 / 4; height:6px; background:rgba(255,255,255,.1); overflow:hidden; }
+  .crs-row .bar i { display:block; height:100%; width:var(--p); background:var(--c); transition:width .4s linear; }
+  .crs-row.loading .bar i { animation:crs-pulse 1.2s ease-in-out infinite alternate; }
+  .crs-row.me .name::after { content:"YOU"; margin-left:6px; font:700 10px/1 var(--cond); color:#03131a; background:var(--teal); padding:1px 5px; vertical-align:2px; font-style:normal; }
+  .crs-row.loading .name { opacity:.7; }
+  .crs-row.dim { opacity:.6; }
+  .crs-row.left { --c:var(--left); background:rgba(20,24,27,.75); }
+  .crs-row.left .name { color:var(--left); }
+  .crs-hint { position:fixed; left:50%; bottom:5%; transform:translateX(-50%); z-index:8; max-width:calc(100vw - 32px); background:var(--panel); padding:6px 14px; font:600 13px/1.3 var(--cond); letter-spacing:.06em; color:var(--dim); border:1px solid var(--line); text-align:center; }
+  .crs-hint b { color:var(--ink); }
+  .crc.crs-on .crc-toast { top:max(calc(4vh + 92px),100px); }
+  .crs-tag { position:fixed; left:0; top:0; z-index:7; pointer-events:none; background:var(--panel); border:1px solid var(--c); padding:3px 9px;
+    font:700 12px/1.2 var(--cond); letter-spacing:.08em; text-transform:uppercase; white-space:nowrap; color:var(--ink); }
+  .crs-tag::after { content:""; position:absolute; left:50%; bottom:-13px; transform:translateX(-50%); border:6px solid transparent; border-top-color:var(--c); }
+  .crs-tag b { font-weight:700; }
+  .crs-tag span { color:var(--c); margin-left:6px; }
+  .crs-tag[hidden] { display:none; }
+  @keyframes crs-pulse { from { opacity:.45; } to { opacity:1; } }
+  @media(max-width:700px) { .crs-list { width:44vw; top:22%; } .crs-timer { gap:10px; padding:8px 16px 8px 10px; } .crs-ring { width:46px; height:46px; } }
+  @media(prefers-reduced-motion:reduce) { .crs-row .bar i,.crs-ring .fg { transition:none; animation:none; } }
   `;
   let root, stack, chip, card, card2, lastCardState = "", cardViewKey = "";
+  let startEl = null, startParts = null, startKey = ""; // race start: the timer, the racers and the line at the bottom
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -943,8 +1103,6 @@
     return h;
   }
   // The card: hosting hint, the host's lobby, an invite, or the race starting.
-  const canStartWithout = () => !!race && !race.cancelled && !race.went && race.host === me && !race.wentSent &&
-    race.ready.has(me) && stillLoading().length > 0 && performance.now() - race.startedAt >= SLOW_AFTER;
   function draw() {
     if (!root) return;
     dispatchEvent(new Event("recomp-race-invitations"));
@@ -962,7 +1120,7 @@
       invites: shown.cards.map((i) => ({ id: i.race, name: i.name, type: i.type, laps: i.laps, ai: i.ai, joined: i.joined, roster: i.roster, crew: crewMate(i) })),
       chip: shown.chip,
       game: g && { phase: g.phase, flow: g.flow, car: g.car, waitingResult: g.waitingResult },
-      small: cardSmall, slow: canStartWithout() });
+      small: cardSmall, start: startShown() });
     if (viewKey === cardViewKey) return;
     cardViewKey = viewKey;
     card.className = "crc-card";
@@ -1009,6 +1167,8 @@
       card.append(el("p", null, isDrift(race.type) ? "Your drift score is recorded. Waiting for the other players to finish." : "Your finish time is recorded. Waiting for the other players to finish."));
       card.append(el("div", "crc-note", "If a player cannot finish, use F9 → Quit to the start page. No shared winner is confirmed until all results arrive."));
     } else if (race && !race.went) {
+      // Race start: the timer and the racers (drawStart) take the card's place while everyone loads.
+      if (startShown()) { card.hidden = true; return; }
       const host = race.roster.find((r) => r.id === race.host);
       card.append(head("Race together", true));
       card.append(summary(race), names(race.roster, race.ready, race.host));
@@ -1017,11 +1177,6 @@
         ? race.world ? "Starting from free roam…" : g.flow === 3 ? "Starting… If nothing happens, answer any question on screen or go back to the main menu."
           : "Starting… (the race starts from the game's menus: leave free roam for the main menu)"
         : `Loading · ${race.ready.size} of ${race.roster.length} ready${host && host.id !== me ? ` · ${host.name} starts it` : ""}`));
-      if (canStartWithout()) {
-        const slow = stillLoading(), row = el("div", "crc-row");
-        row.append(button(slow.length === 1 ? `Start without ${slow[0].name}` : `Start without ${slow.length} players`, () => { startWithout(); draw(); }, true));
-        card.append(row);
-      }
     } else if (lobby) {
       card.append(head("Race together", true));
       card.append(summary(lobby), names(lobby.roster));
@@ -1079,6 +1234,128 @@
     }
   }
 
+  // ---- Race start: the timer, the racers, and the line at the bottom (logs/race-start-mockup) ----
+  const myStep = (g) => (g?.session === race.race ? Math.min(Math.max(g.phase, 0), 2) : 0);
+  const racingNow = (g) => !!g && g.session === race.race && g.phase >= PHASE.racing;
+  // One racer's state for the list: ready, loading (with the step their game reported), late, racing or left.
+  function racerState(r, g) {
+    const s = standings.get(r.id), mine = r.id === me;
+    if (race.gone.has(r.id) || s?.left) return { k: "left", text: "left" };
+    if (!race.went) {
+      if (race.ready.has(r.id) || (mine && race.readySent)) return { k: "ready", text: "ready ✓", p: 100 };
+      const p = mine ? myStep(g) : race.load.get(r.id);
+      return { k: "loading", p: p === 2 ? 66 : p === 1 ? 33 : 8, text: p === 2 ? "loading cars" : p === 1 ? "loading track" : p === 0 ? "starting…" : "loading…" };
+    }
+    if (race.late.has(r.id) || (mine && race.lateMe)) {
+      if (!(mine ? racingNow(g) : race.ready.has(r.id))) return { k: "loading", text: "loading…", dim: true };
+      const row = g?.rows.find((x) => (mine ? x.me : x.id === r.id));
+      if (row?.ghost) return { k: "late", text: "late 👻" };
+    }
+    return { k: "racing", text: s?.done && !s.gone ? "finished" : "" };
+  }
+  const startShown = () => !!race && !race.cancelled && !!startModel(game(), performance.now());
+  function startModel(g, now) {
+    if (!race || race.cancelled) return null;
+    const rows = race.roster.map((r, i) => ({ n: i + 1, name: r.name, me: r.id === me, ...racerState(r, g) }));
+    const waiting = rows.filter((x) => x.k === "loading"), kicker = `Race together · ${what(race).replace(", ", " · ")}`;
+    const players = (n) => `${n} ${n === 1 ? "player" : "players"}`;
+    const lateNames = race.roster.filter((r) => race.late.has(r.id) && r.id !== me).map((r) => r.name);
+    let timer = null, hint = "";
+    if (!race.went) {
+      const left = timerLeft(now), wait = race.wait / 1000, duel = race.type === CANYON_DUEL;
+      const secs = left === null ? wait : Math.max(0, Math.ceil(left / 1000));
+      if (!waiting.length) timer = { ring: "✓", frac: 0, head: "Everyone is ready", sub: "Starting together…" };
+      else if (duel) timer = { ring: "…", frac: 1, head: `Waiting for ${waiting.length === 1 ? waiting[0].name : players(waiting.length)}`, sub: "A Canyon Duel starts when both players have loaded" };
+      else if (left === null) timer = { ring: String(wait), frac: 1, head: "Loading the race", sub: `The timer starts when the first player has loaded · ${wait} s` };
+      else if (left > 0) timer = { ring: String(secs), frac: left / race.wait, head: `Race starts in ${secs}`, sub: `Waiting for ${players(waiting.length)} to load` };
+      else timer = { ring: "0", frac: 0, head: "Starting now", sub: `${waiting.map((x) => x.name).join(", ")} ${waiting.length === 1 ? "joins" : "join"} late` };
+      const mine = rows.find((x) => x.me);
+      if (mine?.k === "ready") hint = "Your car is ready · <b>the race starts when everyone is ready or the timer ends</b>";
+      else if (g && g.phase === PHASE.idle && !race.launched)
+        hint = race.world ? "Starting from free roam…" : g.flow === 3 ? "Starting… <b>answer any question on screen</b>, or go back to the main menu" : "The race starts from the game's menus: <b>leave free roam for the main menu</b>";
+    } else if (race.lateMe && !racingNow(g)) {
+      timer = { ring: "…", frac: 1, head: "The race has started", sub: "You join late, as soon as your game has loaded" };
+      hint = "Your car starts <b>behind the grid</b> and passes through the others until it is clear of them";
+    } else if (lateNames.length && now - (race.wentAt || 0) < NAMED_FOR) {
+      timer = { ring: "✓", frac: 0, head: "Starting now", sub: `${lateNames.join(", ")} ${lateNames.length === 1 ? "joins" : "join"} late` };
+      hint = `<b>${lateNames.map(htmlText).join(", ")}</b> will appear behind the grid, passing through the others until clear`;
+    }
+    // After the go the list stays only while a racer is loading or still passing through (late).
+    const list = !race.went || rows.some((x) => x.k === "loading" || x.k === "late");
+    if (!timer && !list) return null;
+    return { kicker, timer, rows: list ? rows : null, hint };
+  }
+  const htmlText = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const COLOR = { ready: "var(--ready)", loading: "var(--load)", late: "var(--late)", left: "var(--left)", racing: "var(--teal)" };
+  function drawStart(g = game(), now = performance.now()) {
+    if (!startEl) return;
+    const m = race && !race.cancelled ? startModel(g, now) : null;
+    root.classList.toggle("crs-on", !!m?.timer);
+    const key = JSON.stringify(m);
+    if (key === startKey) return;
+    startKey = key;
+    startEl.hidden = !m;
+    const { timer, fg, secs, small, head, sub, list, hint } = startParts;
+    timer.hidden = !m?.timer;
+    if (m?.timer) {
+      const C = 2 * Math.PI * 25;
+      if (fg) {
+        fg.style.strokeDasharray = String(C);
+        fg.style.strokeDashoffset = String(C * (1 - Math.max(0, Math.min(1, m.timer.frac))));
+      }
+      secs.textContent = m.timer.ring;
+      small.textContent = m.kicker; head.textContent = m.timer.head; sub.textContent = m.timer.sub;
+      timer.setAttribute("aria-label", `${m.timer.head}. ${m.timer.sub}`);
+    }
+    list.hidden = !m?.rows;
+    list.classList.toggle("inrace", !!race?.went);
+    list.replaceChildren(...(m?.rows || []).map((x) => {
+      const row = el("div", `crs-row ${x.k}${x.me ? " me" : ""}${x.dim ? " dim" : ""}`), bar = el("div", "bar");
+      row.style.setProperty("--c", COLOR[x.k]);
+      row.style.setProperty("--p", `${x.k === "loading" ? x.p ?? 8 : 100}%`);
+      bar.append(el("i"));
+      row.append(el("span", "n", String(x.n)), el("span", "name", x.name), el("span", "st", x.text));
+      if (!race.went) row.append(bar);
+      row.setAttribute("aria-label", `${x.name}${x.me ? ", you" : ""}${x.text ? `, ${x.text}` : ""}`);
+      return row;
+    }));
+    hint.hidden = !m?.hint;
+    hint.innerHTML = m?.hint || "";
+  }
+  // Tags over the other players' cars on the grid, before the go (race.h race_tags projects them): their name and
+  // ready ✓ or loading. Moved every frame, as net.js moves its name tags; net.js's own come with the go.
+  const gridTags = [];
+  function drawGridTags() {
+    requestAnimationFrame(drawGridTags);
+    // Only while this game holds on the grid: before that it may still show its loading screen (race.h agrees).
+    const g0 = race && !race.cancelled && !race.went ? game() : null, g = g0?.phase === PHASE.holding ? g0 : null;
+    const canvas = document.getElementById?.("canvas"), others = g && canvas ? race.roster.filter((r) => r.id !== me) : [];
+    const box = others.length ? canvas.getBoundingClientRect() : null;
+    for (let k = 0; k < Math.max(gridTags.length, others.length); k++) {
+      const r = others[k], t = g?.tags[k];
+      let e = gridTags[k];
+      if (!r || !t || !(t.depth > 0) || window.recompWorldMapOpen?.()) { if (e) e.hidden = true; continue; }
+      if (!e) {
+        e = gridTags[k] = el("div", "crs-tag");
+        e.append(el("b"), el("span"));
+        root.append(e);
+      }
+      const st = racerState(r, g), label = st.k === "ready" ? "ready ✓" : st.k === "left" ? "left" : "loading";
+      if (e.firstChild.textContent !== r.name) e.firstChild.textContent = r.name;
+      if (e.lastChild.textContent !== label) e.lastChild.textContent = label;
+      e.style.setProperty("--c", COLOR[st.k] || COLOR.loading);
+      e.hidden = false;
+      e.style.transform = `translate(${box.left + t.x * box.width}px, ${box.top + t.y * box.height}px) translate(-50%, -100%)`;
+    }
+  }
+  // Name tags (net.js): a racer of this race keeps their tag at any distance.
+  window.recompRaceRacer = (id) => !!race && !race.cancelled && race.roster.some((r) => r.id === id);
+  // Name tags over the cars (net.js): a late player's car says so while it passes through.
+  window.recompRaceTagNote = (id) => {
+    if (!race || race.cancelled || !race.went || !race.late.has(id)) return "";
+    return game()?.rows.find((x) => x.id === id)?.ghost ? "LATE 👻" : "";
+  };
+
   // ---- The F9 menu ----
   // menu.js lists window.recompMenuActions as buttons ({id, group, label, hint, run, shown, keepOpen}).
   function menu() {
@@ -1092,6 +1369,12 @@
       { id: "race-leave-active", group: "Race together", label: () => race?.host === me ? "Cancel race" : "Leave race",
         shown: () => !!race?.world && !race.cancelled, run: leaveRace },
       { id: "race-cancel", group: "Race together", label: "Cancel the race", shown: () => !!lobby, run: cancelLobby },
+      // Race start: how long the others wait for whoever is still loading, after the first player has loaded.
+      { id: "race-wait", group: "Race together", label: "Start timer", keepOpen: true, shown: () => !race,
+        hint: () => `${waitSecs} s`, run: () => {
+          waitSecs = WAITS[(WAITS.indexOf(waitSecs) + 1) % WAITS.length];
+          try { localStorage.setItem("nfsc.raceWait", String(waitSecs)); } catch {}
+        } },
       // Joining is F9 → Race's open races list (menu.js, openRaces()); the single "Join …" button it replaced is gone.
       { id: "race-invites", group: "Race together", label: "Race invites", keepOpen: true,
         hint: () => (invitesOn ? "On" : "Off"), run: () => setInvites(!invitesOn) },
@@ -1117,7 +1400,19 @@
       c.hidden = true;
     }
     stack.append(chip, card, card2);
-    root.append(stack);
+    startEl = el("div", "crs");
+    startEl.hidden = true;
+    const timerEl = el("div", "crs-timer"), ring = el("div", "crs-ring"), text = el("div", "crs-text");
+    timerEl.setAttribute("role", "status");
+    ring.innerHTML = '<svg viewBox="0 0 60 60" aria-hidden="true"><circle class="bg" cx="30" cy="30" r="25"/><circle class="fg" cx="30" cy="30" r="25"/></svg>';
+    startParts = { timer: timerEl, fg: ring.querySelector?.(".fg") || null, secs: el("span"), small: el("small"), head: el("b"), sub: el("em"),
+                   list: el("div", "crs-list"), hint: el("div", "crs-hint") };
+    ring.append(startParts.secs);
+    text.append(startParts.small, startParts.head, startParts.sub);
+    timerEl.append(ring, text);
+    startEl.append(timerEl, startParts.list, startParts.hint);
+    root.append(stack, startEl);
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(drawGridTags);
     document.body.append(root);
     menu();
     addEventListener("recomp-online-message", (e) => heard(e.detail));
@@ -1140,6 +1435,7 @@
   // state().invites: the races the corner offers (joinable from here); open: every open race heard.
   window.recompRace = { state: () => ({ me, hosting, lobby, invites: shownInvites(), open: [...invites.values()], invitesOn, race, standings: [...standings], game: game() }),
                         host, startLobby, cancelLobby, leaveRace, canJoin, setInvites, openRaces, corner,
+                        startView: () => startModel(game(), performance.now()), // race start: what the timer and the list show
                         join: (raceId) => { const i = raceId == null ? shownInvite() : invites.get(raceId); if (i) join(i); },
                         leave: (raceId) => { const i = invites.get(raceId); if (i?.joined) leave(i); } };
 })();

@@ -851,6 +851,16 @@ impl Host {
             // lowest as the room's leader (00828e10). Its own entry starts at 9999, so without
             // the echo every client sees another player as the leader.
             olmsg::PLAYER_CAR_DATA => {
+                if crate::player_vehicles::blocked(crate::stats::vehicle_key(Some(msg))) {
+                    self.note(format!("{}: blocked player vehicle", peer.label()));
+                    if let Some(who) = &peer.who {
+                        let mut out = Enc::default();
+                        out.i8(GM_LEAVE).u16(who.pid).i8(0);
+                        peer.gm_send(&out.0, now);
+                    }
+                    self.leave(peer, 0, now);
+                    return;
+                }
                 let mut m = msg.to_vec();
                 if m.len() >= 16 {
                     m[12..16].copy_from_slice(&peer.slot.to_be_bytes());
@@ -1880,4 +1890,23 @@ mod tests {
         let mut d = Dec::new(&e.0);
         assert_eq!((d.i8(), d.i8(), d.i16(), d.str(), d.u8()), (Some(0), Some(-1), Some(4), Some("ab".into()), Some(0x80)));
     }
+    #[test]
+    fn blocked_native_car_data_leaves_the_race_without_retaining_the_vehicle() {
+        for key in [0xacd9eea7u32, 0xbb9b2938, 0xc1b2de36] {
+            let mut host = Host::new(100_001, 19_001, 354_668_344, EKEY);
+            let mut sender = joined(JOINER, 0, "Sender");
+            let mut car = vec![0u8; 64];
+            car[0..4].copy_from_slice(&olmsg::PLAYER_CAR_DATA.to_be_bytes());
+            car[20..24].copy_from_slice(&olmsg::VERSION_HASH.to_be_bytes());
+            car[28..32].copy_from_slice(&0x4e085fb3u32.to_le_bytes());
+            host.game(&mut sender, &car, 10);
+            assert!(sender.car_data.is_some(), "normal bonus BMW remains accepted");
+            car[28..32].copy_from_slice(&key.to_le_bytes());
+            host.game(&mut sender, &car, 20);
+            assert!(sender.car_data.is_none(), "no stale car can be replayed to late joiners");
+            assert!(!sender.ready);
+            assert!(sender.stage != Stage::Joined);
+        }
+    }
+
 }

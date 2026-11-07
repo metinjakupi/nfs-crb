@@ -33,10 +33,15 @@ function opfsStore(root) {
       const handle = await fileFor(root, rel, true);
       const access = await handle.createSyncAccessHandle();
       const bytes = new TextEncoder().encode(text);
-      access.truncate(0);
-      access.write(bytes, { at: 0 });
-      access.flush();
-      access.close();
+      try {
+        access.truncate(0);
+        // A short write (storage full) is not an exception; a cut-off file must not stay behind.
+        if (access.write(bytes, { at: 0 }) !== bytes.length) throw new Error("The browser could not store the whole file (storage full)");
+        access.flush();
+      } catch (e) {
+        try { access.truncate(0); } catch {}
+        throw e;
+      } finally { access.close(); }
     },
     async remove(rel) {
       const parts = rel.split("/");
@@ -185,6 +190,61 @@ async function freeBytes() {
   }
 }
 
+// The runtime's streamed-file cache (kit/web/player/stream-fetch.js). It is only a copy
+// of downloadable bytes: at startup, entries for another asset location or another file
+// version are removed, and the newest entries are kept only while at least `wantFree`
+// bytes of the quota stay free for the game's own files and saves.
+const STREAM_CACHE = "recomp-stream-v1";
+const STREAM_CACHE_RESERVE = 512 * 1024 * 1024;
+async function streamIndexVersions(streamManifest, base) {
+  if (!streamManifest) return null;
+  try {
+    const response = await fetch(streamManifest, { redirect: "error", cache: "no-cache" });
+    if (!response.ok) return null;
+    const index = await response.json();
+    const files = new URL(index.base, streamManifest);
+    if (files.href.replace(/\/$/, "") !== base.replace(/\/$/, "") || !index.files) return null;
+    const versions = new Map();
+    for (const [path, entry] of Object.entries(index.files))
+      versions.set(new URL(path.split("/").map(encodeURIComponent).join("/"), files).href, String(entry.etag));
+    return versions;
+  } catch { return null; }
+}
+async function tidyStreamCache({ base, streamManifest = "", wantFree = STREAM_CACHE_RESERVE } = {}) {
+  const report = { entries: 0, removedOtherLocation: 0, removedOtherVersion: 0, evictedForSpace: 0, freeBefore: null, freeAfter: null };
+  const free = async () => {
+    try { const { quota, usage } = await navigator.storage.estimate(); return Number.isFinite(quota - usage) ? quota - usage : null; }
+    catch { return null; }
+  };
+  report.freeBefore = await free();
+  if (!self.caches || !await caches.has(STREAM_CACHE).catch(() => false)) { report.freeAfter = report.freeBefore; return report; }
+  const cache = await caches.open(STREAM_CACHE);
+  const keys = await cache.keys();
+  report.entries = keys.length;
+  const prefix = base ? base.replace(/\/$/, "") + "/" : null;
+  const versions = prefix ? await streamIndexVersions(streamManifest, base) : null;
+  const kept = [];
+  for (const request of keys) {
+    let file, version;
+    try { const u = new URL(request.url); version = u.searchParams.get("recomp-version"); u.search = ""; file = u.href; } catch {}
+    if (!prefix || !file || !file.startsWith(prefix)) {
+      if (await cache.delete(request)) report.removedOtherLocation++;
+    } else if (versions && versions.has(file) && versions.get(file) !== version) {
+      if (await cache.delete(request)) report.removedOtherVersion++;
+    } else kept.push(request);
+  }
+  // Keys come back oldest first; evict in batches, re-measuring after each.
+  let left = await free();
+  while (left !== null && left < wantFree && kept.length) {
+    const batch = kept.splice(0, Math.min(kept.length, Math.max(16, Math.ceil((wantFree - left) / 1048576))));
+    for (const request of batch) if (await cache.delete(request)) report.evictedForSpace++;
+    left = await free();
+  }
+  if (!kept.length && report.entries) await caches.delete(STREAM_CACHE).catch(() => {});
+  report.freeAfter = left;
+  return report;
+}
+
 async function listFiles(dir, prefix, out) {
   for await (const [name, h] of dir.entries()) {
     const path = prefix ? prefix + "/" + name : name;
@@ -230,6 +290,12 @@ const handlers = {
       const pinned = f => f.relative === plan.exe || (game.auxiliaryFiles || []).some(m => m.name.toLowerCase() === f.relative.toLowerCase());
       const root = await dirFor(game.id + "/game");
       const store = opfsStore(root);
+      // Before measuring free space: the streamed-file cache yields to the game's files and saves
+      // (the same 512 MB reserve the runtime keeps free; at least what the import below checks for).
+      const pinnedBytes = plan.files.filter(pinned).reduce((sum, f) => sum + f.size, 0);
+      const cacheTidy = await tidyStreamCache({ base: source.base, streamManifest: source.streamManifest,
+        wantFree: Math.max(STREAM_CACHE_RESERVE, pinnedBytes + (game.minFreeMb || 0) * 1024 * 1024) }).catch(e => ({ error: String(e?.message || e) }));
+      postMessage({ diagnostic: { phase: "stream-cache", ...cacheTidy } });
       const boot = { list: async () => plan.files.filter(pinned).map(f => f.entry), stream: e => source.stream(e) };
       // Startup verification must never publish a full-install stamp, even if the tab closes.
       const startupStore = { ...store, writeText: (path, text) => path === ".stamp" ? Promise.resolve() : store.writeText(path, text) };
@@ -241,7 +307,7 @@ const handlers = {
       if (outcome.result !== "done") return outcome;
       await store.writeText(".stream-source", source.base);
       await store.writeText(".stream-index", plan.files.map(f => `${pinned(f) ? "L" : "R"}\t${f.relative}`).join("\n") + "\n");
-      return { result: "done", base: source.base, manifest: source.streamManifest, index: `/opfs/${game.id}/game/.stream-index` };
+      return { result: "done", base: source.base, manifest: source.streamManifest, index: `/opfs/${game.id}/game/.stream-index`, cacheTidy };
     } finally { controller = null; }
   },
   async cancel() {

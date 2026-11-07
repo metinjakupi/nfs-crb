@@ -196,11 +196,45 @@
 #define TRF_TYPE 0x11cu       /* PVehicle: its vehicle type key (cars 336fcacf, trucks 89e87652 seen) */
 #define TRF_TRAILER_KEY 0x00a9e7bcu /* the "TRAILER" type key (filled at 009b6ca0) */
 #define COP_F_TRAILER 0x10u   /* flags, with COP_F_TRAFFIC (no siren bits then): a truck's trailer */
-#define TRF_RANGE 300.0f      /* metres: traffic cars this near the player are shared (the game spawns them
-                               * out of sight, 160 m and more away: seen 2026-11-04; MP_NEAR builds within 300) */
+/* TRUCKS WHOLE (trucks-20261106: "the trucks come without the head sometimes"). A truck's cab (class 1) and its trailer
+ * (class 4) were two cars to this file: chosen one by one (nearest COP_MAX, range, RANGE KEEP, the sent-already bonus
+ * TRF_KEEP), built one by one in a friend's game (one build per MP_BUILD_GAP_MS, in slot order, each in its own model
+ * or a kept copy) and removed one by one (out of the list, far away, lingering). So a friend's game showed a trailer
+ * with no cab: the trailer was built or taken from the kept copies before its cab, the cab's copy went first, or the
+ * owner sent the trailer and not its cab (the cab one place too far for the nearest COP_MAX, or out of range first).
+ * Now:
+ *   - The owner knows which trailer a cab tows: PVehicle + TRF_ARTIC is the cab's IArticulatedVehicle (table
+ *     TRF_ARTIC_TABLE; its slot 1, 00709ce0, returns +0x10: the trailer's IVehicle = trailer PVehicle + 0xb8; 0 on
+ *     every other car; measured on both truck models, 0a92cc67 + dcfbf79e and a9b509c4 + 1caa5b90).
+ *   - A trailer is never chosen alone: the cab is chosen as any traffic car, and its trailer is sent right after it
+ *     in the same frame (COP_F_TOWING on the cab), or neither when only one place is left. A trailer with no cab
+ *     towing it is not sent.
+ *   - The trailer's number is its cab's number + TRF_TRAILER_NO (cabs and all other cars are numbered 1-127), so a
+ *     friend's game knows exactly which cab a trailer belongs to.
+ *   - A friend's game builds (or takes back) a trailer's copy only while its cab's copy is here, and the same frame
+ *     the cab's copy goes (removed, kept, lingered out, gone with the world) the trailer's copy goes too. */
+#define COP_F_TOWING 0x20u    /* flags, with COP_F_TRAFFIC: a truck's cab towing a trailer, sent with it (TRUCKS WHOLE) */
+#define TRF_TRAILER_NO 0x80u  /* a trailer's number: its cab's number (1-127) + this */
+#define TRF_ARTIC 0x108u      /* PVehicle: IArticulatedVehicle * (a truck's hitch), 0 for other cars */
+#define TRF_ARTIC_TABLE 0x009e72d4u
+/* OLDER GAMES' TRAILERS (logs/duel-trucks-20261106: trucks without their cab still seen on the live release 20261106-m5).
+ * A game from before TRUCKS WHOLE (the public 20261106-hud build bfdc5ddf and older; players who have not reloaded)
+ * sends a trailer as a car of its own, numbered below 128, often without its cab. Shown with "that owner's nearest
+ * traffic car within 20 m", it stood behind any car passing near it, and stayed while that cab copy lingered still
+ * (cop_cab_here counted lingering copies) as the trailer drove on. Now an older game's trailer is shown only behind a
+ * copy of its own truck's cab (TRF_CAB_OF; any traffic car only when the trailer model is not one of the two known)
+ * whose newest pose is within TRF_HITCH_NEAR of the trailer's, in a slot (not lingering), and it goes the frame that
+ * cab copy goes or is farther than TRF_HITCH_KEEP from it. */
+#define TRF_HITCH_NEAR 12.0f  /* metres: an older game's trailer is built behind its owner's cab copy this near (7-8 m measured) */
+#define TRF_HITCH_KEEP 16.0f  /* metres: and goes when that cab copy is farther than this */
+#define TRF_RANGE 800.0f      /* metres: traffic cars this near the player are shared (the game spawns them
+                               * out of sight, 160 m and more away: seen 2026-11-04). 300 until no-vanish-20261106: a
+                               * friend's game built each copy as it came within 300 m, in plain view (4 a minute on a
+                               * straight road); now a friend's game has the copy where the owner has the car, out to
+                               * MP_BUILD_FAR (800 m) */
 #define TRF_FRIEND 300.0f     /* metres: and only while a friend's car is this near */
 #define TRF_QUIET_HOLD 120000.0 /* ms: a game showing a friend's traffic stays quiet this long after it was last here (QUIET HOLD) */
-#define TRF_RANGE_KEEP 360.0f /* metres: a car already sent stays sent out to this (RANGE KEEP; only where keep < 1) */
+#define TRF_RANGE_KEEP 960.0f /* metres: a car already sent stays sent out to this (RANGE KEEP; only where keep < 1; 360 with TRF_RANGE 300) */
 #define TRF_KEEP 0.5f         /* a traffic car sent already counts as this times as far, squared (cop_nearest) */
 static int g_trf_owner;       /* this game sends its traffic now */
 static int g_trf_quiet;       /* this game spawns no traffic: it shows a lower id's */
@@ -248,6 +282,9 @@ static int g_cop_wrecking;    /* cop_no_destroy lets this Destroy through: a cop
                                * they are made here from other paths (00423610 and 00423980 from 00445b20,
                                * roadblocks 0042d2a0, 0043a9a0). Every caller handles 0 (checked in the code),
                                * so while patrol-quiet it makes none (REPLACE). */
+#define COP_SHARED_PATROLS 0  /* 0 (2026-11-07): every game runs its own police again. With SHARED PATROLS on, a game
+                               * near a lower-numbered player made no cops at all, and the patrol copies it showed
+                               * cannot notice anyone, so players near others were never chased (player reports). */
 #define TRF_NEAR 150.0f       /* metres: NFSCO's distance, the game's own 150 (009c17a8) */
 static uint32_t g_trf_spawn_hook, g_trf_make_hook;
 #define TRF_DISTANCE 0x00761550u /* cdecl (const float pos[3]) -> distance to the player, ST0 */
@@ -327,6 +364,7 @@ typedef struct CopCar { /* a friend's cop shown here */
     int gear;             /* and its gear, 0 = none yet */
     int met;              /* with our car: 0 apart, 1 solid (we ran into it), 2 passing through (see PASSING THROUGH) */
     int wreck_tried;      /* this cop's wreck has been given to the copy (see WRECKED COPS) */
+    uint32_t cab, cab_no; /* a trailer's copy: the copy of its cab it was built behind, and that cab's number (TRUCKS WHOLE) */
 } CopCar;
 
 static uint32_t g_cop_block;
@@ -356,6 +394,15 @@ static int cop_trailer(uint32_t car) {
     return get_u32(car + 0x148) == TRF_TOWED && get_u32(car + TRF_TYPE) == get_u32(TRF_TRAILER_KEY);
 }
 
+/* The trailer cab tows (TRUCKS WHOLE), or 0: cab is a traffic car of this game whose IArticulatedVehicle names a
+ * listed trailer. */
+static uint32_t cop_towed(uint32_t cab) {
+    if (get_u32(cab + 0x148) != TRF_CLASS)
+        return 0;
+    const uint32_t artic = get_u32(cab + TRF_ARTIC), iv = artic && get_u32(artic) == TRF_ARTIC_TABLE ? get_u32(artic + 0x10) : 0;
+    return iv > 0xb8u && cop_trailer(iv - 0xb8u) && mp_listed(iv - 0xb8u) ? iv - 0xb8u : 0;
+}
+
 /* Whether car's damage is full: wrecked (see WRECKED COPS). */
 static int cop_wrecked(uint32_t car) {
     const uint32_t damageable = get_u32(car + 0xfc);
@@ -383,7 +430,7 @@ static int cop_of(uint32_t car, uint32_t pursuit) {
 
 static uint32_t cop_flags(uint32_t car) {
     if (get_u32(car + 0x148) == TRF_CLASS)
-        return COP_F_TRAFFIC;
+        return COP_F_TRAFFIC | (cop_towed(car) ? COP_F_TOWING : 0u);
     if (cop_trailer(car))
         return COP_F_TRAFFIC | COP_F_TRAILER;
     const uint32_t ai = get_u32(car + COP_AI);
@@ -452,11 +499,28 @@ static int cop_nearest(uint32_t player, const float here[3], uint32_t pursuit, i
     return n;
 }
 
-/* A traffic car of this game (not a copy of ours: those are class 7 or 8), or a truck's trailer: a
- * car of its own, without which friends saw trucks without their load (2026-11-05). */
+/* A traffic car of this game (not a copy of ours: those are class 7 or 8). A truck's trailer (a car of its own,
+ * without which friends saw trucks without their load, 2026-11-05) is not one: it goes with its cab (TRUCKS WHOLE). */
 static int cop_traffic_of(uint32_t car, uint32_t unused) {
     (void)unused;
-    return get_u32(car + 0x148) == TRF_CLASS || cop_trailer(car);
+    return get_u32(car + 0x148) == TRF_CLASS;
+}
+
+/* TRUCKS WHOLE: the traffic cars cand[0..m) (nearest first) into found[n..COP_MAX), each cab followed by the trailer
+ * it tows; a cab whose trailer does not fit is left out (the next car may). Returns the new count. */
+static int cop_with_trailers(uint32_t found[COP_MAX], int n, const uint32_t cand[COP_MAX], int m) {
+    for (int i = 0; i < m && n < COP_MAX; ++i) {
+        const uint32_t trailer = cop_towed(cand[i]);
+        int dup = 0;
+        for (int j = 0; trailer && j < n && !dup; ++j)
+            dup = found[j] == trailer;
+        if (trailer && !dup && n + 2 > COP_MAX)
+            continue;
+        found[n++] = cand[i];
+        if (trailer && !dup)
+            found[n++] = trailer;
+    }
+    return n;
 }
 
 /* A cop car of this game (not a helicopter) that is not in our pursuit (SHARED PATROLS). */
@@ -504,7 +568,9 @@ static int cop_find(uint32_t player, uint32_t found[COP_MAX]) {
     }
     if (g_trf_owner) {
         n = cop_nearest(player, here, pursuit, cop_other_of, TRF_RANGE, TRF_KEEP, found, n);
-        n = cop_nearest(player, here, 0, cop_traffic_of, TRF_RANGE, TRF_KEEP, found, n);
+        uint32_t cand[COP_MAX];
+        const int m = cop_nearest(player, here, 0, cop_traffic_of, TRF_RANGE, TRF_KEEP, cand, 0);
+        n = cop_with_trailers(found, n, cand, m); /* TRUCKS WHOLE */
     }
     return n;
 }
@@ -573,7 +639,7 @@ static void cop_traffic_owner(uint32_t player) {
         const MpSlot *s = &g_cop_seen[i];
         chase = s->id == from && s->mode == 1 && (s->pad[1] & COP_F_CHASING) != 0;
     }
-    const int cop_quiet = quiet && !chase;
+    const int cop_quiet = COP_SHARED_PATROLS && quiet && !chase;
     if (cop_quiet != g_cop_quiet) {
         char line[128];
         if (cop_quiet)
@@ -765,6 +831,7 @@ static void cop_diag(uint32_t player, const uint32_t old_car[COP_MAX], const uin
 #define COP_ID_SPEED 120.0f /* metres a second since it was last seen */
 typedef struct CopId {
     uint32_t car, number, key, cls;
+    uint32_t towed;       /* the trailer this cab tows, this frame (TRUCKS WHOLE), 0 = none */
     float p[3];
     int has_p, wrecked;
     uint32_t frame;
@@ -775,12 +842,12 @@ static uint32_t g_cop_id_frame, g_cop_id_next, g_cop_ids_born, g_cop_ids_reborn,
 
 static int cop_id_wanted(uint32_t car) {
     const uint32_t cls = get_u32(car + 0x148);
-    return cls == TRF_CLASS || cls == COP_CLASS || cop_trailer(car);
+    return cls == TRF_CLASS || cls == COP_CLASS; /* a trailer's number is its cab's (TRUCKS WHOLE) */
 }
 
 static uint32_t cop_id_number_free(void) {
-    for (int guard = 0; guard < 256; ++guard) {
-        g_cop_id_next = g_cop_id_next % 255u + 1u;
+    for (int guard = 0; guard < 128; ++guard) {
+        g_cop_id_next = g_cop_id_next % (TRF_TRAILER_NO - 1u) + 1u; /* 1-127: + TRF_TRAILER_NO is its trailer's */
         int used = 0;
         for (int i = 0; i < COP_IDS && !used; ++i)
             used = g_cop_ids[i].car && g_cop_ids[i].number == g_cop_id_next;
@@ -848,6 +915,7 @@ static void cop_ids_frame(void) {
         }
         id->key = key;
         id->cls = cls;
+        id->towed = cop_towed(car);
         id->wrecked = wrecked;
         id->frame = frame;
         if (state) {
@@ -872,11 +940,15 @@ static void cop_ids_frame(void) {
     }
 }
 
-/* car's number for its life (cop_ids_frame), 0 = none. */
+/* car's number for its life (cop_ids_frame), 0 = none. A trailer's is its cab's + TRF_TRAILER_NO while that cab
+ * tows it (TRUCKS WHOLE). */
 static uint32_t cop_id_number(uint32_t car) {
     for (int i = 0; car && i < COP_IDS; ++i)
         if (g_cop_ids[i].car == car)
             return g_cop_ids[i].number;
+    for (int i = 0; car && i < COP_IDS; ++i)
+        if (g_cop_ids[i].car && g_cop_ids[i].towed == car && g_cop_ids[i].number && g_cop_ids[i].number < TRF_TRAILER_NO)
+            return g_cop_ids[i].number + TRF_TRAILER_NO;
     return 0;
 }
 
@@ -974,15 +1046,18 @@ static void cop_publish(CopShared *sh, uint32_t player) {
     __atomic_fetch_add(&sh->seq, 1u, __ATOMIC_SEQ_CST);
     sh->ms = mp_ms();
     sh->frame = g_mp_frame;
-    uint32_t count = 0;
+    uint32_t count = 0, sent_cab = 0; /* sent_cab: the trailer the car sent just before tows (TRUCKS WHOLE) */
     for (int i = 0; i < n; ++i) {
         CopOut *o = cop_out(sh, count);
         const uint32_t state = mp_state(get_u32(found[i] + 0x70));
-        if (!tracks[i] || !state)
-            continue;
+        const uint32_t tows = sent_cab;
+        sent_cab = 0;
+        if (!tracks[i] || !state || (cop_trailer(found[i]) && tows != found[i]))
+            continue; /* a trailer goes only right after its cab, in the same frame */
         mp_read(state, &o->pose);
         if (!mp_pose_ok(&o->pose))
             continue;
+        sent_cab = get_u32(found[i] + 0x148) == TRF_CLASS ? cop_towed(found[i]) : 0;
         o->id = tracks[i]->number;
         o->key = mp_model_key(found[i]);
         o->flags = cop_flags(found[i]);
@@ -1372,13 +1447,14 @@ static uint32_t cop_model_here(uint32_t not) {
     return 0;
 }
 
-/* A traffic model this game has now (one of its own traffic cars), other than not, or 0. */
+/* A traffic model this game has now (one of its own traffic cars), other than not, or 0. Never a truck cab
+ * that tows: as a stand-in it would show a friend's ordinary car as a cab without its trailer. */
 static uint32_t traffic_model_here(uint32_t not) {
     uint32_t node = get_u32(MP_CARS);
     for (int guard = 0; node && node != MP_CARS && guard < 256; ++guard, node = get_u32(node)) {
         const uint32_t car = node - 0xd0;
         const uint32_t key = get_u32(car + 0x148) == TRF_CLASS ? mp_model_key(car) : 0;
-        if (key && key != not)
+        if (key && key != not && !cop_towed(car))
             return key;
     }
     return 0;
@@ -1436,9 +1512,10 @@ static void cop_send_hits(CopShared *sh) {
 
 /* LINGERING COPIES (Step B, 2026-11-05: "the traffic disappears in 10 seconds and then another"). A traffic
  * copy whose car its owner no longer sends (it left the owner's list) is not taken away in front of this
- * player: while it is within COP_LINGER_NEAR and in view it stays where it is, its controls cleared (it
+ * player: while it is in view (cop_in_view: on screen, within MP_VIEW_FAR) it stays where it is, its controls cleared (it
  * rolls to a stop), its slot free for the next car; it goes (cop_drop) once it is farther or out of view,
- * or after COP_LINGER_MS. When its owner sends the same car again it takes the lingering copy back.
+ * (COP_LINGER_MS no longer applies in view: logs/no-vanish-20261106). When its owner sends the same car again it
+ * takes the lingering copy back.
  * Patrol cops (not chasing) linger too (traffic-stable-20261105): the game moves a patrol's car 100-300 m about
  * every 10 s, which is a new car (STABLE NUMBERS), and its old copy should not vanish in front of this player. */
 #define COP_LINGER 16
@@ -1448,6 +1525,7 @@ static void cop_send_hits(CopShared *sh) {
 typedef struct CopLinger {
     uint32_t simable, kind, key, built, number, owner, flags;
     double since;
+    uint32_t cab, cab_no; /* a trailer's: as CopCar's (TRUCKS WHOLE) */
 } CopLinger;
 static CopLinger g_cop_linger[COP_LINGER];
 static uint32_t g_cop_lingered, g_cop_linger_back, g_cop_linger_gone;
@@ -1459,17 +1537,17 @@ static int cop_car_pos(uint32_t simable, float out[3]) {
     return st != 0;
 }
 
-/* Whether p is near (COP_LINGER_NEAR) and in front of the player (here, forward row fwd). */
+/* Whether p is in view: on this player's screen (mp.h mp_seen_at: the main view's projection, or within
+ * MP_VIEW_NEAR) and within MP_VIEW_FAR (logs/no-vanish-20261106). It was "within COP_LINGER_NEAR (150 m) and within
+ * 70 degrees of our car's heading": a copy leaves its owner's list at TRF_RANGE_KEEP (360 m) from the owner, so in
+ * a friend's game it was nearly always farther than 150 m then, and no copy ever lingered (trucks-20261106). fwd is
+ * no longer used. */
 static int cop_in_view(const float here[3], const float fwd[3], const float p[3]) {
-    float d[3], len = 0, dot = 0;
-    for (int k = 0; k < 3; ++k) {
-        d[k] = p[k] - here[k];
-        len += d[k] * d[k];
-        dot += d[k] * fwd[k];
-    }
-    if (len > COP_LINGER_NEAR * COP_LINGER_NEAR)
-        return 0;
-    return len < 20.0f * 20.0f || dot > COP_VIEW_COS * sqrtf(len);
+    (void)fwd;
+    float len = 0;
+    for (int k = 0; k < 3; ++k)
+        len += (p[k] - here[k]) * (p[k] - here[k]);
+    return len <= MP_VIEW_FAR * MP_VIEW_FAR && mp_seen_at(p, here);
 }
 
 static void cop_drop(CopCar *cc, const char *why);
@@ -1488,7 +1566,7 @@ static int cop_linger(CopCar *cc, const float here[3], const float fwd[3]) {
         const uint32_t car = c->simable - 0x24, in = get_u32(car + DRV_INPUT);
         if (in && get_u32(in))
             mp_call(drv_method(in, 1), in, NULL, 0); /* IInput::ClearInput: it rolls to a stop */
-        *l = (CopLinger){c->simable, c->kind, c->key, cc->built, cc->number, c->id, cc->flags, mp_now()};
+        *l = (CopLinger){c->simable, c->kind, c->key, cc->built, cc->number, c->id, cc->flags, mp_now(), cc->cab, cc->cab_no};
         c->simable = 0;
         c->pending = c->holding = 0;
         ++g_cop_lingered;
@@ -1510,6 +1588,113 @@ static uint32_t cop_linger_take(uint32_t owner, uint32_t number, uint32_t key, u
         }
     }
     return 0;
+}
+
+/* A lingering copy goes (cop_drop). */
+static void cop_linger_drop(CopLinger *l, const char *why) {
+    CopCar tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.car.simable = l->simable;
+    tmp.car.kind = l->kind;
+    tmp.car.id = l->owner;
+    tmp.car.key = l->key;
+    tmp.built = l->built;
+    tmp.number = l->number;
+    tmp.flags = l->flags;
+    l->simable = 0;
+    ++g_cop_linger_gone;
+    cop_drop(&tmp, why);
+}
+
+/* OLDER GAMES' TRAILERS: the cab model of a trailer model (both truck models of the game, trucks-20261106), 0 = unknown. */
+static uint32_t cop_cab_of(uint32_t trailer_key) {
+    return trailer_key == 0xdcfbf79eu ? 0x0a92cc67u : trailer_key == 0x1caa5b90u ? 0xa9b509c4u : 0;
+}
+/* The squared distance between two copies' newest poses, or -1. */
+static float cop_pose_d2(const MpCar *a, const MpCar *b) {
+    if (!a->kept || !b->kept)
+        return -1.0f;
+    float d = 0;
+    for (int k = 0; k < 3; ++k)
+        d += (a->pose[a->kept - 1].p[k] - b->pose[b->kept - 1].p[k]) * (a->pose[a->kept - 1].p[k] - b->pose[b->kept - 1].p[k]);
+    return d;
+}
+
+/* TRUCKS WHOLE: the slot of trailer slot i's cab (the same owner, the trailer's number - TRF_TRAILER_NO, flagged
+ * COP_F_TOWING), or -1. A trailer numbered below TRF_TRAILER_NO comes from an older game: it goes with that owner's
+ * copy of its truck's cab model (OLDER GAMES' TRAILERS) nearest to it within TRF_HITCH_NEAR. */
+static int cop_cab_slot(int i) {
+    const MpSlot *s = &g_cop_seen[i];
+    const MpCar *a = &g_cop_cars[i].car;
+    int best = -1;
+    float best_d = TRF_HITCH_NEAR * TRF_HITCH_NEAR;
+    for (int j = 0; j < COP_SLOTS; ++j) {
+        const MpSlot *t = &g_cop_seen[j];
+        if (j == i || t->id != s->id || t->mode != 1 || !t->pad[0] || !(t->pad[1] & COP_F_TRAFFIC) || (t->pad[1] & COP_F_TRAILER))
+            continue;
+        if (s->pad[0] & TRF_TRAILER_NO) {
+            if ((t->pad[1] & COP_F_TOWING) && t->pad[0] == s->pad[0] - TRF_TRAILER_NO)
+                return j;
+            continue;
+        }
+        const MpCar *b = &g_cop_cars[j].car;
+        const uint32_t cab_key = cop_cab_of(s->key);
+        if (cab_key && t->key != cab_key)
+            continue; /* OLDER GAMES' TRAILERS: only its own truck's cab, never a car passing by */
+        const float d = cop_pose_d2(a, b);
+        if (d >= 0 && d < best_d) {
+            best_d = d;
+            best = j;
+        }
+    }
+    return best;
+}
+
+/* TRUCKS WHOLE: whether the cab copy cab (owner's car number no) is still here: in a slot of that car, or lingering. */
+static int cop_cab_here(uint32_t owner, uint32_t cab, uint32_t no) {
+    for (int j = 0; cab && j < COP_SLOTS; ++j)
+        if (g_cop_cars[j].car.simable == cab && g_cop_cars[j].car.id == owner && g_cop_cars[j].number == no)
+            return 1;
+    for (int j = 0; cab && j < COP_LINGER; ++j)
+        if (g_cop_linger[j].simable == cab && g_cop_linger[j].owner == owner && g_cop_linger[j].number == no)
+            return 1;
+    return 0;
+}
+
+/* TRUCKS WHOLE, at the end of every cop_cars: a trailer's copy (in a slot or lingering) whose cab's copy is no longer
+ * here goes, in the same frame as its cab's. */
+static uint32_t g_cop_trailers_dropped;
+static void cop_trailers_follow(void) {
+    for (int i = 0; i < COP_SLOTS; ++i) {
+        CopCar *cc = &g_cop_cars[i];
+        if (!cc->car.simable || !(cc->flags & COP_F_TRAFFIC) || !(cc->flags & COP_F_TRAILER))
+            continue;
+        const char *why = !cop_cab_here(cc->car.id, cc->cab, cc->cab_no) ? "its truck's copy is gone" : NULL;
+        if (!why && cc->number < TRF_TRAILER_NO) {
+            /* OLDER GAMES' TRAILERS: its cab copy in a slot (a lingering one stands still), and still hitched. */
+            int j = 0;
+            while (j < COP_SLOTS && !(g_cop_cars[j].car.simable == cc->cab && g_cop_cars[j].car.id == cc->car.id &&
+                                      g_cop_cars[j].number == cc->cab_no))
+                ++j;
+            const float d = j < COP_SLOTS ? cop_pose_d2(&cc->car, &g_cop_cars[j].car) : -1.0f;
+            if (j == COP_SLOTS)
+                why = "an older game's trailer, its truck's copy is not following it";
+            else if (d < 0 || d > TRF_HITCH_KEEP * TRF_HITCH_KEEP)
+                why = "an older game's trailer, its truck's copy is not hitched to it";
+        }
+        if (why) {
+            ++g_cop_trailers_dropped;
+            cop_drop(cc, why);
+            cc->car.wait = 0;
+        }
+    }
+    for (int i = 0; i < COP_LINGER; ++i) {
+        CopLinger *l = &g_cop_linger[i];
+        if (l->simable && (l->flags & COP_F_TRAFFIC) && (l->flags & COP_F_TRAILER) && !cop_cab_here(l->owner, l->cab, l->cab_no)) {
+            ++g_cop_trailers_dropped;
+            cop_linger_drop(l, "lingering, its truck's copy is gone");
+        }
+    }
 }
 
 /* Every frame: lingering copies out of view, farther than COP_LINGER_NEAR, or too old go. */
@@ -1537,20 +1722,9 @@ static void cop_linger_frame(const float here[3], const float fwd[3], int have_p
             l->simable = 0; /* gone with the world */
             continue;
         }
-        if (have_player && cop_car_pos(l->simable, p) && cop_in_view(here, fwd, p) && now - l->since < COP_LINGER_MS)
-            continue;
-        CopCar tmp;
-        memset(&tmp, 0, sizeof tmp);
-        tmp.car.simable = l->simable;
-        tmp.car.kind = l->kind;
-        tmp.car.id = l->owner;
-        tmp.car.key = l->key;
-        tmp.built = l->built;
-        tmp.number = l->number;
-        tmp.flags = l->flags;
-        l->simable = 0;
-        ++g_cop_linger_gone;
-        cop_drop(&tmp, now - l->since >= COP_LINGER_MS ? "lingered 30 s" : "lingered until out of view or 150 m away");
+        if (have_player && cop_car_pos(l->simable, p) && cop_in_view(here, fwd, p))
+            continue; /* no time limit in view (logs/no-vanish-20261106: COP_LINGER_MS took copies away in plain view) */
+        cop_linger_drop(l, now - l->since >= COP_LINGER_MS ? "lingered 30 s" : "lingered until out of view or 150 m away");
     }
 }
 
@@ -1620,12 +1794,15 @@ static void cop_cars(CopShared *sh, uint32_t player) {
         c->lag = MP_DELAY + (MP_NEAR_DELAY - MP_DELAY) * near;
         if (g_mp_local_paused)
             continue; /* as mp_remotes: no new or removed cars behind the frozen menu */
-        if (c->simable) {
-            if (d2 > MP_FAR * MP_FAR)
+        /* TRUCKS WHOLE: a trailer's copy is built and removed with its cab's, not by its own distance from us (7 m
+         * from its cab's: at MP_NEAR and MP_FAR one of the two was built or removed alone, measured 2026-11-06). */
+        const int towed = (s->pad[1] & COP_F_TRAFFIC) && (s->pad[1] & COP_F_TRAILER);
+        if (c->simable) { /* RADII (logs/no-vanish-20261106): as a friend's car, built within MP_BUILD_FAR, gone past MP_VIEW_FAR */
+            if (d2 > MP_VIEW_FAR * MP_VIEW_FAR && !towed)
                 cop_drop(cc, "far away");
             continue;
         }
-        if (d2 > MP_NEAR * MP_NEAR || (c->wait && --c->wait))
+        if ((d2 > MP_BUILD_FAR * MP_BUILD_FAR && !towed) || (c->wait && --c->wait))
             continue;
         if (d2 < COP_BUILD_CLEAR * COP_BUILD_CLEAR) { /* not on our car (see NEAR OUR CAR) */
             c->wait = 6;
@@ -1635,10 +1812,15 @@ static void cop_cars(CopShared *sh, uint32_t player) {
          * has (see the header). */
         const int step = c->tries % 3, traffic = (s->pad[1] & COP_F_TRAFFIC) != 0;
         const int trailer = traffic && (s->pad[1] & COP_F_TRAILER) != 0; /* only its own model: never a car */
+        /* TRUCKS WHOLE: a trailer's copy only behind its cab's, built in the cab's own model (never behind a car
+         * standing in for a truck this game does not have), and then at once: not after the build gap. */
+        const int cab_slot = trailer ? cop_cab_slot(i) : -1;
+        if (trailer && (cab_slot < 0 || !g_cop_cars[cab_slot].car.simable || g_cop_cars[cab_slot].built != g_cop_seen[cab_slot].key))
+            continue;
         const uint32_t key = step < 2 ? s->key : trailer ? 0 : traffic ? traffic_model_here(s->key) : cop_model_here(s->key);
         /* 0 = model 0 is the player's own */
         /* One build per MP_BUILD_GAP_MS, shared with friends' cars: a chase can bring eight at once. */
-        if (key && now < g_mp_build_after && !cop_spare_free(key, cop_kind()))
+        if (key && now < g_mp_build_after && !cop_spare_free(key, cop_kind()) && !trailer)
             continue;
         ++c->tries;
         if (!key) { /* no cop car here to borrow a model from: the next round */
@@ -1651,6 +1833,8 @@ static void cop_cars(CopShared *sh, uint32_t player) {
         c->follow = MP_FOLLOWING;
         memcpy(c->drawn, last->p, sizeof c->drawn);
         cc->met = 0;
+        cc->cab = trailer ? g_cop_cars[cab_slot].car.simable : 0; /* TRUCKS WHOLE: the cab copy it goes with */
+        cc->cab_no = trailer ? g_cop_cars[cab_slot].number : 0;
         c->simable = cop_linger_take(c->id, cc->number, s->key, c->kind);
         if (c->simable) {
             cc->built = key;
@@ -1686,6 +1870,7 @@ static void cop_cars(CopShared *sh, uint32_t player) {
                 ++cc->round;
         }
     }
+    cop_trailers_follow(); /* TRUCKS WHOLE */
 }
 
 /* mp_drive.h's g_drv_cop: what a driver must be doing to make a copy move as it does at playback

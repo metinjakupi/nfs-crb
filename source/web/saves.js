@@ -102,6 +102,7 @@
     "empty": "There is no save in this browser yet. Play first, then back it up.",
     "in-use": "Part of the save is in use. Is the game open in another window?",
     "quota": "This browser is out of storage space.",
+    "starting": "The game is starting, so your save was not replaced.",
   };
   function messageFor(error) {
     if (error instanceof SaveError) {
@@ -631,24 +632,30 @@
     // Replaces the folder with `files`. The save it replaces goes to the undo
     // file first, and back into the folder if writing the new one fails.
     async function restore(files, { undoing = false } = {}) {
-      await page.beforeProfileRestore?.();
+      if (page.playStarting?.()) throw new SaveError("starting");
+      page.restoring = true;
       try {
-        const current = (await readFolder()).files;
-        const nfsc = await gameDir(true);
-        if (!undoing && current.length) {
-          const out = await (await nfsc.getFileHandle(undoName, { create: true })).createWritable();
-          await out.write(backupZip(current, "undo"));
-          await out.close();
-        }
+        await page.beforeProfileRestore?.();
         try {
-          await writeFiles(files);
-        } catch (error) {
-          if (current.length) await writeFiles(current).catch(() => {});
-          throw error;
+          const current = (await readFolder()).files;
+          const nfsc = await gameDir(true);
+          if (!undoing && current.length) {
+            const out = await (await nfsc.getFileHandle(undoName, { create: true })).createWritable();
+            await out.write(backupZip(current, "undo"));
+            await out.close();
+          }
+          try {
+            await writeFiles(files);
+          } catch (error) {
+            if (current.length) await writeFiles(current).catch(() => {});
+            throw error;
+          }
+          if (undoing) await nfsc.removeEntry(undoName).catch(() => {});
+        } finally {
+          await page.afterProfileRestore?.();
         }
-        if (undoing) await nfsc.removeEntry(undoName).catch(() => {});
       } finally {
-        await page.afterProfileRestore?.();
+        page.restoring = false;
       }
     }
     async function readUndo() {

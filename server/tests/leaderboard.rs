@@ -45,7 +45,7 @@ impl Server {
             "metin": {"name": "Metin", "key": null, "seen": 1, "stats": {"Srv_Bst_30F07253": t(103.05, now), "Overall_Solo_On_Wins": [40.0, "", 0, [], now, 0], "Srv_Wins": [4.0, "reset:1000", 0, [[2, week, 4.0, "reset:1000"]], now, now]}},
             "cheat": {"name": "Cheat", "key": null, "seen": 1, "stats": {"Srv_Bst_30F07253": t(101.0, now), "Overall_Solo_On_Wins": [90.0, "", 0, [], now, 0], "Srv_Wins": [9.0, "reset:500", 0, [], now, now]}},
             // not claimed: never on the public boards
-            "guest": {"name": "Guest", "key": "0123456789abcdef", "seen": 1, "stats": {"Srv_Bst_30F07253": t(99.0, now)}},
+            "guest": {"name": "Guest", "key": "0123456789abcdef", "seen": 1, "stats": {"Srv_Bst_30F07253": t(99.0, now), "Evt_Bst_Lap_30F07253": [50.0, "", 1, [[2, week, 50.0, ""]], now, now]}},
             // the game's own word only
             "jan": {"name": "Jan", "key": null, "seen": 1, "stats": {"Evt_Bst_30F07253": t(90.0, now), "Best_Drift_Combo": [5000.0, "", 0, [], 0, 0]}},
         });
@@ -213,4 +213,53 @@ fn only_the_admin_bans_and_the_board_shows_it_at_once() {
     assert!(saved.contains("\"cheat\""), "{saved}");
     let (status, _, _) = s.ask("POST", &admin, &auth, Some(r#"{"op":"approve","id":12345}"#));
     assert_eq!(status, 400);
+}
+
+#[test]
+fn the_in_game_group_is_what_the_game_shows_and_comes_only_when_asked_for() {
+    let s = Server::start("ingame", &[]);
+    // the plain answer is unchanged: no in-game board in it
+    let plain = s.json("/leaderboard");
+    assert!(plain["boards"].as_array().unwrap().iter().all(|b| b["source"] == "race"));
+    assert!(plain.get("ingame").is_none());
+    let (status, head, body) = s.ask("GET", "/leaderboard?source=ingame", &[("Origin", "https://nfscrb.xyz")], None);
+    assert_eq!(status, 200);
+    assert!(head.contains("access-control-allow-origin: https://nfscrb.xyz") && head.contains("cache-control: public, max-age=60"), "{head}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ingame"]["label"], json!("In-game leaderboard"));
+    assert!(v["boards"].as_array().unwrap().iter().all(|b| b["source"] == "ingame" && b["label"] == "In-game leaderboard"));
+    // the game's own best (Jan's, claimed or not does not matter here) with its two numbers
+    let b = board(&v, "ingame:Evt_Bst:30F07253").expect("the in-game race board");
+    assert_eq!(names(&b["all"]), ["Jan"]);
+    assert_eq!(b["all"][0], json!(["Jan", 90.0, "0x8774322c", b["all"][0][3].clone(), 51.5, 72.9]));
+    assert_eq!(names(&b["week"]), ["Jan"]);
+    assert!(b["day"].is_array());
+    // an unclaimed name is on the in-game board, as in the game
+    assert_eq!(names(&board(&v, "ingame:Evt_Bst_Lap:30F07253").unwrap()["all"]), ["Guest"]);
+    // the game's own wins (before the reset too), every name
+    assert_eq!(names(&board(&v, "ingame:Overall_Solo_On_Wins").unwrap()["all"]), ["Cheat", "Metin"]);
+    // game-only keys stay out, and no browser key or owner
+    assert!(board(&v, "ingame:Best_Drift_Combo").is_none() && !body.contains("Best_Drift") && !body.contains("Srv_"));
+    for secret in ["0123456789abcdef", "1111111111"] {
+        assert!(!body.contains(secret), "{secret} in {body}");
+    }
+    // one in-game board by id, one period; both groups together
+    let one = s.json("/leaderboard?board=ingame:Overall_Solo_On_Wins&period=all&limit=1");
+    assert_eq!(names(&one["boards"][0]["all"]), ["Cheat"]);
+    assert!(one["boards"][0].get("week").is_none() && one["boards"][0].get("day").is_none());
+    let all = s.json("/leaderboard?source=all");
+    assert!(board(&all, "Evt_Bst:30F07253").is_some() && board(&all, "ingame:Evt_Bst:30F07253").is_some());
+    // a banned name leaves the in-game group at once
+    let admin = format!("/leaderboard/admin?key={KEY}");
+    let bearer = format!("Bearer {ADMIN_TOKEN}");
+    let (status, _, body) = s.ask("POST", &admin, &[("Authorization", bearer.as_str())], Some(r#"{"op":"ban","name":"Cheat","text":"fake"}"#));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(names(&board(&s.json("/leaderboard?source=ingame"), "ingame:Overall_Solo_On_Wins").unwrap()["all"]), ["Metin"]);
+}
+
+#[test]
+fn the_in_game_group_can_be_turned_off() {
+    let s = Server::start("ingame-off", &[("CARBON_LEADERBOARD_INGAME", "0")]);
+    assert_eq!(s.json("/leaderboard?source=ingame")["boards"], json!([]));
+    assert!(board(&s.json("/leaderboard"), "Evt_Bst:30F07253").is_some());
 }

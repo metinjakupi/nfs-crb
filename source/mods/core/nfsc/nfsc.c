@@ -29,7 +29,7 @@
  * message; the left and right HUD groups are then moved out by the same
  * offset with the game's FindObject/GetCenter/SetCenter, as the fix does.
  * Rear-view mirror / picture-in-picture placement and FE/movie scaling are
- * also adapted below. Movie geometry does not supply a browser movie decoder.
+ * also adapted below.
  *
  * CONTROLLER. The console layout, analog triggers and the controller's own
  * button names on the Controls screen: see pad.h. Console prompts in the
@@ -121,6 +121,7 @@ static void log_line(const char *text) {
     g_api->log(g_api, text);
 }
 
+#include "player_vehicles.h" /* denied player models; AI assets remain available */
 #include "pad.h" /* controller layout, analog triggers, button names */
 #include "fe_pad.h" /* console button prompts in the menus */
 #include "hd_ui.h" /* HD fonts and cursor laid out at their original size */
@@ -136,6 +137,7 @@ static void log_line(const char *text) {
 #include "race.h" /* friends as racers in Quick Races (web/race.js runs the lobby) */
 #include "worldmap.h" /* friends on the big world map (web/worldmap.js names them) */
 #include "cops.h" /* a friend's police chase shown here; ramming those cops counts there */
+#include "patrol_view.h" /* the game's own police cars are not taken away while on screen */
 #include "resume.h" /* recover a free-roam session after refresh */
 #include "lights.h" /* turn signals (blinkers) and a headlight flash */
 #include "headlight_road.h" /* your own headlights light the road, as other cars' do */
@@ -143,6 +145,7 @@ static void log_line(const char *text) {
 #include "rewards.h" /* missed boss cars: the game's own pink-slip award, local only */
 #include "bmw.h" /* local custom BMW boost */
 #include "pursuit.h" /* one police chase shared by friends in free roam (plans/shared-pursuit.md) */
+#include "player_vehicle_guard.h" /* purchase and player creation guards */
 #include "police.h" /* be the police in free roam (plans/shared-pursuit.md) */
 #include "encounter_support.h" /* shared HUD and compatibility helpers for crew rivals */
 #include "encounter.h" /* native Crew Challenge with online opponents */
@@ -153,6 +156,7 @@ static void log_line(const char *text) {
 #include "paint_fast.h" /* the skin compositor's pixel loops in native code (logs/paint-speed-20261105) */
 #include "crowd_test.h" /* TEST ONLY, RECOMP_CROWD=<max>: how many extra cars the game holds */
 #include "carlimit.h" /* more than the game's 30 cars: moved car lists, the car gate, full-vector guards */
+#include "drawonly.h" /* draw-only far cars: render connections with no vehicle (logs/drawonly-cars-20261106, logs/drawonly-merge-20261106) */
 #include "guards2.h" /* more unchecked tables: the players registry of 20, watches (logs/stability-20261105) */
 #include "reflect.h" /* the car reflection cube in turns when many cars are near */
 #include "poolfill.h" /* no 0xEE fill of free pool memory: pools cost only what they hold */
@@ -161,6 +165,7 @@ static void log_line(const char *text) {
 #include "cockpit.h" /* local driver-seat camera and native wheel animation */
 #include "traffic.h" /* less traffic by default: race traffic density halved */
 #include "custom_hud.h" /* local World HUD; original gauges remain the default */
+#include "iatwatch.h" /* DIAGNOSTIC (logs/zeroed-iat-20261106): who writes over the import table */
 
 /* ---- the resolution list --------------------------------------------------
  * The host scales the frame smoothly to the window, aspect kept (game.toml
@@ -616,6 +621,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     race_install();
     worldmap_install();
     cops_install();
+    patrol_view_install();
     resume_install();
     lights_install();
     headlight_road_install(); /* after lights_install: its BEFORE hook on 007cbc40 runs first */
@@ -623,7 +629,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     rewards_install();
     bmw_install();
     pursuit_install();
-    police_install();
+    player_vehicle_guard_install(); /* player police mode is disabled */
     encounter_support_install();
     encounter_install();
     maprace_install();
@@ -633,6 +639,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     guards_install();
     paint_install();
     paint_fast_install();
+    drawonly_install();
     crowd_install();
     carlimit_install(); /* after mp_install: it alone sets the Cars pool size (phones keep 65000 KB) */
     guards2_install();
@@ -641,6 +648,7 @@ PopModStatus pop_mod_init(const PopModApi *api) {
     photo_zoom_install();
     cockpit_install();
     traffic_install();
+    iatwatch_install();
     /* Match the effect-render caller patched by XenonEffectFix.ixx, rather
      * than changing blending for every use of this shared setup routine. */
     if (setting("xenon_effects", 1) && api->hook_install_at_callsite &&
@@ -690,8 +698,10 @@ PopModStatus pop_mod_exit(void) {
     guards2_shutdown();
     reflect_shutdown();
     poolfill_shutdown();
+    patrol_view_shutdown();
     photo_zoom_shutdown();
     traffic_shutdown();
+    iatwatch_shutdown();
     customization_shutdown();
     impact_feedback_stop(g_api);
     for (unsigned i = 0; i < sizeof g_hooks / sizeof g_hooks[0]; ++i)

@@ -22,7 +22,10 @@
 // A room may hold a few hundred players; the relay sends this one the cars of
 // the (up to 24) players near it, and once a second where everyone is (the
 // "where" feed, for the world map: window.recompOnlineWhere and
-// "recomp-online-where" events). The slots go to the players racing with this
+// "recomp-online-where" events; [id, x, z, heading, state]: this page asks for the relay's
+// version 2 (hi where:2, "Where, version 2" in the relay's header): everyone in free roam, state
+// 1 driving, 2 paused, 3 away; a relay from before sends the drivers only, without a state).
+// The slots go to the players racing with this
 // one (race.js), then crew-mates within CREW_NEAR, then the nearest; a waiting
 // player takes the slot of the one that counts least only when clearly nearer
 // (SWAP) and not within SLOT_HOLD of that slot's last change, so cars do not
@@ -93,7 +96,7 @@
     let crewsOk = false, crewId = null, account = null;
     // Compact poses (tools/carbon-net-relay.mjs, "Compact poses"): the format this page reads and
     // writes; bin is what the relay's welcome agreed to (0: JSON).
-    const BIN = 1, BIN_POSE = 1, BIN_WHERE = 2, POSE_BYTES = 46;
+    const BIN = 1, BIN_POSE = 1, BIN_WHERE = 2, BIN_WHERE2 = 4, POSE_BYTES = 46;
     const SCALE = [32767, 32767, 32767, 32767, 1000, 1000, 1000, 100, 100, 100, 500, 500, 500];
     let bin = 0;
     const players = new Map(); // id -> {id, name, crew, key, mode, heard, slot, at, pos, vel, last}
@@ -430,14 +433,18 @@
       if (p.activity !== "race") return localActivity !== "race" || racers.has(p.id);
       return localActivity === "race" && localSession && p.session === localSession && racers.has(p.id);
     }
+    // A feed entry's state: 1 driving (also every entry of a relay from before), 2 paused, 3 away.
+    const driving = (e) => e.length < 5 || e[4] === 1;
     function mapTell() {
       postMessage({t: "where", p: mapPoints.filter(e => {
         const p = players.get(e[0]);
+        // Not driving (version 2): on the map at its last free-roam place unless it, or this player, races.
+        if (!driving(e)) return !!p && p.activity !== "race" && localActivity !== "race";
         return p && visible(p) && p.activity !== "race";
       }).map(e => {
         const p = players.get(e[0]);
-        return p.activity && p.at && p.heard && performance.now() - p.heard <= FRESH
-          ? [e[0], Math.round(p.at[0]), Math.round(p.at[2]), e[3]] : e;
+        return driving(e) && p.activity && p.at && p.heard && performance.now() - p.heard <= FRESH
+          ? [e[0], Math.round(p.at[0]), Math.round(p.at[2]), ...e.slice(3)] : e;
       })});
     }
     function refreshVisibility() {
@@ -679,6 +686,14 @@
           p.push([v.getUint32(at, true), v.getInt32(at + 4, true), v.getInt32(at + 8, true), v.getUint16(at + 12, true)]);
         return { t: "where", p };
       }
+      if (type === BIN_WHERE2 && (n - 1) % 10 === 0) { // version 2: heading | state << 9
+        const p = [];
+        for (let at = 1; at < n; at += 10) {
+          const hs = v.getUint16(at + 8, true);
+          p.push([v.getUint32(at, true), v.getInt16(at + 4, true), v.getInt16(at + 6, true), hs & 0x1ff, (hs >> 9) & 7]);
+        }
+        return { t: "where", p };
+      }
       if (type === BIN_COPS && n >= COPS_HEAD && n === COPS_HEAD + COP_BYTES * v.getUint8(1)) {
         const list = [];
         for (let j = 0, at = COPS_HEAD; j < v.getUint8(1); j++, at += COP_BYTES) {
@@ -872,10 +887,11 @@
         take(p, owners.indexOf(0), now);
       } else if (m.t === "where" && Array.isArray(m.p)) {
         // Where everyone driving is (whole metres, heading in degrees), for the world map; a
-        // far player's place also stands in for chat until its own poses come.
+        // far player's place also stands in for chat until its own poses come. Version 2 adds
+        // everyone else in free roam, with a state as a fifth number.
         const list = [], now = performance.now();
         for (const e of m.p) {
-          if (!Array.isArray(e) || e.length !== 4 || !e.every(Number.isFinite) || e[0] === me) continue;
+          if (!Array.isArray(e) || (e.length !== 4 && e.length !== 5) || !e.every(Number.isFinite) || e[0] === me) continue;
           list.push(e);
           const p = players.get(e[0]);
           if (p && !(p.heard && now - p.heard <= FRESH)) p.at = [e[1], p.at ? p.at[1] : self ? self.at[1] : 0, e[2]];
@@ -889,7 +905,7 @@
     function connect() {
       ws = new WebSocket(relay);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew: "", crews: 1, chatAck: 1, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1 })); tell(); };
+      ws.onopen = () => { ws.send(JSON.stringify({ t: "hi", name, crew: "", crews: 1, chatAck: 1, claim, pk: legacy, physics: physics ? 1 : 0, bin: BIN, cops: 1, drive: 1, where: 2 })); tell(); };
       ws.onmessage = (e) => {
         try {
           const m = typeof e.data === "string" ? JSON.parse(e.data) : unpack(e.data);
@@ -1769,14 +1785,20 @@
       const mate = !!state.crewId && peer?.crewId === state.crewId;
       if (el.crew !== c || el.paint !== paint || el.mate !== mate) dress(el, c, mate);
       const isPolice = police.has(state.slotIds?.[i]);
+      // Depth is the view's w, metres along the view. Tags draw through walls, and a friend out to the far radius has one
+      // even with no car drawn here: past 200 m only crew mates, police and racers keep theirs (user, 2026-11-07).
+      const far = !mate && !isPolice && !window.recompRaceRacer?.(state.slotIds?.[i]);
+      if (far && depth > 200) { el.style.display = "none"; continue; }
       el.badge.style.display = isPolice ? "inline-block" : "none";
       const paused = state.slotModes?.[i] === 0;
-      const text = paused ? `${who} · PAUSED` : who;
+      // Race start (race.js): a late racer's car passing through the others says so.
+      const note = window.recompRaceTagNote?.(state.slotIds?.[i]) || "";
+      const text = paused ? `${who} · PAUSED` : note ? `${who} · ${note}` : who;
       if (el.text.data !== text) el.text.data = text;
       const size = Math.max(11, Math.min(16, 17 - depth / 25));
       el.style.display = "block";
       el.style.fontSize = `${size}px`;
-      el.style.opacity = depth > 250 && !el.mate && !isPolice ? "0.6" : "1";
+      el.style.opacity = far && depth > 170 ? String((200 - depth) / 30) : depth > 250 && !el.mate && !isPolice ? "0.6" : "1";
       el.style.transform = `translate(${box.left + f32[b] * box.width}px, ${box.top + f32[b + 1] * box.height}px) translate(-50%, -100%)`;
     }
   }

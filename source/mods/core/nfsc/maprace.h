@@ -170,7 +170,7 @@ static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
  const uint32_t retired=get_u32(db+0x2c);
  if(retired) {
   if(retired==raw)return;
-  mp_put(db+0x2c,0);mp_call(0x006132c0,0,&retired,1);
+  mp_put(db+0x2c,0);mp_call(0x006132c0,db,&retired,1); /* thiscall on the database: it also takes the race off the list */
  }
  uint32_t custom=mp_call(0x00649170,db,&raw,1);if(!custom){race_forget("world custom allocation failed");return;}
  mp_put(db+0x2c,custom);
@@ -193,7 +193,7 @@ static void mr_service(const PopModApi *api,pop_cpu_v1 *cpu,PopHookInvocation *i
  if(activity) {mp_call(0x0063b4f0,activity,0,0);race_log("core.nfsc: world race: launched session %u custom %08x activity %08x",p->session,custom,activity);}
  else {
   mp_put(rs+0x6a18,g_mr_context);race_forget("practice activity missing");
-  if(get_u32(db+0x2c)==custom){mp_put(db+0x2c,0);mp_call(0x006132c0,0,&custom,1);}
+  if(get_u32(db+0x2c)==custom){mp_put(db+0x2c,0);mp_call(0x006132c0,db,&custom,1);}
   g_mr_session=g_mr_custom=0;
  }
 }

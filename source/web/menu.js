@@ -1421,6 +1421,57 @@
     }
 
     window.recompMenuActions ||= [];
+    let cashNote = "Set your career cash to $999,999,999. Your save is backed up first.";
+    window.recompMenuActions.push({
+      id: "cash-set", group: "Career", keepOpen: true,
+      shown: () => { const v = block(); return !!v && v.u32[v.p + 114] === 0x31485343; },
+      label: () => "Set cash to $999,999,999",
+      hint: () => cashNote,
+      run: async () => {
+        if (busy >= 0) return;
+        if (status()?.where !== SAFE) { cashNote = "Open this in the game's menus or the Safehouse."; redraw(); return; }
+        busy = 10; cashNote = "Backing up your save…"; redraw();
+        try {
+          await backup();
+          const v = block();
+          if (!v || v.u32[v.p + 114] !== 0x31485343) throw new Error("the game is not ready");
+          Atomics.store(v.u32, v.p + 4, 6);
+          const request = (Atomics.add(v.u32, v.p + 3, 1) + 1) >>> 0;
+          let result = 0;
+          for (let t = 0; t < 150 && !result; t++) {
+            await new Promise((r) => setTimeout(r, 100));
+            if (Atomics.load(v.u32, v.p + 5) === request) result = v.u32[v.p + 6];
+          }
+          cashNote = result === 1 ? "Cash set to $999,999,999. Save from the game menu or leave the Safehouse with autosave on. To undo: start page → Saves → Undo the last restore."
+            : result === 2 ? "Cash was not changed. Open this in the game's menus or the Safehouse."
+            : result ? "The game could not set your cash. Your backup is available in Saves."
+            : "The game has not confirmed the change. Check your cash before trying again.";
+        } catch (e) { cashNote = `Could not prepare the cash change (${e?.message || e}).`; }
+        finally { busy = -1; redraw(); }
+      },
+    });
+    let carsBusy = false, carsNote = "Unlock cars in Car Select. Resets when the game restarts. Your save is backed up before enabling.";
+    window.recompMenuActions.push({
+      id: "cars-unlock", group: "Career", keepOpen: true,
+      shown: () => { const v = block(); return !!v && v.u32[v.p + 113] === 0x31524143; },
+      label: () => { const v = block(); return `Unlock all cars: ${v && v.u32[v.p + 112] === 1 ? "On" : "Off"}`; },
+      hint: () => carsNote,
+      run: async () => {
+        let v = block();
+        if (!v || v.u32[v.p + 113] !== 0x31524143 || carsBusy || busy >= 0) return;
+        if (v.u32[v.p + 112] === 1) { Atomics.store(v.u32, v.p + 112, 0); carsNote = "Normal car locks restored. Reopen Car Select to refresh."; redraw(); return; }
+        if (status()?.where !== SAFE) { carsNote = "Open this in the game's menus or the Safehouse."; redraw(); return; }
+        carsBusy = true; busy = 9; carsNote = "Backing up your save…"; redraw();
+        try {
+          await backup(); v = block();
+          if (v && v.u32[v.p + 113] === 0x31524143) {
+            Atomics.store(v.u32, v.p + 112, 1);
+            carsNote = "Cars are unlocked. Reopen Car Select to refresh. Cars you buy stay owned.";
+          }
+        } catch (e) { carsNote = `Could not back up your save. Cars remain locked (${e?.message || e}).`; }
+        finally { carsBusy = false; busy = -1; redraw(); }
+      },
+    });
     let tuneBusy = false, tuneNote = "Packages bought stay owned. Your save is backed up before enabling.";
     window.recompMenuActions.push({
       id: "performance-unlock", group: "Career", keepOpen: true,

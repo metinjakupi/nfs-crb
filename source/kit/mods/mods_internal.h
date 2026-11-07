@@ -22,9 +22,9 @@
 #define MODS_OWNER_FIRST_MOD 2u
 
 // The mod heap: the gap between the game heap's HEAP_LIMIT (0x0e000000) and
-// the guest stack's lower limit (0x0ef00000), less a megabyte of guard.
+// the 8 MB guest stack's lower limit (STACK_LIMIT 0x0e800000), less a megabyte of guard.
 #define MOD_HEAP_BASE 0x0e000000u
-#define MOD_HEAP_END 0x0ee00000u
+#define MOD_HEAP_END 0x0e700000u
 
 extern "C" {
 

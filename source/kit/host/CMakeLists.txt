@@ -3,7 +3,7 @@
 set(HOST ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Portable host code shared by every host that boots the guest.
-add_library(host_common OBJECT boot.cpp report_lock.cpp)
+add_library(host_common OBJECT boot.cpp report_lock.cpp crash_probe.cpp)
 target_include_directories(host_common PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
 target_link_libraries(host_common PUBLIC recomp_runtime)
 target_compile_options(host_common PRIVATE ${POP_WARN_HOST})
@@ -290,10 +290,10 @@ if(TARGET recomp_gen)
     configure_file(${POP_ROOT}/web/player/lan.js ${POP_OUT}/lan.js COPYONLY)
     # A game's start page (web/start.js), which the player page shows before
     # the game, what the start page loads (web/menu.js, chat.js, radar.js,
-    # saves.js, and online.js: the internet server's address and key, written
+    # saves.js, language.js, and online.js: the internet server's address and key, written
     # by tools/carbon-relay-deploy.sh) and its online client (web/net.js).
     # report.js: Download log / Send report (F9 menu, and the player page's stopped screens).
-    foreach(page start.js play-home.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
+    foreach(page start.js play-home.js menu.js chat.js radar.js race.js encounter.js worldmap.js saves.js language.js net.js online.js report.js streaming.js resume.js custom-install.js custom-hud.js billboards.js billboard-stream.js cockpit.js cockpit-assets.js touch.js)
       if(EXISTS ${RECOMP_GAME_DIR}/web/${page})
         configure_file(${RECOMP_GAME_DIR}/web/${page} ${POP_OUT}/${page} COPYONLY)
       endif()
@@ -337,8 +337,9 @@ if(TARGET recomp_gen)
       "SHELL:--js-library ${POP_ROOT}/web/player/stream-fetch.js"
       "SHELL:--js-library ${POP_ROOT}/web/player/webgpu-bind-group.js"
       --pre-js ${POP_ROOT}/web/opfs-shared.js
+      --pre-js ${POP_ROOT}/web/crash-capture.js
       --preload-file ${web_resources}@/app/resources)
-    set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/opfs-shared.js ${POP_ROOT}/web/player/stream-fetch.js ${POP_ROOT}/web/player/webgpu-bind-group.js)
+    set_property(TARGET recomp_app APPEND PROPERTY LINK_DEPENDS ${POP_ROOT}/web/opfs-shared.js ${POP_ROOT}/web/crash-capture.js ${POP_ROOT}/web/player/stream-fetch.js ${POP_ROOT}/web/player/webgpu-bind-group.js)
   elseif(APPLE)
     pop_mac_bundle(recomp_app)
   else()

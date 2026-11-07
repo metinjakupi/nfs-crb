@@ -4,6 +4,7 @@ Game features, performance improvements, and bug fixes for NFS Carbon in the bro
 
 ## Unreleased
 
+- Play the story movies and start-up movies in the browser. They were skipped on the web; the game's own VP6 decoder plays them there. Skip intro movies is now on by default and skips only the EA logo and the street-racing warning.
 - Limit how many connections one internet address can hold on the online server, and slow connection floods at the web server, without counting addresses behind a proxy.
 - Add a Content Security Policy to the site, so an injected script cannot run or send data out, and stop other sites showing it in a frame.
 - Treat lookalike letters as the real ones when checking names, so "Admin" or a claimed name cannot be copied with Cyrillic or Greek letters.

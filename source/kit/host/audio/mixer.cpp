@@ -112,6 +112,13 @@ struct Segment {
     int completion = 0; // 0 none, 1 a generation, 2 queued bytes
     uint64_t generation = 0;
     uint32_t bytes = 0;
+    // A stream ring the guest keeps overwriting (render mutex). Once on, the frames the play
+    // head has passed are cleared, so a guest that falls behind by more than its lead leaves
+    // silence under the head instead of the previous lap, which would be heard again as an echo.
+    bool silence_played = false;
+    uint32_t stream_wraps = 0; // writes at the top of this ring so far: its laps
+    bool clear_valid = false;
+    uint32_t clear_next = 0; // first frame not yet cleared behind the head
     uint32_t frames() const {
         return uint32_t(l.size());
     }
@@ -161,6 +168,43 @@ inline void sample_at(const Segment &s, double pos, float *values) {
     }
 }
 
+// Frames kept behind the head. The resampler reads two frames behind and three ahead of the
+// position it renders, so clearing stops well short of that.
+constexpr uint32_t STALE_GUARD_FRAMES = 8;
+// Laps of the ring the guest must have written before it counts as streaming it.
+constexpr uint32_t STALE_SILENCE_WRAPS = 3;
+
+bool stale_silence_enabled() {
+    static const bool on = [] {
+        const char *v = recomp_env("AUDIO_STALE_SILENCE"); // RECOMP_AUDIO_STALE_SILENCE
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+// Render mutex held. Clears the frames of a stream ring the head has passed, up to the guard.
+void clear_played(Segment &s, double pos) {
+    const uint32_t n = s.frames();
+    if (!s.silence_played || !s.loop || n <= 4 * STALE_GUARD_FRAMES)
+        return;
+    const uint32_t here = (uint32_t)pos % n;
+    const uint32_t upto = (here + n - STALE_GUARD_FRAMES) % n;
+    if (!s.clear_valid) {
+        s.clear_valid = true;
+        s.clear_next = upto;
+        return;
+    }
+    // More than half a lap since the last block is not a normal step; start again from here.
+    if ((upto + n - s.clear_next) % n > n / 2) {
+        s.clear_next = upto;
+        return;
+    }
+    for (uint32_t i = s.clear_next; i != upto; i = (i + 1 == n) ? 0 : i + 1)
+        for (unsigned c = 0; c < s.channels; ++c)
+            s.plane(c)[i] = 0.0f;
+    s.clear_next = upto;
+}
+
 // Render mutex held. Adds `frames` of this player into the mix.
 void render_player(int32_t id, Player &p, float *const *out, uint32_t frames) {
     for (uint32_t i = 0; i < frames && p.playing; ++i) {
@@ -198,6 +242,8 @@ void render_player(int32_t id, Player &p, float *const *out, uint32_t frames) {
             break; // the next segment starts at the carried-over position
         }
     }
+    if (p.playing && !p.segments.empty())
+        clear_played(*p.segments.front(), p.pos);
 }
 
 // The whole mix for one block, into deinterleaved buffers that arrive zeroed.
@@ -1005,6 +1051,14 @@ extern "C" int32_t host_audio_write(int32_t id, const void *pcm, uint32_t offset
                 // these same floats. Data lock, then render lock, is the
                 // order the render thread never takes the other way round.
                 std::lock_guard<std::mutex> render(g_render_mutex);
+                // A guest that has gone round the ring several times is streaming it, not
+                // filling a loop once: from then on, what the head has passed is silence.
+                // RECOMP_AUDIO_STALE_SILENCE=0 turns this off.
+                if (!at)
+                    ++ring->stream_wraps;
+                if (!ring->silence_played && ring->stream_wraps >= STALE_SILENCE_WRAPS &&
+                    stale_silence_enabled())
+                    ring->silence_played = true;
                 for (unsigned c = 0; c < ring->channels; ++c) {
                     float *dest = ring->plane(c).data() + at;
                     const auto &source = incoming.plane(c);

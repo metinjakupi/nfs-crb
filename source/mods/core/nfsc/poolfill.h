@@ -15,9 +15,18 @@
  * byte of the pool it is called for (ECX), so nothing is filled: no pool changes size (no fewer cars, no less track
  * streaming memory); pages are written only when the game really puts something there.
  * RECOMP_POOLFILL=1 keeps the game's fill (A/B, troubleshooting).
+ *
+ * Only the pool constructor's call (00476470 calls 004758e0 at 004764e7, returning to 004764ec) is hooked on a host
+ * with call-site hooks. Nothing turns the flag on again (only the constructor sets it, 004764bd; the one caller of
+ * the setter 00470de0, at 007e49d8, turns it off), so the flag is clear before any later call fills anything. The
+ * other callers (00475ca0, 00476560, 00476d70: allocation and free paths) were hooked too in the first version, and
+ * the EA sound thread, which runs without the baton, calls them: every such call took the baton, about 280 a second,
+ * with waits of up to a second (Dell, 2026-11-06: ~1 s frame freezes, 4-12 a 30 s drive). A call from a site that is
+ * not hooked bypasses the hook and the baton.
  */
 #define PF_ADD_FREE 0x004758e0u /* thiscall (pool), (memory, size, ...): onto the free list, filled when [pool + 0x40] */
 #define PF_FLAG 0x40u
+#define PF_CTOR_RETURN 0x004764ecu /* the pool constructor 00476470 calls PF_ADD_FREE at 004764e7 */
 static uint32_t g_pfill_hook, g_pfill_cleared, g_pfill_calls;
 
 static void pfill_hook(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *user) {
@@ -50,9 +59,16 @@ static void poolfill_install(void) {
         log_line("core.nfsc: poolfill off (RECOMP_POOLFILL=1): the game's 0xEE fill of free pool memory");
         return;
     }
-    if (g_api->hook_install(g_api, PF_ADD_FREE, pfill_hook, POP_HOOK_BEFORE, NULL, &g_pfill_hook) != POP_OK) {
+    const int filtered = g_api->size >= offsetof(PopModApi, hook_install_at_callsite) + sizeof g_api->hook_install_at_callsite &&
+                         g_api->hook_install_at_callsite;
+    const PopModStatus st = filtered
+        ? g_api->hook_install_at_callsite(g_api, PF_ADD_FREE, PF_CTOR_RETURN, pfill_hook, POP_HOOK_BEFORE, NULL, &g_pfill_hook)
+        : g_api->hook_install(g_api, PF_ADD_FREE, pfill_hook, POP_HOOK_BEFORE, NULL, &g_pfill_hook);
+    if (st != POP_OK) {
         g_pfill_hook = 0;
         log_line("core.nfsc: poolfill: hook unavailable: the game's 0xEE fill stays");
+    } else if (!filtered) {
+        log_line("core.nfsc: poolfill: host without call-site hooks: every caller is hooked");
     }
 }
 

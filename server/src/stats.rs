@@ -174,6 +174,35 @@ fn public_spec(key: &str, game: bool) -> Option<PublicSpec> {
     }
 }
 
+/// The in-game group of the public answer (leaderboard.rs, source "ingame"): the keys the game's
+/// own Statistics screens rank (plans/lan-protocol.md "Player Stats and the Leaderboard"): per
+/// race the best (Evt_Bst_<race>, one per race whatever the lap count, as the game keeps it), the
+/// best lap (Evt_Bst_Lap_<race>), the races and the wins (Total_Rnkd_Evt_Games_<race>,
+/// Evt_Wins_<race>), and the game's own online wins and best win streak. Canyon Duel, drift,
+/// pursuit and the other game-only keys are not in it (they stay behind CARBON_LEADERBOARD_GAME).
+/// Returns (family, race hash, a count).
+fn ingame_spec(key: &str) -> Option<(&'static str, Option<String>, bool)> {
+    for (family, count) in [("Evt_Bst_Lap", false), ("Total_Rnkd_Evt_Games", true), ("Evt_Wins", true), ("Evt_Bst", false)] {
+        if let Some(h) = key.strip_prefix(family).and_then(|r| r.strip_prefix('_')).and_then(race_hash) {
+            return Some((family, Some(h), count));
+        }
+    }
+    match key {
+        "Overall_Solo_On_Wins" => Some(("Overall_Solo_On_Wins", None, true)),
+        "Best_Online_Win_Streak" => Some(("Best_Online_Win_Streak", None, true)),
+        _ => None,
+    }
+}
+
+/// The two numbers of a best time's text ("0x<car>,a,b,0x0", 008222f0) that the game's board
+/// shows by race type: a circuit's best lap and top speed, a sprint's top speed and NOS.
+fn numbers_of(text: &str) -> Option<(f64, f64)> {
+    let mut it = text.split(',').skip(1);
+    let a = it.next()?.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    let b = it.next()?.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    Some((a, b))
+}
+
 /// The car's Attrib key from a stat's text ("0x8774322C,..."), lowercase, or "".
 fn car_of(text: &str) -> String {
     let car = text.split(',').next().unwrap_or("");
@@ -1154,12 +1183,13 @@ impl Stats {
                     players: 0,
                     all: Vec::new(),
                     week: Vec::new(),
+                    day: Vec::new(),
                 });
-                b.all.push(Entry { name: p.name.clone(), value: s.v, car: car_of(&s.t), when: s.at });
+                b.all.push(Entry { name: p.name.clone(), value: s.v, car: car_of(&s.t), when: s.at, numbers: None });
                 if let Some((wv, wt)) = s.at(Period::Week, 0, now) {
                     if plausible(wv, s.low) && wv > 0.0 && (!counted || wt == tag) {
                         let when = if Period::Week.number(s.pat) == week { s.pat } else { 0 };
-                        b.week.push(Entry { name: p.name.clone(), value: wv, car: car_of(wt), when });
+                        b.week.push(Entry { name: p.name.clone(), value: wv, car: car_of(wt), when, numbers: None });
                     }
                 }
             }
@@ -1175,6 +1205,75 @@ impl Stats {
                 });
                 rows.truncate(crate::leaderboard::MAX_ROWS);
             }
+        }
+        out
+    }
+
+    /// The in-game group of the public answer (leaderboard.rs, source "ingame"): what the game's
+    /// own LEADERBOARD and ONLINE PLAYER STATS show, from the same rows as board() (and so top(),
+    /// GetTopN): every name, banned names left out, plausible() values only (zeros and the
+    /// game's own numbers included, as the game shows them), best first, for all time, the
+    /// current week and the current day; at most leaderboard::MAX_ROWS each. One pass over the
+    /// players instead of one board() per key and period. One difference for the public web
+    /// page: a name the chat's word filter refuses (moderation::profane, whole words) is left
+    /// out too; the game's own board still lists it.
+    pub fn ingame_boards(&self, now: u64) -> Vec<crate::leaderboard::Board> {
+        use crate::leaderboard::{Board, Row as Entry};
+        const PERIODS: [Period; 3] = [Period::All, Period::Week, Period::Day];
+        let mut boards: BTreeMap<String, (Board, bool)> = BTreeMap::new();
+        for p in self.people.values() {
+            let mut banned = None; // worked out at the player's first in-game key
+            for (key, s) in &p.stats {
+                let Some((family, race, count)) = ingame_spec(key) else { continue };
+                let banned = *banned.get_or_insert_with(|| self.review.is_banned(&p.name) || crate::moderation::profane(&p.name));
+                let id = race.as_ref().map_or(format!("ingame:{family}"), |h| format!("ingame:{family}:{h}"));
+                let (b, _) = boards.entry(id.clone()).or_insert_with(|| {
+                    let board = Board { id, family: family.to_string(), source: "ingame", race, laps: None, low: false, unit: "", players: 0, all: Vec::new(), week: Vec::new(), day: Vec::new() };
+                    (board, count)
+                });
+                // board(): a key ranks lowest first when any holder's stat is a time, banned ones too
+                // (and names left out for the word filter)
+                b.low |= s.low;
+                if banned {
+                    continue;
+                }
+                for period in PERIODS {
+                    let Some((v, t)) = s.at(period, 0, now) else { continue };
+                    if !plausible(v, s.low) {
+                        continue;
+                    }
+                    let when = match period {
+                        Period::All => s.at,
+                        _ if period.number(s.pat) == period.number(now) => s.pat,
+                        _ => 0,
+                    };
+                    let numbers = if family == "Evt_Bst" { numbers_of(t) } else { None };
+                    let row = Entry { name: p.name.clone(), value: v, car: car_of(t), when, numbers };
+                    match period {
+                        Period::All => b.all.push(row),
+                        Period::Week => b.week.push(row),
+                        Period::Day => b.day.push(row),
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(boards.len());
+        for (mut b, count) in boards.into_values() {
+            if b.all.is_empty() {
+                continue; // only banned names hold it: the game shows no rows either
+            }
+            b.players = b.all.len();
+            b.unit = if b.low { "time" } else if count { "count" } else { "points" };
+            let lower = b.low;
+            for rows in [&mut b.all, &mut b.week, &mut b.day] {
+                // board()'s order: best first, then the name case-blind
+                rows.sort_by(|x, y| {
+                    let by = if lower { x.value.total_cmp(&y.value) } else { y.value.total_cmp(&x.value) };
+                    by.then_with(|| low(&x.name).cmp(&low(&y.name)))
+                });
+                rows.truncate(crate::leaderboard::MAX_ROWS);
+            }
+            out.push(b);
         }
         out
     }
@@ -1833,5 +1932,144 @@ mod tests {
         assert_eq!(b.all.iter().map(|r| (r.name.as_str(), r.when)).collect::<Vec<_>>(), [("New", NOW), ("Next", NOW), ("Old", 0)]);
         assert_eq!(b.all[2].car, "0x7b2cc40b");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every in-game board and period has exactly the rows of top() (GetTopN) for its key.
+    fn assert_ingame_is_top(s: &Stats, now: u64) -> usize {
+        let mut checked = 0;
+        for b in s.ingame_boards(now) {
+            let rest = b.id.strip_prefix("ingame:").unwrap();
+            let key = match rest.split_once(':') {
+                Some((family, h)) => format!("{family}_{h}"),
+                None => rest.to_string(),
+            };
+            for (period, rows) in [(Period::All, &b.all), (Period::Week, &b.week), (Period::Day, &b.day)] {
+                // the public group leaves out the names the word filter refuses
+                let top: Vec<Ranked> = s.board(&key, period, 0, now).into_iter().filter(|r| !crate::moderation::profane(r.1)).take(crate::leaderboard::MAX_ROWS).map(|(owner, name, value, text)| Ranked { owner, name: name.into(), rank: 0, value, text: text.into() }).collect();
+                if !s.people.values().any(|p| p.stats.contains_key(&key) && crate::moderation::profane(&p.name)) {
+                    assert_eq!(top, s.top(&key, 1, crate::leaderboard::MAX_ROWS, period, 0, now).into_iter().map(|r| Ranked { rank: 0, ..r }).collect::<Vec<_>>());
+                }
+                let want: Vec<(&str, f64, String)> = top.iter().map(|r| (r.name.as_str(), r.value, car_of(&r.text))).collect();
+                let got: Vec<(&str, f64, String)> = rows.iter().map(|r| (r.name.as_str(), r.value, r.car.clone())).collect();
+                assert_eq!(got, want, "{} {period:?}", b.id);
+                checked += 1;
+            }
+            assert_eq!(b.players, s.board(&key, Period::All, 0, now).iter().filter(|r| !crate::moderation::profane(r.1)).count(), "{}", b.id);
+        }
+        checked
+    }
+
+    #[test]
+    fn the_in_game_group_has_the_games_own_rows_for_every_name_but_banned_ones() {
+        let mut s = Stats::open(None);
+        // career and online bests from the games, a drift score (highest first), a zero score,
+        // and the game-only keys that stay out of the group
+        for (who, t, drift) in [("Metin", "103.5", "5000"), ("Jan", "99.25", "9000"), ("Guest", "120", "0"), ("Cheat", "80", "99999"), ("Fag", "95", "1")] {
+            let text = "0x8774322C,51.500000,72.900000,0x00000000";
+            s.update(who, &update(who, &[("Evt_Bst_30F07253", t, text, 2), ("Evt_Bst_Lap_30F07253", "51.5", "", 2), ("Evt_Bst_9C09A497", drift, "0x7B2CC40B,1.0,2.0,0x0", 1), ("CD_Best_Score_2656C6D0", "700", "", 1), ("Best_Drift_Combo", "5000", "", 1)]), NOW);
+        }
+        // the online records: counted by the race host
+        let both = racers(&["Metin", "Jan"]);
+        let r = results(&[(1, 1, true, 103.0, 72.0), (5, 2, true, 104.0, 72.0)]);
+        race_of(&mut s, 1, &both, vec![(0, r.clone()), (1, r)], Vec::new());
+        // and last week's time, which is in all time only
+        s.update("Old", &update("Old", &[("Evt_Bst_30F07253", "101", "", 2)]), NOW - 8 * 86_400);
+        s.admin("ban", "admin:t", &json!({"name": "cheat", "text": "fake"}), NOW).unwrap();
+        assert!(assert_ingame_is_top(&s, NOW) > 0);
+        let boards = s.ingame_boards(NOW);
+        // the word filter's names are on the game's own board, not on the public page
+        assert!(s.top("Evt_Bst_30F07253", 1, 10, Period::All, 0, NOW).iter().any(|r| r.name == "Fag"));
+        assert!(boards.iter().all(|b| b.all.iter().chain(&b.week).chain(&b.day).all(|r| r.name != "Fag")));
+        let ids: Vec<&str> = boards.iter().map(|b| b.id.as_str()).collect();
+        for id in ["ingame:Evt_Bst:30F07253", "ingame:Evt_Bst_Lap:30F07253", "ingame:Evt_Bst:9C09A497", "ingame:Total_Rnkd_Evt_Games:30F07253", "ingame:Evt_Wins:30F07253", "ingame:Overall_Solo_On_Wins", "ingame:Best_Online_Win_Streak"] {
+            assert!(ids.contains(&id), "{id} in {ids:?}");
+        }
+        // Canyon Duel, drift records and the server's own keys are not in it
+        assert!(ids.iter().all(|i| !i.contains("CD_") && !i.contains("Best_Drift") && !i.contains("Srv_") && !i.contains("Overall_Solo_On_Losses")), "{ids:?}");
+        let b = boards.iter().find(|b| b.id == "ingame:Evt_Bst:30F07253").unwrap();
+        // every name, claimed or not (the in-game board has no claims), not the banned one
+        let rows = |v: &[crate::leaderboard::Row]| v.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(rows(&b.all), ["Jan", "Old", "Metin", "Guest"]);
+        assert_eq!(rows(&b.week), ["Jan", "Metin", "Guest"]);
+        assert_eq!(rows(&b.day), ["Jan", "Metin", "Guest"]);
+        assert_eq!((b.source, b.low, b.unit, b.players, b.laps), ("ingame", true, "time", 4, None));
+        // the race host's time (103.0) replaced Metin's 103.5: the game's own board has it too
+        assert_eq!(b.all[2].value, 103.0);
+        assert_eq!(b.all[0].numbers, Some((51.5, 72.9)));
+        assert_eq!(b.all[0].car, "0x8774322c");
+        assert_eq!(b.all[0].when, NOW);
+        assert_eq!(b.all[1].when, NOW - 8 * 86_400);
+        // drift: highest first, the zero shows as the game shows it
+        let d = boards.iter().find(|b| b.id == "ingame:Evt_Bst:9C09A497").unwrap();
+        assert_eq!((d.low, d.unit), (false, "points"));
+        assert_eq!(d.all.iter().map(|r| (r.name.as_str(), r.value)).collect::<Vec<_>>(), [("Jan", 9000.0), ("Metin", 5000.0), ("Guest", 0.0)]);
+        let w = boards.iter().find(|b| b.id == "ingame:Overall_Solo_On_Wins").unwrap();
+        assert_eq!((w.unit, w.all.len(), w.week.len(), w.all[0].name.as_str()), ("count", 1, 0, "Metin"));
+        assert_eq!(boards.iter().find(|b| b.id == "ingame:Total_Rnkd_Evt_Games:30F07253").unwrap().all.len(), 2);
+        // unbanned: back on the in-game group at once
+        s.admin("unban", "admin:t", &json!({"name": "Cheat"}), NOW).unwrap();
+        assert_eq!(s.ingame_boards(NOW).iter().find(|b| b.id == "ingame:Evt_Bst:30F07253").unwrap().all[0].name, "Cheat");
+        assert_ingame_is_top(&s, NOW);
+        // a board only a banned name holds has no rows: it is left out
+        let mut s = Stats::open(None);
+        s.update("Solo", &update("Solo", &[("Evt_Bst_7335A1D3", "90", "", 2)]), NOW);
+        s.admin("ban", "admin:t", &json!({"name": "Solo"}), NOW).unwrap();
+        assert!(s.ingame_boards(NOW).is_empty());
+        assert!(s.top("Evt_Bst_7335A1D3", 1, 10, Period::All, 0, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_value_never_reaches_the_in_game_group() {
+        let mut s = Stats::open(None);
+        for (i, who) in ["A", "B", "C", "D", "E"].iter().enumerate() {
+            s.update(who, &update(who, &[("Evt_Bst_30F07253", &format!("{}", 100 + i), "", 2)]), NOW);
+        }
+        s.update("Cheat", &update("Cheat", &[("Evt_Bst_30F07253", "50", "", 2)]), NOW);
+        let id = s.review.pending[0].id;
+        s.admin("reject", "admin:t", &json!({"id": id}), NOW).unwrap();
+        s.update("Cheat", &update("Cheat", &[("Evt_Bst_30F07253", "50", "", 2)]), NOW);
+        let b = s.ingame_boards(NOW);
+        assert!(b[0].all.iter().all(|r| r.name != "Cheat"));
+        assert_ingame_is_top(&s, NOW);
+    }
+
+    /// The real stats copy: CARBON_STATS_COPY=<a folder with stats.json> cargo test --release --
+    /// --ignored real_stats --nocapture. Read only (nothing is changed, so nothing is written).
+    #[test]
+    #[ignore]
+    fn real_stats_in_game_group_is_top_and_its_size() {
+        let dir = PathBuf::from(std::env::var("CARBON_STATS_COPY").expect("CARBON_STATS_COPY"));
+        let s = Stats::open(Some(dir));
+        let now: u64 = std::env::var("CARBON_STATS_NOW").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        let t = std::time::Instant::now();
+        let boards = s.ingame_boards(now);
+        let built = t.elapsed();
+        let week = week_number(now);
+        let t = std::time::Instant::now();
+        let text = crate::leaderboard::answer(&boards, now, week, None, None, crate::leaderboard::DEFAULT_ROWS, Some("ingame")).to_string();
+        let made = t.elapsed();
+        let full = crate::leaderboard::answer(&boards, now, week, None, None, crate::leaderboard::MAX_ROWS, Some("ingame")).to_string();
+        let t = std::time::Instant::now();
+        let race = s.public_boards(&|_| false, false, now);
+        let race_built = t.elapsed();
+        let rows: usize = boards.iter().map(|b| b.all.len() + b.week.len() + b.day.len()).sum();
+        let filtered = s.people.values().filter(|p| p.stats.keys().any(|k| ingame_spec(k).is_some()) && crate::moderation::profane(&p.name)).count();
+        println!("names on in-game boards left out for the word filter: {filtered}");
+        let t = std::time::Instant::now();
+        let checked = assert_ingame_is_top(&s, now);
+        println!(
+            "players {} | in-game boards {} (rows {rows}) built in {:.1} ms, answer text {:.1} ms | plain ?source=ingame {} bytes, at 100 rows {} bytes | race group (no claims) {} boards in {:.1} ms | {checked} board-periods equal top() ({:.0} ms)",
+            s.len(), boards.len(), built.as_secs_f64() * 1e3, made.as_secs_f64() * 1e3, text.len(), full.len(), race.len(), race_built.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3
+        );
+        let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for b in &boards {
+            let e = by.entry(b.family.as_str()).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(b.players);
+        }
+        println!("families (boards, most players): {by:?}");
+        if let Ok(out) = std::env::var("CARBON_STATS_ANSWER") {
+            fs::write(out, &text).unwrap();
+        }
     }
 }
