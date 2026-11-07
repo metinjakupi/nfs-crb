@@ -5,6 +5,13 @@ target_compile_options(gpu_fake PRIVATE ${POP_WARN_STRICT})
 pop_optimize(gpu_fake 1)
 
 if(NOT IOS AND NOT ANDROID)
+add_executable(d3d9_world_filter_tests tests/d3d9_world_filter_tests.cpp)
+target_compile_options(d3d9_world_filter_tests PRIVATE ${POP_WARN_STRICT})
+pop_optimize(d3d9_world_filter_tests 1)
+pop_test_binary(d3d9_world_filter_tests)
+add_test(NAME d3d9_world_filter_tests COMMAND d3d9_world_filter_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(d3d9_world_filter_tests PROPERTIES LABELS nogame)
+
 add_executable(d3d9_trace_tests tests/d3d9_trace_tests.cpp)
 target_compile_options(d3d9_trace_tests PRIVATE ${POP_WARN_STRICT})
 pop_optimize(d3d9_trace_tests 1)
